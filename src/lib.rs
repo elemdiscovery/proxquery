@@ -600,6 +600,19 @@ mod tests {
         // sibling branch (`alpha`) would have matched and short-circuited eval.
         Spi::run("SELECT ts_prox_match(to_tsvector('simple','alpha beta'), 'alpha | ##[##')").unwrap();
     }
+
+    // --- pure-SQL port -----------------------------------------------------
+    // The extension-free port (sql/proxquery_pure.sql) must stay behavior-
+    // identical to this extension. Loading it into a `proxquery` schema and
+    // running its assertion suite (sql/proxquery_pure_test.sql, the same 123
+    // known-good values used here) via Spi runs that parity check on every CI
+    // Postgres version, right alongside the Rust tests. The self-test RAISEs on
+    // any mismatch, which surfaces as a failed Spi call here.
+    #[pg_test]
+    fn pure_sql_port_matches_extension() {
+        Spi::run(include_str!("../sql/proxquery_pure.sql")).expect("load pure-SQL port");
+        Spi::run(include_str!("../sql/proxquery_pure_test.sql")).expect("pure-SQL self-test");
+    }
 }
 
 /// Required by `cargo pgrx test`.
