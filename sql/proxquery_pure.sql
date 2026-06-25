@@ -1,0 +1,1051 @@
+-- proxquery — pure-SQL implementation
+-- ====================================
+--
+-- A drop-in, extension-free port of the proxquery Rust extension. Every public
+-- function keeps the same name and signature as the compiled extension, so an
+-- environment can run this migration on a managed/cloud Postgres (Cloud SQL,
+-- RDS, Neon, …) where loading a custom `.so` isn't practical, and later migrate
+-- to the native extension transparently.
+--
+-- Everything is installed into a dedicated `proxquery` schema (helpers and
+-- public functions alike), so it never pollutes `public` and tears down with a
+-- single `DROP SCHEMA proxquery CASCADE`. The native extension is relocatable,
+-- so it installs into the same schema for a transparent migration:
+--     CREATE EXTENSION proxquery SCHEMA proxquery;
+-- Call the functions schema-qualified (`proxquery.ts_prox_match(…)`) or add the
+-- schema to your search_path (`SET search_path = public, proxquery;`). Each
+-- public function pins its own search_path, so it resolves correctly either way.
+--
+-- What is the same: the DSL, the skeleton tsquery (`ts_prox_query`), the
+-- positional recheck (`ts_prox_match`), and the positional predicate functions —
+-- all produce identical results to the Rust extension.
+--
+-- What differs:
+--   * No `@~@` operator. The native extension's single indexable operator needs
+--     a C planner support function (impossible in SQL). Rather than ship a
+--     look-alike `@~@` that silently seq-scans, this port omits it entirely, so
+--     proximity queries must be written in the form that is actually index-
+--     served — the two clauses the support function would otherwise inject:
+--         WHERE tsv @@ proxquery.ts_prox_query(q)   -- GIN index selects
+--           AND proxquery.ts_prox_match(tsv, q)       -- positional recheck
+--     (The native extension keeps `@~@`; after migrating you may switch to it.)
+--   * Performance: positions are read with `unnest(tsvector)` (O(all lexemes)
+--     per call) instead of the extension's O(log L) binary search, and the
+--     query AST is re-parsed per row. Same answers, slower on large corpora.
+--
+-- Text search configuration: `simple` (literal, lowercased), matching the
+-- extension. Internal helpers are prefixed `_prox_`.
+
+CREATE SCHEMA IF NOT EXISTS proxquery;
+SET search_path = proxquery, pg_catalog;
+SET check_function_bodies = off;
+
+-- ===========================================================================
+-- Small utilities
+-- ===========================================================================
+
+-- ASCII-only lowercasing, matching the Rust lexer's `to_ascii_lowercase`
+-- (Postgres `lower()` would also fold non-ASCII; the stored `simple` lexemes and
+-- the query terms must agree, and the extension folds ASCII only on the query side).
+CREATE OR REPLACE FUNCTION _prox_alower(t text) RETURNS text
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$ SELECT translate($1, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') $fn$;
+
+CREATE OR REPLACE FUNCTION _prox_quote_lexeme(lex text) RETURNS text
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$ SELECT '''' || replace($1, '''', '''''') || '''' $fn$;
+
+-- The leading literal run of a glob — characters before the first `*` or `?`.
+CREATE OR REPLACE FUNCTION _prox_glob_prefix(glob text) RETURNS text
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$ SELECT coalesce(substring($1 from '^[^*?]*'), '') $fn$;
+
+-- Convert a `*`/`?` glob to a LIKE pattern (`*`→`%`, `?`→`_`), escaping the LIKE
+-- metacharacters that may appear in the glob's literal parts first.
+CREATE OR REPLACE FUNCTION _prox_glob_to_like(glob text) RETURNS text
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$
+    SELECT replace(replace(
+             replace(replace(replace($1, '\', '\\'), '%', '\%'), '_', '\_'),
+           '*', '%'), '?', '_')
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_is_word_char(c text) RETURNS boolean
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$ SELECT $1 !~ '\s' AND position($1 in '()&|!<>,"''#') = 0 $fn$;
+
+-- Parse a distance: non-empty digits, clamped to [1, 16383] (matches the Rust
+-- `parse_distance` / MAX_DISTANCE clamp, including overflow → 16383).
+CREATE OR REPLACE FUNCTION _prox_parse_distance(digits text) RETURNS int
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+BEGIN
+    IF digits IS NULL OR digits = '' OR digits !~ '^[0-9]+$' THEN
+        RAISE EXCEPTION 'expected a distance, got `%`', coalesce(digits, '');
+    END IF;
+    IF length(digits) > 5 THEN
+        RETURN 16383;
+    END IF;
+    RETURN least(greatest(digits::int, 1), 16383);
+END
+$fn$;
+
+-- ===========================================================================
+-- Position accessors  (the building block: read a lexeme's sorted positions)
+-- ===========================================================================
+
+-- Sorted positions of `lexeme` (exact, byte-equal match); empty if absent or
+-- position-less. Equivalent to the extension's binary-search accessor.
+CREATE OR REPLACE FUNCTION ts_prox_positions(v tsvector, needle text) RETURNS int[]
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+    SET search_path = proxquery, pg_catalog AS
+$fn$
+    SELECT coalesce(
+        (SELECT u.positions::int[]
+         FROM unnest(v) u
+         WHERE u.lexeme = needle COLLATE "C"
+         LIMIT 1),
+        '{}'::int[])
+$fn$;
+
+-- Merged, sorted, unique positions over every lexeme beginning with `prefix`
+-- (the `appl*` primitive). Empty if nothing matches.
+CREATE OR REPLACE FUNCTION ts_prox_positions_prefix(v tsvector, prefix text) RETURNS int[]
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+    SET search_path = proxquery, pg_catalog AS
+$fn$
+    SELECT coalesce(
+        (SELECT array_agg(DISTINCT p ORDER BY p)
+         FROM (SELECT unnest(u.positions)::int AS p
+               FROM unnest(v) u
+               WHERE starts_with(u.lexeme, prefix)) s),
+        '{}'::int[])
+$fn$;
+
+-- Positions of every lexeme matching a `*`/`?` glob (with a leading literal
+-- `pfx` used to narrow the scan, matching the extension's prefix fast path).
+CREATE OR REPLACE FUNCTION _prox_pos_glob(v tsvector, pfx text, glob text) RETURNS int[]
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$
+    SELECT coalesce(
+        (SELECT array_agg(DISTINCT p ORDER BY p)
+         FROM (SELECT unnest(u.positions)::int AS p
+               FROM unnest(v) u
+               WHERE (pfx = '' OR starts_with(u.lexeme, pfx))
+                 AND u.lexeme LIKE _prox_glob_to_like(glob)) s),
+        '{}'::int[])
+$fn$;
+
+-- Positions of every lexeme matching the whole-lexeme-anchored regex.
+CREATE OR REPLACE FUNCTION _prox_pos_regex(v tsvector, pattern text) RETURNS int[]
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$
+    SELECT coalesce(
+        (SELECT array_agg(DISTINCT p ORDER BY p)
+         FROM (SELECT unnest(u.positions)::int AS p
+               FROM unnest(v) u
+               WHERE (u.lexeme COLLATE "C") ~ ('^(?:' || pattern || ')$')) s),
+        '{}'::int[])
+$fn$;
+
+-- ===========================================================================
+-- Array predicates  (the positional semantics over sorted int[] position lists)
+-- ===========================================================================
+
+-- within: some a within n of some b, either order  (∃ |aᵢ − bⱼ| ≤ n).
+CREATE OR REPLACE FUNCTION _prox_arr_within(a int[], b int[], n int) RETURNS boolean
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$ SELECT EXISTS (SELECT 1 FROM unnest(a) x, unnest(b) y WHERE abs(x - y) <= n) $fn$;
+
+-- pre: some a strictly before some b within n  (∃ 0 < bⱼ − aᵢ ≤ n).
+CREATE OR REPLACE FUNCTION _prox_arr_pre(a int[], b int[], n int) RETURNS boolean
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$ SELECT EXISTS (SELECT 1 FROM unnest(a) x, unnest(b) y WHERE y - x > 0 AND y - x <= n) $fn$;
+
+-- not_within: occurrence-level — some a has no qualifying b (true if b absent).
+-- ordered ⇒ the forbidden b lies after a, within n; else either side.
+CREATE OR REPLACE FUNCTION _prox_arr_not_within(a int[], b int[], n int, ordered boolean) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+BEGIN
+    IF coalesce(array_length(a, 1), 0) = 0 THEN RETURN false; END IF;
+    IF coalesce(array_length(b, 1), 0) = 0 THEN RETURN true; END IF;
+    RETURN EXISTS (
+        SELECT 1 FROM unnest(a) x
+        WHERE NOT EXISTS (
+            SELECT 1 FROM unnest(b) y
+            WHERE CASE WHEN ordered THEN (y > x AND y - x <= n)
+                       ELSE abs(x - y) <= n END));
+END
+$fn$;
+
+-- The positions of a and b that participate in some satisfying within/pre pair
+-- — the "region" a chained proximity operand composes against.
+CREATE OR REPLACE FUNCTION _prox_within_participants(a int[], b int[], n int, ordered boolean) RETURNS int[]
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$
+    SELECT coalesce(array_agg(p ORDER BY p), '{}'::int[]) FROM (
+        SELECT DISTINCT p FROM (
+            SELECT x AS p FROM unnest(a) x
+              WHERE EXISTS (SELECT 1 FROM unnest(b) y
+                            WHERE CASE WHEN ordered THEN (y > x AND y - x <= n)
+                                       ELSE abs(x - y) <= n END)
+            UNION ALL
+            SELECT y AS p FROM unnest(b) y
+              WHERE EXISTS (SELECT 1 FROM unnest(a) x
+                            WHERE CASE WHEN ordered THEN (x < y AND y - x <= n)
+                                       ELSE abs(x - y) <= n END)
+        ) u
+    ) s
+$fn$;
+
+-- The isolated a positions — those with no qualifying b (what a nested
+-- not-within contributes when composed).
+CREATE OR REPLACE FUNCTION _prox_not_within_participants(a int[], b int[], n int, ordered boolean) RETURNS int[]
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$
+    SELECT coalesce(array_agg(x ORDER BY x), '{}'::int[])
+    FROM unnest(a) x
+    WHERE NOT EXISTS (SELECT 1 FROM unnest(b) y
+                      WHERE CASE WHEN ordered THEN (y > x AND y - x <= n)
+                                 ELSE abs(x - y) <= n END)
+$fn$;
+
+-- ===========================================================================
+-- Public positional predicate functions
+-- ===========================================================================
+
+CREATE OR REPLACE FUNCTION ts_prox_within(v tsvector, a text, b text, n int) RETURNS boolean
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+    SET search_path = proxquery, pg_catalog AS
+$fn$ SELECT _prox_arr_within(ts_prox_positions(v, a), ts_prox_positions(v, b), n) $fn$;
+
+CREATE OR REPLACE FUNCTION ts_prox_pre(v tsvector, a text, b text, n int) RETURNS boolean
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+    SET search_path = proxquery, pg_catalog AS
+$fn$ SELECT _prox_arr_pre(ts_prox_positions(v, a), ts_prox_positions(v, b), n) $fn$;
+
+CREATE OR REPLACE FUNCTION ts_prox_not_within(v tsvector, a text, b text, n int) RETURNS boolean
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+    SET search_path = proxquery, pg_catalog AS
+$fn$ SELECT _prox_arr_not_within(ts_prox_positions(v, a), ts_prox_positions(v, b), n, false) $fn$;
+
+-- Same-occurrence chain over `terms`, each consecutive pair within its gaps[i].
+-- gaps must have exactly one fewer element than terms.
+CREATE OR REPLACE FUNCTION ts_prox_window(v tsvector, terms text[], gaps int[]) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE STRICT
+    SET search_path = proxquery, pg_catalog AS
+$fn$
+DECLARE
+    nterms int := coalesce(array_length(terms, 1), 0);
+    ngaps  int := coalesce(array_length(gaps, 1), 0);
+    reach  int[];
+    cur    int[];
+    g      int;
+    i      int;
+BEGIN
+    IF nterms = 0 OR ngaps <> nterms - 1 THEN
+        RAISE EXCEPTION 'ts_prox_window: gaps length must be one less than terms length (got % terms, % gaps)',
+            nterms, ngaps;
+    END IF;
+    reach := ts_prox_positions(v, terms[1]);
+    IF coalesce(array_length(reach, 1), 0) = 0 THEN RETURN false; END IF;
+    FOR i IN 2 .. nterms LOOP
+        g := gaps[i - 1];
+        cur := ts_prox_positions(v, terms[i]);
+        IF coalesce(array_length(cur, 1), 0) = 0 THEN RETURN false; END IF;
+        reach := ARRAY(
+            SELECT c FROM unnest(cur) c
+            WHERE EXISTS (SELECT 1 FROM unnest(reach) r WHERE abs(r - c) <= g)
+            ORDER BY c);
+        IF coalesce(array_length(reach, 1), 0) = 0 THEN RETURN false; END IF;
+    END LOOP;
+    RETURN true;
+END
+$fn$;
+
+-- ===========================================================================
+-- Lexer  (query text -> jsonb array of tokens)
+-- ===========================================================================
+--
+-- Token kinds: lparen rparen and or not | op_phrase{n} op_pre{n} op_within{n}
+-- op_notwithin{n,ord} | leaf{node}.  A "leaf" carries a finished AST node
+-- (term/prefix/glob/regex/phrase) so the parser's atom cases collapse to one.
+--
+-- AST node shapes (jsonb):
+--   {t:term,   v}                         {t:prefix, v}
+--   {t:glob,   g, p}                      {t:regex,  v}
+--   {t:phrase, atoms:[atom...], gaps:[]}  (atom = a term/prefix/glob node)
+--   {t:and, c:[]}  {t:or, c:[]}  {t:not, x}
+--   {t:within,    a, b, n, ord}           {t:notwithin, a, b, n, ord}
+
+-- Classify a standalone word, resolving `*`/`?` wildcards. Yields a
+-- term/prefix/glob node (also used as a phrase atom).
+CREATE OR REPLACE FUNCTION _prox_word_to_node(word text) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    lower text := _prox_alower(word);
+    stem  text;
+    body  text;
+BEGIN
+    IF right(lower, 2) = ':*' THEN
+        stem := left(lower, length(lower) - 2);
+        IF stem <> '' AND stem !~ '[*?]' THEN
+            RETURN jsonb_build_object('t', 'prefix', 'v', stem);
+        END IF;
+    END IF;
+    IF lower !~ '[*?]' THEN
+        RETURN jsonb_build_object('t', 'term', 'v', lower);
+    END IF;
+    IF lower = '*' THEN
+        RAISE EXCEPTION 'a bare `*` matches everything; give it a literal part';
+    END IF;
+    body := left(lower, length(lower) - 1);
+    IF right(lower, 1) = '*' AND body !~ '[*?]' THEN
+        RETURN jsonb_build_object('t', 'prefix', 'v', body);
+    END IF;
+    RETURN jsonb_build_object('t', 'glob', 'g', lower, 'p', _prox_glob_prefix(lower));
+END
+$fn$;
+
+-- Collapse a quoted phrase's atoms into a node: single atom → that node; else a
+-- phrase node with all-1 gaps (adjacency).
+CREATE OR REPLACE FUNCTION _prox_phrase_node(atoms jsonb) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    gaps jsonb := '[]'::jsonb;
+    k    int;
+BEGIN
+    IF jsonb_array_length(atoms) = 1 THEN
+        RETURN atoms -> 0;
+    END IF;
+    FOR k IN 1 .. jsonb_array_length(atoms) - 1 LOOP
+        gaps := gaps || jsonb_build_array(1);
+    END LOOP;
+    RETURN jsonb_build_object('t', 'phrase', 'atoms', atoms, 'gaps', gaps);
+END
+$fn$;
+
+-- Interpret a `<…>` bracket body into a single operator token.
+CREATE OR REPLACE FUNCTION _prox_bracket_op(content text) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+BEGIN
+    IF content = '-' THEN
+        RETURN jsonb_build_object('k', 'op_phrase', 'n', 1);
+    ELSIF left(content, 2) = '!~' THEN
+        RETURN jsonb_build_object('k', 'op_notwithin', 'n', _prox_parse_distance(substr(content, 3)), 'ord', false);
+    ELSIF left(content, 2) = '!-' THEN
+        RETURN jsonb_build_object('k', 'op_notwithin', 'n', _prox_parse_distance(substr(content, 3)), 'ord', true);
+    ELSIF left(content, 1) = '!' THEN
+        RAISE EXCEPTION 'not-within needs a direction: `<!~N>` (either order) or `<!-N>` (ordered)';
+    ELSIF left(content, 1) = '~' THEN
+        RETURN jsonb_build_object('k', 'op_within', 'n', _prox_parse_distance(substr(content, 2)));
+    ELSIF left(content, 1) = '-' THEN
+        RETURN jsonb_build_object('k', 'op_pre', 'n', _prox_parse_distance(substr(content, 2)));
+    ELSE
+        RETURN jsonb_build_object('k', 'op_phrase', 'n', _prox_parse_distance(content));
+    END IF;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_lex(input text) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    chars text[] := regexp_split_to_array(input, '');
+    n int := coalesce(array_length(chars, 1), 0);
+    i int := 1;
+    j int;
+    p0 int;
+    startp int;
+    c text;
+    content text;
+    phrase text;
+    atoms jsonb;
+    lexeme text;
+    word text;
+    toks jsonb := '[]'::jsonb;
+BEGIN
+    WHILE i <= n LOOP
+        c := chars[i];
+        IF c ~ '\s' THEN
+            i := i + 1;
+        ELSIF c = '(' THEN toks := toks || jsonb_build_array(jsonb_build_object('k', 'lparen')); i := i + 1;
+        ELSIF c = ')' THEN toks := toks || jsonb_build_array(jsonb_build_object('k', 'rparen')); i := i + 1;
+        ELSIF c = '&' THEN toks := toks || jsonb_build_array(jsonb_build_object('k', 'and')); i := i + 1;
+        ELSIF c = '|' THEN toks := toks || jsonb_build_array(jsonb_build_object('k', 'or')); i := i + 1;
+        ELSIF c = '!' THEN toks := toks || jsonb_build_array(jsonb_build_object('k', 'not')); i := i + 1;
+        ELSIF c = '<' THEN
+            j := i + 1;
+            WHILE j <= n AND chars[j] <> '>' LOOP j := j + 1; END LOOP;
+            IF j > n THEN RAISE EXCEPTION 'unterminated `<…>` operator'; END IF;
+            content := array_to_string(chars[i + 1 : j - 1], '');
+            i := j + 1;
+            toks := toks || jsonb_build_array(_prox_bracket_op(content));
+        ELSIF c = '"' THEN
+            j := i + 1;
+            WHILE j <= n AND chars[j] <> '"' LOOP j := j + 1; END LOOP;
+            IF j > n THEN RAISE EXCEPTION 'unterminated quoted phrase'; END IF;
+            phrase := array_to_string(chars[i + 1 : j - 1], '');
+            i := j + 1;
+            SELECT coalesce(jsonb_agg(_prox_word_to_node(w) ORDER BY ord), '[]'::jsonb)
+              INTO atoms
+              FROM (SELECT w, ord FROM unnest(regexp_split_to_array(phrase, '\s+'))
+                      WITH ORDINALITY AS t(w, ord) WHERE w <> '') q;
+            IF jsonb_array_length(atoms) = 0 THEN RAISE EXCEPTION 'empty quoted phrase'; END IF;
+            toks := toks || jsonb_build_array(jsonb_build_object('k', 'leaf', 'node', _prox_phrase_node(atoms)));
+        ELSIF c = '''' THEN
+            j := i + 1;
+            lexeme := '';
+            LOOP
+                IF j > n THEN RAISE EXCEPTION 'unterminated quoted term'; END IF;
+                IF chars[j] = '''' AND j < n AND chars[j + 1] = '''' THEN
+                    lexeme := lexeme || ''''; j := j + 2;
+                ELSIF chars[j] = '''' THEN
+                    j := j + 1; EXIT;
+                ELSE
+                    lexeme := lexeme || chars[j]; j := j + 1;
+                END IF;
+            END LOOP;
+            IF lexeme = '' THEN RAISE EXCEPTION 'empty quoted term'; END IF;
+            i := j;
+            toks := toks || jsonb_build_array(jsonb_build_object(
+                'k', 'leaf', 'node', jsonb_build_object('t', 'term', 'v', _prox_alower(lexeme))));
+        ELSIF c = '#' THEN
+            IF i >= n OR chars[i + 1] <> '#' THEN
+                RAISE EXCEPTION 'a single `#` is not valid; use `##regex##` or quote it';
+            END IF;
+            p0 := i + 2;
+            j := p0;
+            WHILE j + 1 <= n AND NOT (chars[j] = '#' AND chars[j + 1] = '#') LOOP j := j + 1; END LOOP;
+            IF j + 1 > n OR NOT (chars[j] = '#' AND chars[j + 1] = '#') THEN
+                RAISE EXCEPTION 'unterminated `##regex##`';
+            END IF;
+            i := j + 2;
+            toks := toks || jsonb_build_array(jsonb_build_object(
+                'k', 'leaf', 'node', jsonb_build_object('t', 'regex', 'v', array_to_string(chars[p0 : j - 1], ''))));
+        ELSE
+            startp := i;
+            WHILE i <= n AND _prox_is_word_char(chars[i]) LOOP i := i + 1; END LOOP;
+            IF i = startp THEN RAISE EXCEPTION 'unexpected character `%`', c; END IF;
+            word := array_to_string(chars[startp : i - 1], '');
+            toks := toks || jsonb_build_array(jsonb_build_object('k', 'leaf', 'node', _prox_word_to_node(word)));
+        END IF;
+    END LOOP;
+    RETURN toks;
+END
+$fn$;
+
+-- ===========================================================================
+-- Parser  (recursive descent; precedence | < & < proximity < !)
+-- ===========================================================================
+-- Each parse function returns {node, pos}.
+
+CREATE OR REPLACE FUNCTION _prox_as_atom(node jsonb) RETURNS jsonb
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$ SELECT CASE WHEN node ->> 't' IN ('term', 'prefix', 'glob') THEN node ELSE NULL END $fn$;
+
+CREATE OR REPLACE FUNCTION _prox_extend_phrase(cur jsonb, rhs jsonb, gap int) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    rhs_atom jsonb := _prox_as_atom(rhs);
+    left_atom jsonb;
+BEGIN
+    IF rhs_atom IS NULL THEN
+        RAISE EXCEPTION 'phrase/distance operator (`<->`, `<N>`) needs term operands';
+    END IF;
+    IF cur ->> 't' = 'phrase' THEN
+        RETURN jsonb_build_object('t', 'phrase',
+            'atoms', (cur -> 'atoms') || jsonb_build_array(rhs_atom),
+            'gaps',  (cur -> 'gaps')  || jsonb_build_array(gap));
+    END IF;
+    left_atom := _prox_as_atom(cur);
+    IF left_atom IS NULL THEN
+        RAISE EXCEPTION 'phrase/distance operator (`<->`, `<N>`) needs term operands';
+    END IF;
+    RETURN jsonb_build_object('t', 'phrase',
+        'atoms', jsonb_build_array(left_atom, rhs_atom),
+        'gaps',  jsonb_build_array(gap));
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_build_prox(first jsonb, ops jsonb) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    cur jsonb := first;
+    o jsonb;
+    opk text;
+    rhs jsonb;
+    nn int;
+    i int;
+BEGIN
+    FOR i IN 0 .. jsonb_array_length(ops) - 1 LOOP
+        o := ops -> i;
+        opk := o ->> 'op';
+        rhs := o -> 'rhs';
+        nn := (o ->> 'n')::int;
+        IF opk = 'phrase' THEN
+            cur := _prox_extend_phrase(cur, rhs, nn);
+        ELSIF opk = 'pre' THEN
+            cur := jsonb_build_object('t', 'within', 'a', cur, 'b', rhs, 'n', nn, 'ord', true);
+        ELSIF opk = 'within' THEN
+            cur := jsonb_build_object('t', 'within', 'a', cur, 'b', rhs, 'n', nn, 'ord', false);
+        ELSIF opk = 'notwithin' THEN
+            cur := jsonb_build_object('t', 'notwithin', 'a', cur, 'b', rhs, 'n', nn, 'ord', (o ->> 'ord')::boolean);
+        END IF;
+    END LOOP;
+    RETURN cur;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_p_atom(toks jsonb, pos int) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    tk jsonb := toks -> pos;
+    k text;
+    r jsonb;
+    p2 int;
+BEGIN
+    IF tk IS NULL THEN RAISE EXCEPTION 'unexpected end of query'; END IF;
+    k := tk ->> 'k';
+    IF k = 'lparen' THEN
+        r := _prox_p_or(toks, pos + 1);
+        p2 := (r ->> 'pos')::int;
+        IF (toks -> p2) ->> 'k' IS DISTINCT FROM 'rparen' THEN
+            RAISE EXCEPTION 'expected `)`';
+        END IF;
+        RETURN jsonb_build_object('node', r -> 'node', 'pos', p2 + 1);
+    ELSIF k = 'leaf' THEN
+        RETURN jsonb_build_object('node', tk -> 'node', 'pos', pos + 1);
+    ELSE
+        RAISE EXCEPTION 'unexpected token % (expected a term, phrase, or `(`)', tk::text;
+    END IF;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_p_unary(toks jsonb, pos int) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    r jsonb;
+BEGIN
+    IF (toks -> pos) ->> 'k' = 'not' THEN
+        r := _prox_p_unary(toks, pos + 1);
+        RETURN jsonb_build_object('node', jsonb_build_object('t', 'not', 'x', r -> 'node'),
+                                  'pos', (r ->> 'pos')::int);
+    END IF;
+    RETURN _prox_p_atom(toks, pos);
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_p_prox(toks jsonb, pos int) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    r jsonb;
+    first jsonb;
+    ops jsonb := '[]'::jsonb;
+    op jsonb;
+    k text;
+    p int := pos;
+BEGIN
+    r := _prox_p_unary(toks, p);
+    first := r -> 'node';
+    p := (r ->> 'pos')::int;
+    LOOP
+        k := (toks -> p) ->> 'k';
+        IF k = 'op_phrase' THEN
+            op := jsonb_build_object('op', 'phrase', 'n', ((toks -> p) ->> 'n')::int);
+        ELSIF k = 'op_pre' THEN
+            op := jsonb_build_object('op', 'pre', 'n', ((toks -> p) ->> 'n')::int);
+        ELSIF k = 'op_within' THEN
+            op := jsonb_build_object('op', 'within', 'n', ((toks -> p) ->> 'n')::int);
+        ELSIF k = 'op_notwithin' THEN
+            op := jsonb_build_object('op', 'notwithin', 'n', ((toks -> p) ->> 'n')::int,
+                                     'ord', ((toks -> p) ->> 'ord')::boolean);
+        ELSE
+            EXIT;
+        END IF;
+        p := p + 1;
+        r := _prox_p_unary(toks, p);
+        op := op || jsonb_build_object('rhs', r -> 'node');
+        p := (r ->> 'pos')::int;
+        ops := ops || jsonb_build_array(op);
+    END LOOP;
+    RETURN jsonb_build_object('node', _prox_build_prox(first, ops), 'pos', p);
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_p_and(toks jsonb, pos int) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    r jsonb;
+    branches jsonb;
+    p int := pos;
+BEGIN
+    r := _prox_p_prox(toks, p);
+    branches := jsonb_build_array(r -> 'node');
+    p := (r ->> 'pos')::int;
+    WHILE (toks -> p) ->> 'k' = 'and' LOOP
+        p := p + 1;
+        r := _prox_p_prox(toks, p);
+        branches := branches || jsonb_build_array(r -> 'node');
+        p := (r ->> 'pos')::int;
+    END LOOP;
+    RETURN jsonb_build_object(
+        'node', CASE WHEN jsonb_array_length(branches) = 1 THEN branches -> 0
+                     ELSE jsonb_build_object('t', 'and', 'c', branches) END,
+        'pos', p);
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_p_or(toks jsonb, pos int) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    r jsonb;
+    branches jsonb;
+    p int := pos;
+BEGIN
+    r := _prox_p_and(toks, p);
+    branches := jsonb_build_array(r -> 'node');
+    p := (r ->> 'pos')::int;
+    WHILE (toks -> p) ->> 'k' = 'or' LOOP
+        p := p + 1;
+        r := _prox_p_and(toks, p);
+        branches := branches || jsonb_build_array(r -> 'node');
+        p := (r ->> 'pos')::int;
+    END LOOP;
+    RETURN jsonb_build_object(
+        'node', CASE WHEN jsonb_array_length(branches) = 1 THEN branches -> 0
+                     ELSE jsonb_build_object('t', 'or', 'c', branches) END,
+        'pos', p);
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_parse(input text) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    toks jsonb := _prox_lex(input);
+    r jsonb;
+BEGIN
+    IF jsonb_array_length(toks) = 0 THEN RAISE EXCEPTION 'empty query'; END IF;
+    r := _prox_p_or(toks, 0);
+    IF (r ->> 'pos')::int <> jsonb_array_length(toks) THEN
+        RAISE EXCEPTION 'unexpected token %', (toks -> (r ->> 'pos')::int)::text;
+    END IF;
+    RETURN r -> 'node';
+END
+$fn$;
+
+-- ===========================================================================
+-- Normalization  (lift AND/NOT out of proximity operands; keep OR/phrase in)
+-- ===========================================================================
+
+CREATE OR REPLACE FUNCTION _prox_flatten(is_and boolean, children jsonb) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    out jsonb := '[]'::jsonb;
+    c jsonb;
+BEGIN
+    FOR c IN SELECT value FROM jsonb_array_elements(children) WITH ORDINALITY AS t(value, ord) ORDER BY ord LOOP
+        IF is_and AND c ->> 't' = 'and' THEN
+            out := out || (c -> 'c');
+        ELSIF (NOT is_and) AND c ->> 't' = 'or' THEN
+            out := out || (c -> 'c');
+        ELSE
+            out := out || jsonb_build_array(c);
+        END IF;
+    END LOOP;
+    IF jsonb_array_length(out) = 1 THEN
+        RETURN out -> 0;
+    ELSIF is_and THEN
+        RETURN jsonb_build_object('t', 'and', 'c', out);
+    ELSE
+        RETURN jsonb_build_object('t', 'or', 'c', out);
+    END IF;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_make_within(a jsonb, b jsonb, n int, ordered boolean) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+BEGIN
+    IF a ->> 't' = 'and' THEN
+        RETURN _prox_flatten(true, (SELECT jsonb_agg(_prox_make_within(x, b, n, ordered) ORDER BY ord)
+                                    FROM jsonb_array_elements(a -> 'c') WITH ORDINALITY AS t(x, ord)));
+    ELSIF a ->> 't' = 'not' THEN
+        RETURN jsonb_build_object('t', 'not', 'x', _prox_make_within(a -> 'x', b, n, ordered));
+    ELSIF b ->> 't' = 'and' THEN
+        RETURN _prox_flatten(true, (SELECT jsonb_agg(_prox_make_within(a, y, n, ordered) ORDER BY ord)
+                                    FROM jsonb_array_elements(b -> 'c') WITH ORDINALITY AS t(y, ord)));
+    ELSIF b ->> 't' = 'not' THEN
+        RETURN jsonb_build_object('t', 'not', 'x', _prox_make_within(a, b -> 'x', n, ordered));
+    ELSE
+        RETURN jsonb_build_object('t', 'within', 'a', a, 'b', b, 'n', n, 'ord', ordered);
+    END IF;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_make_not_within(a jsonb, b jsonb, n int, ordered boolean) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+BEGIN
+    IF a ->> 't' = 'and' THEN
+        RETURN _prox_flatten(true, (SELECT jsonb_agg(_prox_make_not_within(x, b, n, ordered) ORDER BY ord)
+                                    FROM jsonb_array_elements(a -> 'c') WITH ORDINALITY AS t(x, ord)));
+    ELSIF a ->> 't' = 'not' THEN
+        RETURN jsonb_build_object('t', 'not', 'x', _prox_make_not_within(a -> 'x', b, n, ordered));
+    ELSIF b ->> 't' = 'and' THEN
+        RETURN _prox_flatten(true, (SELECT jsonb_agg(_prox_make_not_within(a, y, n, ordered) ORDER BY ord)
+                                    FROM jsonb_array_elements(b -> 'c') WITH ORDINALITY AS t(y, ord)));
+    ELSIF b ->> 't' = 'not' THEN
+        RETURN jsonb_build_object('t', 'not', 'x', _prox_make_not_within(a, b -> 'x', n, ordered));
+    ELSE
+        RETURN jsonb_build_object('t', 'notwithin', 'a', a, 'b', b, 'n', n, 'ord', ordered);
+    END IF;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_normalize(node jsonb) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    t text := node ->> 't';
+BEGIN
+    IF t = 'and' THEN
+        RETURN _prox_flatten(true, (SELECT jsonb_agg(_prox_normalize(c) ORDER BY ord)
+                                    FROM jsonb_array_elements(node -> 'c') WITH ORDINALITY AS t(c, ord)));
+    ELSIF t = 'or' THEN
+        RETURN _prox_flatten(false, (SELECT jsonb_agg(_prox_normalize(c) ORDER BY ord)
+                                     FROM jsonb_array_elements(node -> 'c') WITH ORDINALITY AS t(c, ord)));
+    ELSIF t = 'not' THEN
+        RETURN jsonb_build_object('t', 'not', 'x', _prox_normalize(node -> 'x'));
+    ELSIF t = 'within' THEN
+        RETURN _prox_make_within(_prox_normalize(node -> 'a'), _prox_normalize(node -> 'b'),
+                                 (node ->> 'n')::int, (node ->> 'ord')::boolean);
+    ELSIF t = 'notwithin' THEN
+        RETURN _prox_make_not_within(_prox_normalize(node -> 'a'), _prox_normalize(node -> 'b'),
+                                     (node ->> 'n')::int, (node ->> 'ord')::boolean);
+    ELSE
+        RETURN node;
+    END IF;
+END
+$fn$;
+
+-- ===========================================================================
+-- Skeleton lowering  ->  lexeme-presence tsquery string  (NULL = no constraint)
+-- ===========================================================================
+
+CREATE OR REPLACE FUNCTION _prox_conj(parts text[]) RETURNS text
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$ SELECT CASE WHEN array_length($1, 1) = 1 THEN $1[1]
+                 ELSE '(' || array_to_string($1, ' & ') || ')' END $fn$;
+
+CREATE OR REPLACE FUNCTION _prox_optional_conj(parts text[]) RETURNS text
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    present text[];
+BEGIN
+    present := ARRAY(SELECT p FROM unnest(parts) p WHERE p IS NOT NULL);
+    IF coalesce(array_length(present, 1), 0) = 0 THEN RETURN NULL; END IF;
+    RETURN _prox_conj(present);
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_native_phrase_atom(atom jsonb) RETURNS text
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    t text := atom ->> 't';
+BEGIN
+    IF t = 'term' THEN
+        RETURN _prox_quote_lexeme(atom ->> 'v');
+    ELSIF t = 'prefix' THEN
+        RETURN _prox_quote_lexeme(atom ->> 'v') || ':*';
+    ELSIF t = 'glob' THEN
+        IF (atom ->> 'p') <> '' THEN RETURN _prox_quote_lexeme(atom ->> 'p') || ':*'; ELSE RETURN NULL; END IF;
+    END IF;
+    RETURN NULL;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_phrase_skeleton(atoms jsonb, gaps jsonb) RETURNS text
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    native text[] := '{}';
+    keyed  text[] := '{}';
+    allkeyed boolean := true;
+    na text;
+    a jsonb;
+    s text;
+    g int;
+    op text;
+    i int;
+BEGIN
+    FOR a IN SELECT value FROM jsonb_array_elements(atoms) WITH ORDINALITY AS t(value, ord) ORDER BY ord LOOP
+        na := _prox_native_phrase_atom(a);
+        native := array_append(native, na);
+        IF na IS NULL THEN allkeyed := false; ELSE keyed := array_append(keyed, na); END IF;
+    END LOOP;
+    IF allkeyed THEN
+        s := native[1];
+        FOR i IN 2 .. array_length(native, 1) LOOP
+            g := (gaps ->> (i - 2))::int;
+            IF g = 1 THEN op := '<->'; ELSE op := '<' || g || '>'; END IF;
+            s := s || ' ' || op || ' ' || native[i];
+        END LOOP;
+        RETURN '(' || s || ')';
+    ELSE
+        IF coalesce(array_length(keyed, 1), 0) = 0 THEN RETURN NULL; END IF;
+        RETURN _prox_conj(keyed);
+    END IF;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_skeleton(node jsonb) RETURNS text
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    t text := node ->> 't';
+    present text[];
+    parts text[] := '{}';
+    c jsonb;
+    s text;
+BEGIN
+    IF t = 'term' THEN
+        RETURN _prox_quote_lexeme(node ->> 'v');
+    ELSIF t = 'prefix' THEN
+        RETURN _prox_quote_lexeme(node ->> 'v') || ':*';
+    ELSIF t = 'glob' THEN
+        IF (node ->> 'p') <> '' THEN RETURN _prox_quote_lexeme(node ->> 'p') || ':*'; ELSE RETURN NULL; END IF;
+    ELSIF t = 'regex' THEN
+        RETURN NULL;
+    ELSIF t = 'phrase' THEN
+        RETURN _prox_phrase_skeleton(node -> 'atoms', node -> 'gaps');
+    ELSIF t = 'within' THEN
+        RETURN _prox_optional_conj(ARRAY[_prox_skeleton(node -> 'a'), _prox_skeleton(node -> 'b')]);
+    ELSIF t = 'notwithin' THEN
+        RETURN _prox_skeleton(node -> 'a');
+    ELSIF t = 'and' THEN
+        present := ARRAY(SELECT _prox_skeleton(value)
+                         FROM jsonb_array_elements(node -> 'c') WITH ORDINALITY AS x(value, ord)
+                         WHERE _prox_skeleton(value) IS NOT NULL
+                         ORDER BY ord);
+        IF coalesce(array_length(present, 1), 0) = 0 THEN RETURN NULL; END IF;
+        RETURN _prox_conj(present);
+    ELSIF t = 'or' THEN
+        FOR c IN SELECT value FROM jsonb_array_elements(node -> 'c') WITH ORDINALITY AS x(value, ord) ORDER BY ord LOOP
+            s := _prox_skeleton(c);
+            IF s IS NULL THEN RETURN NULL; END IF;
+            parts := array_append(parts, s);
+        END LOOP;
+        RETURN '(' || array_to_string(parts, ' | ') || ')';
+    ELSE  -- not
+        RETURN NULL;
+    END IF;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_to_tsquery_string(input text) RETURNS text
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    s text := _prox_skeleton(_prox_normalize(_prox_parse(input)));
+BEGIN
+    IF s IS NULL THEN
+        RAISE EXCEPTION 'query has no positive term to drive the index; add an AND-ed positive term';
+    END IF;
+    RETURN s;
+END
+$fn$;
+
+-- ===========================================================================
+-- Regex validation  ->  fail fast on a malformed `##regex##`
+-- ===========================================================================
+
+CREATE OR REPLACE FUNCTION _prox_regex_ok(pattern text) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+BEGIN
+    PERFORM '' ~ ('^(?:' || pattern || ')$');
+    RETURN true;
+EXCEPTION WHEN invalid_regular_expression THEN
+    RETURN false;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_validate_regexes(node jsonb) RETURNS void
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    t text := node ->> 't';
+    c jsonb;
+BEGIN
+    IF t = 'regex' THEN
+        IF NOT _prox_regex_ok(node ->> 'v') THEN
+            RAISE EXCEPTION 'invalid regex `%`', node ->> 'v';
+        END IF;
+    ELSIF t IN ('and', 'or') THEN
+        FOR c IN SELECT value FROM jsonb_array_elements(node -> 'c') AS x(value) LOOP
+            PERFORM _prox_validate_regexes(c);
+        END LOOP;
+    ELSIF t = 'not' THEN
+        PERFORM _prox_validate_regexes(node -> 'x');
+    ELSIF t IN ('within', 'notwithin') THEN
+        PERFORM _prox_validate_regexes(node -> 'a');
+        PERFORM _prox_validate_regexes(node -> 'b');
+    END IF;
+END
+$fn$;
+
+-- ===========================================================================
+-- Recheck evaluation  (positional semantics on a tsvector)
+-- ===========================================================================
+
+CREATE OR REPLACE FUNCTION _prox_positions(node jsonb, v tsvector) RETURNS int[]
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    t text := node ->> 't';
+    atoms jsonb;
+    gaps jsonb;
+    reach int[];
+    cur int[];
+    res int[] := '{}';
+    g int;
+    i int;
+    c jsonb;
+BEGIN
+    IF t = 'term' THEN
+        RETURN ts_prox_positions(v, node ->> 'v');
+    ELSIF t = 'prefix' THEN
+        RETURN ts_prox_positions_prefix(v, node ->> 'v');
+    ELSIF t = 'glob' THEN
+        RETURN _prox_pos_glob(v, node ->> 'p', node ->> 'g');
+    ELSIF t = 'regex' THEN
+        RETURN _prox_pos_regex(v, node ->> 'v');
+    ELSIF t = 'phrase' THEN
+        atoms := node -> 'atoms';
+        gaps := node -> 'gaps';
+        reach := _prox_positions(atoms -> 0, v);
+        IF coalesce(array_length(reach, 1), 0) = 0 THEN RETURN '{}'; END IF;
+        FOR i IN 1 .. jsonb_array_length(atoms) - 1 LOOP
+            cur := _prox_positions(atoms -> i, v);
+            g := (gaps ->> (i - 1))::int;
+            reach := ARRAY(SELECT cc FROM unnest(cur) cc WHERE (cc - g) = ANY(reach) ORDER BY cc);
+            IF coalesce(array_length(reach, 1), 0) = 0 THEN RETURN '{}'; END IF;
+        END LOOP;
+        RETURN reach;
+    ELSIF t = 'or' THEN
+        FOR c IN SELECT value FROM jsonb_array_elements(node -> 'c') AS x(value) LOOP
+            res := res || _prox_positions(c, v);
+        END LOOP;
+        RETURN coalesce((SELECT array_agg(DISTINCT p ORDER BY p) FROM unnest(res) p), '{}'::int[]);
+    ELSIF t = 'within' THEN
+        RETURN _prox_within_participants(_prox_positions(node -> 'a', v), _prox_positions(node -> 'b', v),
+                                         (node ->> 'n')::int, (node ->> 'ord')::boolean);
+    ELSIF t = 'notwithin' THEN
+        RETURN _prox_not_within_participants(_prox_positions(node -> 'a', v), _prox_positions(node -> 'b', v),
+                                             (node ->> 'n')::int, (node ->> 'ord')::boolean);
+    ELSE
+        RAISE EXCEPTION 'AND/NOT cannot be a proximity operand (normalization should have lifted it)';
+    END IF;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_eval(node jsonb, v tsvector) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    t text := node ->> 't';
+    c jsonb;
+    pa int[];
+    pb int[];
+BEGIN
+    IF t = 'and' THEN
+        FOR c IN SELECT value FROM jsonb_array_elements(node -> 'c') AS x(value) LOOP
+            IF NOT _prox_eval(c, v) THEN RETURN false; END IF;
+        END LOOP;
+        RETURN true;
+    ELSIF t = 'or' THEN
+        FOR c IN SELECT value FROM jsonb_array_elements(node -> 'c') AS x(value) LOOP
+            IF _prox_eval(c, v) THEN RETURN true; END IF;
+        END LOOP;
+        RETURN false;
+    ELSIF t = 'not' THEN
+        RETURN NOT _prox_eval(node -> 'x', v);
+    ELSIF t = 'within' THEN
+        pa := _prox_positions(node -> 'a', v);
+        pb := _prox_positions(node -> 'b', v);
+        IF (node ->> 'ord')::boolean THEN
+            RETURN _prox_arr_pre(pa, pb, (node ->> 'n')::int);
+        ELSE
+            RETURN _prox_arr_within(pa, pb, (node ->> 'n')::int);
+        END IF;
+    ELSIF t = 'notwithin' THEN
+        RETURN _prox_arr_not_within(_prox_positions(node -> 'a', v), _prox_positions(node -> 'b', v),
+                                    (node ->> 'n')::int, (node ->> 'ord')::boolean);
+    ELSE  -- term / prefix / glob / regex / phrase
+        RETURN coalesce(array_length(_prox_positions(node, v), 1), 0) > 0;
+    END IF;
+END
+$fn$;
+
+-- ===========================================================================
+-- Public compiler entry points  (names/signatures match the extension)
+-- ===========================================================================
+
+-- Parse a DSL string and emit the lexeme-presence skeleton as a
+-- `to_tsquery('simple', …)` input string.
+CREATE OR REPLACE FUNCTION ts_prox_query_skeleton(query text) RETURNS text
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE STRICT
+    SET search_path = proxquery, pg_catalog AS
+$fn$
+BEGIN
+    RETURN _prox_to_tsquery_string(query);
+EXCEPTION WHEN OTHERS THEN
+    RAISE EXCEPTION 'ts_prox_query: %', SQLERRM;
+END
+$fn$;
+
+-- One query string → the index-selection tsquery.
+CREATE OR REPLACE FUNCTION ts_prox_query(query text) RETURNS tsquery
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+    SET search_path = proxquery, pg_catalog AS
+$fn$ SELECT to_tsquery('simple', ts_prox_query_skeleton(query)) $fn$;
+
+-- Evaluate the DSL's positional semantics on `v` — the recheck that pairs with
+-- ts_prox_query for index selection.
+CREATE OR REPLACE FUNCTION ts_prox_match(v tsvector, query text) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE STRICT
+    SET search_path = proxquery, pg_catalog AS
+$fn$
+DECLARE
+    node jsonb;
+BEGIN
+    node := _prox_normalize(_prox_parse(query));
+    PERFORM _prox_validate_regexes(node);
+    RETURN _prox_eval(node, v);
+EXCEPTION WHEN OTHERS THEN
+    RAISE EXCEPTION 'ts_prox_match: %', SQLERRM;
+END
+$fn$;
+
+-- NOTE: no `@~@` operator. The native extension's single indexable operator
+-- needs a C planner support function that cannot be written in SQL; a SQL-only
+-- look-alike would silently seq-scan every query. So proximity queries here are
+-- always written as the two index-served clauses (the same plan the operator
+-- expands to under the extension):
+--     WHERE tsv @@ proxquery.ts_prox_query(q) AND proxquery.ts_prox_match(tsv, q)

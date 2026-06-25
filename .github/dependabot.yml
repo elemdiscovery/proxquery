@@ -1,0 +1,25 @@
+# Keep the SHA-pinned GitHub Actions in .github/workflows/ current. SHA pins
+# never move on their own, so without this they silently go stale — exactly the
+# Node 20 deprecation that prompted pinning them. Dependabot bumps both the SHA
+# and the trailing `# version` comment when a new release lands.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    # Match the repo's conventional-commit style: "ci(deps): bump ...".
+    commit-message:
+      prefix: ci
+      include: scope
+    # One grouped PR per run rather than one per action — less review churn.
+    groups:
+      actions:
+        patterns:
+          - "*"
+    # dtolnay/rust-toolchain is pinned to a commit on its `stable` branch, which
+    # tracks the current stable Rust channel. Dependabot would retarget the pin
+    # to the latest *version* tag (e.g. 1.89.0), turning channel-tracking into a
+    # fixed-version pin — so exclude it; bump that SHA by hand if ever needed.
+    ignore:
+      - dependency-name: dtolnay/rust-toolchain

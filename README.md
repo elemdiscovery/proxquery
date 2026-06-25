@@ -22,6 +22,26 @@ CREATE EXTENSION proxquery;
 
 Requires PostgreSQL 16+. To build and install it from source, see [Development](#development).
 
+### No compiled extension? Use the pure-SQL port
+
+On managed Postgres where you can't load a custom extension (Cloud SQL, RDS,
+Azure, …), [sql/proxquery_pure.sql](sql/proxquery_pure.sql) is a drop-in,
+extension-free implementation — a plain migration with the same function names
+and identical results, installed into a dedicated `proxquery` schema. The single
+indexable `@~@` operator needs a C planner support function, so the pure port
+omits it and you write the two-clause form it expands to (the index-served path):
+
+```sql
+SELECT * FROM docs
+WHERE body_tsv @@ proxquery.ts_prox_query('quick <~3> fox')   -- GIN index selects
+  AND proxquery.ts_prox_match(body_tsv, 'quick <~3> fox');      -- recheck refines
+```
+
+The native extension is relocatable, so migrating is just
+`DROP SCHEMA proxquery CASCADE; CREATE EXTENSION proxquery SCHEMA proxquery;` —
+those two-clause queries keep working verbatim. See
+[docs/PURE_SQL.md](docs/PURE_SQL.md) for the full story.
+
 ## Usage
 
 Query a `tsvector` column with the `@~@` operator. The right-hand side is a query
@@ -174,10 +194,12 @@ The [bench/](bench/) scripts are plain SQL piped into a `cargo pgrx run` session
 ```sh
 cargo pgrx run pg17 proxquery < bench/native_vs_proxquery.sql   # proxquery vs native FTS
 cargo pgrx run pg17 proxquery < bench/proximity_bench.sql       # proxquery vs the unnest baseline
+cargo pgrx run pg17 proxquery < bench/pure_vs_extension.sql     # pure-SQL port vs the extension
 ```
 
 Corpus size is tunable via psql vars, e.g. `-v ndocs=50000` (see the header
-comments in each script).
+comments in each script). `pure_vs_extension.sql` also loads the pure port from
+`sql/proxquery_pure.sql`, so run it from the repo root.
 
 ### Install into a system Postgres
 
