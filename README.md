@@ -20,8 +20,7 @@ The motivation is to implement query syntax similar to dtSearch and Lucene witho
 CREATE EXTENSION proxquery;
 ```
 
-Requires PostgreSQL 15+. The extension is `trusted` and has no external
-dependencies. To build and install it from source, see [Development](#development).
+Requires PostgreSQL 16+. To build and install it from source, see [Development](#development).
 
 ## Usage
 
@@ -93,7 +92,7 @@ The operator is built on plain SQL functions, which can also be used directly:
 - `ts_prox_query(text) -> tsquery` / `ts_prox_match(tsvector, text) -> bool` — the
   compiler behind `@~@` (index selection and recheck).
 
-Notice `ts_prox_window` isn't the same as using the proximity operators in an associative way and is not availale via DSL syntax.
+Notice `ts_prox_window` isn't the same as using the proximity operators in an associative way and is not available via DSL syntax.
 
 The `ts_prox_window`function instead 'chains' the proximity onto each specific lexeme hit rather than onto the spanning phrase formed by the lexemes matched in the earlier query. (If that makes sense I'm sorry.)
 
@@ -157,7 +156,7 @@ temporary Postgres instance:
 cargo pgrx test pg17        # or: cargo test --features pg_test
 ```
 
-`pg17` is the local default; CI runs the same suite against `pg15`–`pg18` (see
+`pg17` is the local default; CI runs the same suite against `pg16`–`pg18` (see
 [Other PostgreSQL versions](#other-postgresql-versions) and
 [.github/workflows/test.yml](.github/workflows/test.yml)).
 
@@ -195,7 +194,7 @@ directory tree for packaging instead, use `cargo pgrx package`.
 ### Other PostgreSQL versions
 
 `pg17` is the default for local development. The crate has features for
-`pg15`–`pg18`, and CI runs the test suite against every one of them
+`pg16`–`pg18`, and CI runs the test suite against each of them
 ([.github/workflows/test.yml](.github/workflows/test.yml)). Build against another
 major version locally by swapping the feature, e.g.:
 

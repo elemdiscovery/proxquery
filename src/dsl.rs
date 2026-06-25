@@ -37,11 +37,14 @@
 //! - `(a | b) <~N> c` → kept: OR distributes into the position-set union
 //! - `"a b"   <~N> c` → kept: the phrase's positions are its end positions
 
-/// A phrase/distance element.
+/// A phrase/distance element. A phrase matches per-atom on position sets, so an
+/// atom may be a wildcard (`"*ology class"`): the glob contributes the positions
+/// of every lexeme it matches, and adjacency is checked against that set.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Atom {
     Term(String),
     Prefix(String),
+    Glob { glob: String, prefix: String },
 }
 
 /// The query AST. After [`normalize`], `&`/`|`/`!` appear only at/above the
@@ -135,16 +138,16 @@ fn word_to_tok(word: &str) -> Result<Tok, String> {
     Ok(Tok::Glob(lower, prefix))
 }
 
-fn word_atom(word: &str) -> Atom {
-    let lower = word.to_ascii_lowercase();
-    for suffix in [":*", "*"] {
-        if let Some(stem) = lower.strip_suffix(suffix) {
-            if !stem.is_empty() {
-                return Atom::Prefix(stem.to_string());
-            }
-        }
-    }
-    Atom::Term(lower)
+/// Classify a phrase word, reusing the standalone-word rules so a phrase atom can
+/// be a term, a prefix (`appl*`), or a glob (`*ology`, `te?t`). A `##regex##` can't
+/// appear here — phrases split on whitespace and a regex may contain spaces.
+fn word_atom(word: &str) -> Result<Atom, String> {
+    Ok(match word_to_tok(word)? {
+        Tok::Term(t) => Atom::Term(t),
+        Tok::Prefix(p) => Atom::Prefix(p),
+        Tok::Glob(glob, prefix) => Atom::Glob { glob, prefix },
+        _ => unreachable!("word_to_tok yields only Term/Prefix/Glob"),
+    })
 }
 
 fn is_word_char(c: char) -> bool {
@@ -215,7 +218,7 @@ fn lex(input: &str) -> Result<Vec<Tok>, String> {
             }
             let phrase: String = chars[start..i].iter().collect();
             i += 1;
-            let atoms: Vec<Atom> = phrase.split_whitespace().map(word_atom).collect();
+            let atoms = phrase.split_whitespace().map(word_atom).collect::<Result<Vec<Atom>, _>>()?;
             if atoms.is_empty() {
                 return Err("empty quoted phrase".into());
             }
@@ -385,6 +388,7 @@ fn phrase_node(atoms: Vec<Atom>) -> Node {
         return match atoms.into_iter().next().unwrap() {
             Atom::Term(t) => Node::Term(t),
             Atom::Prefix(p) => Node::Prefix(p),
+            Atom::Glob { glob, prefix } => Node::Glob { glob, prefix },
         };
     }
     let gaps = vec![1; atoms.len() - 1];
@@ -395,6 +399,7 @@ fn as_atom(node: &Node) -> Option<Atom> {
     match node {
         Node::Term(t) => Some(Atom::Term(t.clone())),
         Node::Prefix(p) => Some(Atom::Prefix(p.clone())),
+        Node::Glob { glob, prefix } => Some(Atom::Glob { glob: glob.clone(), prefix: prefix.clone() }),
         _ => None,
     }
 }
@@ -509,7 +514,7 @@ pub fn skeleton(node: &Node) -> Result<Option<String>, String> {
         // starts with a wildcard carries no key and needs a companion term.
         Node::Glob { prefix, .. } => (!prefix.is_empty()).then(|| format!("{}:*", quote_lexeme(prefix))),
         Node::Regex(_) => None, // recheck-only, no index key
-        Node::Phrase { atoms, gaps } => Some(phrase_skeleton(atoms, gaps)),
+        Node::Phrase { atoms, gaps } => phrase_skeleton(atoms, gaps),
         Node::Within { a, b, .. } => optional_conj(&[skeleton(a)?, skeleton(b)?]),
         Node::NotWithin { a, .. } => skeleton(a)?, // companion term, if it carries a key
         Node::And(v) => {
@@ -537,19 +542,29 @@ fn optional_conj(parts: &[Option<String>]) -> Option<String> {
     (!present.is_empty()).then(|| conj(&present))
 }
 
-fn phrase_skeleton(atoms: &[Atom], gaps: &[i32]) -> String {
-    let mut s = atom_skeleton(&atoms[0]);
-    for (atom, &g) in atoms[1..].iter().zip(gaps) {
-        let op = if g == 1 { "<->".to_string() } else { format!("<{g}>") };
-        s = format!("{s} {op} {}", atom_skeleton(atom));
+/// Native phrase skeleton when every atom has an index key; otherwise the
+/// conjunction of the atoms that do (a keyless-wildcard atom carries none, so the
+/// recheck enforces adjacency and the wildcard). `None` if no atom carries a key.
+fn phrase_skeleton(atoms: &[Atom], gaps: &[i32]) -> Option<String> {
+    if let Some(native) = atoms.iter().map(native_phrase_atom).collect::<Option<Vec<_>>>() {
+        let mut s = native[0].clone();
+        for (atom, &g) in native[1..].iter().zip(gaps) {
+            let op = if g == 1 { "<->".to_string() } else { format!("<{g}>") };
+            s = format!("{s} {op} {atom}");
+        }
+        Some(format!("({s})"))
+    } else {
+        let keyed: Vec<String> = atoms.iter().filter_map(native_phrase_atom).collect();
+        (!keyed.is_empty()).then(|| conj(&keyed))
     }
-    format!("({s})")
 }
 
-fn atom_skeleton(atom: &Atom) -> String {
+/// A phrase atom's index key, or `None` for a leading-wildcard glob (no key).
+fn native_phrase_atom(atom: &Atom) -> Option<String> {
     match atom {
-        Atom::Term(t) => quote_lexeme(t),
-        Atom::Prefix(p) => format!("{}:*", quote_lexeme(p)),
+        Atom::Term(t) => Some(quote_lexeme(t)),
+        Atom::Prefix(p) => Some(format!("{}:*", quote_lexeme(p))),
+        Atom::Glob { prefix, .. } => (!prefix.is_empty()).then(|| format!("{}:*", quote_lexeme(prefix))),
     }
 }
 
@@ -570,6 +585,42 @@ pub fn to_tsquery_string(input: &str) -> Result<String, String> {
     skeleton(&node)?.ok_or_else(|| {
         "query has no positive term to drive the index; add an AND-ed positive term".to_string()
     })
+}
+
+// ===========================================================================
+// Regex validation  ->  fail fast & consistently on a malformed `##regex##`
+// ===========================================================================
+
+/// Probe every `##regex##` in the query so a malformed pattern fails the whole
+/// query up front — consistently, regardless of short-circuiting or which
+/// documents get scanned — rather than erroring mid-scan or being silently
+/// skipped. The offending pattern is named in the error; the recheck can then
+/// assume any regex it sees compiles.
+pub fn validate_regexes(node: &Node) -> Result<(), String> {
+    match node {
+        Node::Regex(pattern) if !regex_compiles(pattern) => Err(format!("invalid regex `{pattern}`")),
+        Node::And(v) | Node::Or(v) => v.iter().try_for_each(validate_regexes),
+        Node::Not(x) => validate_regexes(x),
+        Node::Within { a, b, .. } | Node::NotWithin { a, b, .. } => {
+            validate_regexes(a)?;
+            validate_regexes(b)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Does `pattern` compile? Postgres compiles lazily and `ereport`s on a bad
+/// pattern; probe once under a catch scoped to *only* the invalid-regex error (so
+/// a statement cancel etc. still propagates) and report it cleanly ourselves —
+/// our message is stable across major versions, unlike Postgres's own text.
+fn regex_compiles(pattern: &str) -> bool {
+    let re = unsafe { Regexp::compile(pattern) };
+    pgrx::PgTryBuilder::new(|| {
+        unsafe { re.is_match(b"") };
+        true
+    })
+    .catch_when(pgrx::PgSqlErrorCode::ERRCODE_INVALID_REGULAR_EXPRESSION, |_| false)
+    .execute()
 }
 
 // ===========================================================================
@@ -628,6 +679,8 @@ fn positions(node: &Node, v: &TsVector) -> Result<Vec<i32>, String> {
         Node::Prefix(p) => v.positions_prefix(p.as_bytes()),
         Node::Glob { glob, prefix } => v.positions_matching(prefix.as_bytes(), |lex| glob_match(glob, lex)),
         Node::Regex(pattern) => {
+            // Patterns are validated up front (see `validate_regexes`), so by the
+            // time the recheck runs the regex is known to compile.
             let re = unsafe { Regexp::compile(pattern) };
             v.positions_matching(b"", |lex| unsafe { re.is_match(lex) })
         }
@@ -738,6 +791,7 @@ fn atom_positions(a: &Atom, v: &TsVector) -> Vec<i32> {
     match a {
         Atom::Term(t) => v.positions(t.as_bytes()),
         Atom::Prefix(p) => v.positions_prefix(p.as_bytes()),
+        Atom::Glob { glob, prefix } => v.positions_matching(prefix.as_bytes(), |lex| glob_match(glob, lex)),
     }
 }
 

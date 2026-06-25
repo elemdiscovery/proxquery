@@ -2,11 +2,12 @@
     "cSpell.words": [
         "clippy",
         "ndocs",
-        "PGXS",
         "pgrx",
+        "PGXS",
         "proxquery",
         "psql",
         "rustup",
+        "tsquery",
         "tsvector"
     ]
 }

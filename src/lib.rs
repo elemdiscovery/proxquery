@@ -111,7 +111,9 @@ fn cached_ast(query: &str) -> Result<Rc<dsl::Node>, String> {
     {
         return Ok(node);
     }
-    let parsed = Rc::new(dsl::normalize(dsl::parse(query)?));
+    let parsed = dsl::normalize(dsl::parse(query)?);
+    dsl::validate_regexes(&parsed)?; // a malformed ##regex## fails the query up front
+    let parsed = Rc::new(parsed);
     PROXMATCH_AST.with(|c| *c.borrow_mut() = Some((query.to_owned(), Rc::clone(&parsed))));
     Ok(parsed)
 }
@@ -332,6 +334,7 @@ mod tests {
         assert!(!proxfind("ssn abc here", "ssn <~3> ##[0-9]{9}##"));
     }
 
+
     // --- ts_prox_match recheck + full pipeline -----------------------------
     fn proxmatch(doc: &str, q: &str) -> bool {
         let (doc, q) = (doc.replace('\'', "''"), q.replace('\'', "''"));
@@ -464,6 +467,138 @@ mod tests {
         assert!(proxmatch("a x b", "a <~2> b")); // back again
         assert!(proxmatch("p q", "p <~1> q")); // different query → cache replaced
         assert!(!proxmatch("a x b", "p <~1> q"));
+    }
+
+    // --- compound operand combinations -----------------------------------
+
+    #[pg_test]
+    fn compound_phrase_in_proximity() {
+        // A phrase as a proximity operand; distance is measured from the phrase
+        // (its end position). the@1 quick@2 brown@3 fox@4 jumps@5
+        assert!(proxmatch("the quick brown fox jumps", "\"quick brown\" <~3> jumps")); // end@3, d=2
+        assert!(!proxmatch("the quick brown fox jumps", "\"quick brown\" <~1> jumps")); // d=2 > 1
+        // phrases on both sides
+        assert!(proxmatch("alpha beta x gamma delta", "\"alpha beta\" <~3> \"gamma delta\""));
+        // not_within with a phrase operand (occurrence-level)
+        assert!(proxmatch("quick brown z z z z z z email", "\"quick brown\" <!~3> email"));
+        assert!(!proxmatch("quick brown email", "\"quick brown\" <!~3> email"));
+    }
+
+    #[pg_test]
+    fn compound_phrase_with_wildcards() {
+        // Wildcards inside a phrase match per-atom: prefix, suffix, infix, and `?`.
+        assert!(proxmatch("the apple pie", "\"appl* pie\"")); // prefix
+        assert!(!proxmatch("the orange pie", "\"appl* pie\""));
+        assert!(proxmatch("the biology class", "\"*ology class\"")); // suffix
+        assert!(!proxmatch("the geography class", "\"*ology class\""));
+        assert!(proxmatch("the best test class", "\"te?t class\"")); // single char
+        assert!(!proxmatch("the best tense class", "\"te?t class\""));
+        // Also via the <-> phrase operator, not only the quoted form.
+        assert!(proxmatch("the biology class", "*ology <-> class"));
+        // A keyless-glob phrase still selects via its keyed atom (drives the index).
+        assert!(proxfind("the biology class", "*ology <-> class"));
+        assert!(!proxfind("the biology room", "*ology <-> class"));
+    }
+
+    #[pg_test]
+    fn compound_or_group_operand() {
+        // OR-group as a proximity operand (recheck): the position-set union.
+        assert!(proxmatch("the cat sat", "(cat | dog) <~2> sat"));
+        assert!(proxmatch("the dog sat", "(cat | dog) <~2> sat"));
+        assert!(!proxmatch("the bird sat", "(cat | dog) <~2> sat"));
+        // …and as the not_within companion.
+        assert!(proxmatch("cat z z z z z email", "(cat | dog) <!~2> email"));
+    }
+
+    #[pg_test]
+    fn compound_nested_with_phrase() {
+        // (("a b" within 5 of c) within 10 of d) — nested composition over a phrase.
+        let q = "(\"a b\" <~5> c) <~10> d";
+        assert!(proxmatch("a b x c z z z z d", q)); // d within range of the region
+        assert!(!proxmatch("a b x c z z z z z z z z z z d", q)); // d pushed out (>10)
+        // nested chain ending in not_within, with no d at all → region is isolated.
+        assert!(proxmatch("a b c", "((a <~5> b) <~10> c) <!~3> d"));
+    }
+
+    // --- parenthesization: commutation vs. grouping differences ----------
+
+    #[pg_test]
+    fn grouping_commutes_where_symmetric() {
+        // `<~N>` is either-order, AND/OR commute, and explicit left-grouping is the
+        // default association — so none of these rewrites may change the result.
+        for doc in ["a x b", "b x a", "a b c", "x y z", "a only"] {
+            assert_eq!(proxmatch(doc, "a <~5> b"), proxmatch(doc, "b <~5> a"));
+            assert_eq!(proxmatch(doc, "a & b"), proxmatch(doc, "b & a"));
+            assert_eq!(proxmatch(doc, "(a | b) <~5> c"), proxmatch(doc, "(b | a) <~5> c"));
+            assert_eq!(proxmatch(doc, "(a <~5> b) <~5> c"), proxmatch(doc, "a <~5> b <~5> c"));
+        }
+    }
+
+    #[pg_test]
+    fn grouping_changes_meaning() {
+        // (a & b) <~5> c lifts the AND → BOTH within 5 of c; a & (b <~5> c) → a
+        // present AND (b within 5 of c). a far from c, b adjacent to c → they differ.
+        let d = "a z z z z z z z z z z b c"; // a@1 b@12 c@13
+        assert!(!proxmatch(d, "(a & b) <~5> c"));
+        assert!(proxmatch(d, "a & (b <~5> c)"));
+
+        // (a | b) <~5> c → (a or b) within 5 of c; a | (b <~5> c) → a present OR ….
+        let d = "a z z z z z c"; // a@1 c@7, b absent
+        assert!(!proxmatch(d, "(a | b) <~5> c")); // a too far, b absent
+        assert!(proxmatch(d, "a | (b <~5> c)")); // a present
+
+        // precedence: `a & b | c` parses as `(a & b) | c`, not `a & (b | c)`.
+        let d = "c alone"; // only c present
+        assert!(proxmatch(d, "a & b | c"));
+        assert!(!proxmatch(d, "a & (b | c)"));
+
+        // pre (<-N>) is ordered → not commutative.
+        let d = "a x b"; // a@1 b@3
+        assert!(proxmatch(d, "a <-5> b"));
+        assert!(!proxmatch(d, "b <-5> a"));
+
+        // not_within (<!~N>) is asymmetric in its operands.
+        let d = "a b z z z z z z b"; // a@1 b@2 … b@9
+        assert!(!proxmatch(d, "a <!~5> b")); // the one a sits next to a b
+        assert!(proxmatch(d, "b <!~5> a")); // b@9 is far from any a
+    }
+
+    // --- malformed input fails cleanly (exact, controlled messages) ------
+
+    #[pg_test(error = "ts_prox_query: query has no positive term to drive the index; add an AND-ed positive term")]
+    fn err_bare_wildcard_has_no_index_key() {
+        // A standalone suffix wildcard can't drive the index → ts_prox_query refuses
+        // (so the ts_rank_cd(col, ts_prox_query(q)) recipe surfaces it, not silently).
+        Spi::run("SELECT ts_prox_query('*ology')").unwrap();
+    }
+
+    #[pg_test(error = "ts_prox_match: expected `)`")]
+    fn err_unbalanced_parens() {
+        Spi::run("SELECT ts_prox_match(to_tsvector('simple','a b'), '(a <~5> b')").unwrap();
+    }
+
+    #[pg_test(error = "ts_prox_match: not-within needs a direction: `<!~N>` (either order) or `<!-N>` (ordered)")]
+    fn err_not_within_without_direction() {
+        // dtSearch-style bare `w/N` and a directionless `<!N>` are both rejected.
+        Spi::run("SELECT ts_prox_match(to_tsvector('simple','a b'), 'a <!5> b')").unwrap();
+    }
+
+    #[pg_test(error = "ts_prox_match: unexpected end of query")]
+    fn err_trailing_operator() {
+        Spi::run("SELECT ts_prox_match(to_tsvector('simple','a b'), 'a &')").unwrap();
+    }
+
+    #[pg_test(error = "ts_prox_match: invalid regex `[`")]
+    fn err_invalid_regex() {
+        // A ##regex## that can't compile is a query bug → fail, don't suppress.
+        Spi::run("SELECT ts_prox_match(to_tsvector('simple','alpha beta'), '##[##')").unwrap();
+    }
+
+    #[pg_test(error = "ts_prox_match: invalid regex `[`")]
+    fn err_invalid_regex_fails_regardless_of_short_circuit() {
+        // Validation is up front, so a malformed regex fails the query even when a
+        // sibling branch (`alpha`) would have matched and short-circuited eval.
+        Spi::run("SELECT ts_prox_match(to_tsvector('simple','alpha beta'), 'alpha | ##[##')").unwrap();
     }
 }
 
