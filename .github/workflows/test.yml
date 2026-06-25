@@ -24,7 +24,7 @@ jobs:
       PGRX_VERSION: 0.19.1
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Build deps for compiling PostgreSQL from source (cargo pgrx init ... download).
       - name: Install build dependencies
