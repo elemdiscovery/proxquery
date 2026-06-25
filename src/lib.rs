@@ -1,0 +1,479 @@
+//! proxquery — positional proximity predicates for `tsvector` full-text search.
+//!
+//! Milestone 1: the position accessor ([`tsvector`]) and the proximity predicates
+//! ([`proximity`]), exposed as SQL recheck filters. These pair with a plain GIN
+//! `@@` candidate selection today; the proximity query compiler and the single
+//! `@~@` operator land in later milestones (see docs/IMPLEMENTATION_PLAN.md).
+
+use pgrx::prelude::*;
+
+mod dsl;
+mod proximity;
+mod support;
+mod tsvector;
+
+use pgrx::datum::Internal;
+use std::cell::RefCell;
+use std::rc::Rc;
+use tsvector::TsVector;
+
+::pgrx::pg_module_magic!(name, version);
+
+/// Sorted positions of one lexeme (`int[]`; empty if absent or position-less).
+/// The core primitive — a binary search plus one position-array read.
+#[pg_extern(immutable, parallel_safe)]
+fn ts_prox_positions(v: TsVector, lexeme: &str) -> Vec<i32> {
+    v.positions(lexeme.as_bytes())
+}
+
+/// Merged sorted positions over every lexeme beginning with `prefix` (`appl*`).
+#[pg_extern(immutable, parallel_safe)]
+fn ts_prox_positions_prefix(v: TsVector, prefix: &str) -> Vec<i32> {
+    v.positions_prefix(prefix.as_bytes())
+}
+
+/// Some `a` within `n` of some `b`, either order (`a <~n> b`).
+#[pg_extern(immutable, parallel_safe)]
+fn ts_prox_within(v: TsVector, a: &str, b: &str, n: i32) -> bool {
+    proximity::within(&v.positions(a.as_bytes()), &v.positions(b.as_bytes()), n)
+}
+
+/// Some `a` before some `b` within `n`, ordered (`a <-n> b`).
+#[pg_extern(immutable, parallel_safe)]
+fn ts_prox_pre(v: TsVector, a: &str, b: &str, n: i32) -> bool {
+    proximity::pre(&v.positions(a.as_bytes()), &v.positions(b.as_bytes()), n)
+}
+
+/// Occurrence-level: some `a` with no `b` within `n` (`a <!~n> b`).
+#[pg_extern(immutable, parallel_safe)]
+fn ts_prox_not_within(v: TsVector, a: &str, b: &str, n: i32) -> bool {
+    proximity::not_within(&v.positions(a.as_bytes()), &v.positions(b.as_bytes()), n, false)
+}
+
+/// Same-occurrence chain over `terms`, each consecutive pair within its
+/// `gaps[i]`, mutually within the gaps. `gaps` must have exactly one fewer
+/// element than `terms`.
+#[pg_extern(immutable, parallel_safe)]
+fn ts_prox_window(v: TsVector, terms: Vec<String>, gaps: Vec<i32>) -> bool {
+    if terms.is_empty() || gaps.len() + 1 != terms.len() {
+        error!(
+            "ts_prox_window: gaps length must be one less than terms length (got {} terms, {} gaps)",
+            terms.len(),
+            gaps.len()
+        );
+    }
+    let positions: Vec<Vec<i32>> = terms.iter().map(|t| v.positions(t.as_bytes())).collect();
+    proximity::window(&positions, &gaps)
+}
+
+// --- proxquery DSL compiler (Milestone 2) --------------------------------
+
+/// Parse a proxquery DSL string and emit the lexeme-presence skeleton as a
+/// `to_tsquery('simple', …)` input string. Used by the `ts_prox_query` wrapper
+/// below; exposed for tests and debugging. Errors on malformed or purely
+/// negative queries.
+#[pg_extern(immutable, parallel_safe)]
+fn ts_prox_query_skeleton(query: &str) -> String {
+    match dsl::to_tsquery_string(query) {
+        Ok(s) => s,
+        Err(e) => error!("ts_prox_query: {e}"),
+    }
+}
+
+// The user-facing compiler entry point: one query string → the index-selection
+// tsquery. A thin SQL wrapper so the result is a real `tsquery` (no custom
+// return-type boundary needed) and the planner can fold it into an index scan.
+pgrx::extension_sql!(
+    r#"
+CREATE FUNCTION ts_prox_query(query text) RETURNS tsquery
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+    AS $$ SELECT to_tsquery('simple', ts_prox_query_skeleton($1)) $$;
+"#,
+    name = "ts_prox_query_wrapper",
+    requires = [ts_prox_query_skeleton],
+);
+
+thread_local! {
+    // The recheck runs per candidate row with the same constant query string, so
+    // re-parsing it each time is pure overhead. Cache the parsed+normalized AST
+    // keyed by the string (a scan reuses one entry). The `Rc` lets the hot path
+    // be a string compare + refcount bump, and lets us drop the `RefCell` borrow
+    // before any `eval`/`error!` — holding it across an ereport (longjmp) would
+    // leave the cell permanently borrowed.
+    static PROXMATCH_AST: RefCell<Option<(String, Rc<dsl::Node>)>> = const { RefCell::new(None) };
+}
+
+/// Parse + normalize `query`, reusing the per-scan AST cache. The `RefCell` borrow
+/// is released before any `?`/`error!` (a longjmp across it would leak the borrow).
+fn cached_ast(query: &str) -> Result<Rc<dsl::Node>, String> {
+    if let Some(node) =
+        PROXMATCH_AST.with(|c| c.borrow().as_ref().and_then(|(q, n)| (q == query).then(|| Rc::clone(n))))
+    {
+        return Ok(node);
+    }
+    let parsed = Rc::new(dsl::normalize(dsl::parse(query)?));
+    PROXMATCH_AST.with(|c| *c.borrow_mut() = Some((query.to_owned(), Rc::clone(&parsed))));
+    Ok(parsed)
+}
+
+/// Evaluate the proxquery DSL's positional semantics on `v` — the recheck that
+/// pairs with `ts_prox_query` for index selection (`v @@ ts_prox_query(q) AND
+/// ts_prox_match(v, q)`).
+#[pg_extern(immutable, parallel_safe)]
+fn ts_prox_match(v: TsVector, query: &str) -> bool {
+    let node = match cached_ast(query) {
+        Ok(n) => n,
+        Err(e) => error!("ts_prox_match: {e}"),
+    };
+    match dsl::eval_match(&node, &v) {
+        Ok(m) => m,
+        Err(e) => error!("ts_prox_match: {e}"),
+    }
+}
+
+// The single-clause surface: `text_tsv @~@ 'a <~5> b'`. For now it is `ts_prox_match`
+// sugar (a seq-scan recheck); the planner support function below teaches it to use
+// the GIN index. The right operand is the DSL string.
+pgrx::extension_sql!(
+    r#"
+CREATE OPERATOR @~@ (
+    LEFTARG = tsvector,
+    RIGHTARG = text,
+    FUNCTION = ts_prox_match
+);
+"#,
+    name = "proxmatch_operator",
+    requires = [ts_prox_match],
+);
+
+/// Planner support function for `@~@` / `ts_prox_match` — derives an index
+/// condition (`tsvector @@ ts_prox_query(q)`, lossy) so the operator uses a plain
+/// GIN tsvector index. See [`support`].
+#[pg_extern(immutable, parallel_safe)]
+fn ts_prox_query_support(arg: Internal) -> Internal {
+    // "No support" must be a non-NULL datum holding a NULL pointer — returning
+    // SQL NULL trips `FunctionCall1Coll`'s "function returned NULL" error.
+    let no_support = || Internal::from(Some(pgrx::pg_sys::Datum::null()));
+    let node = match arg.unwrap() {
+        Some(datum) => datum.cast_mut_ptr::<pgrx::pg_sys::Node>(),
+        None => return no_support(),
+    };
+    unsafe { support::index_condition(node) }.unwrap_or_else(no_support)
+}
+
+// Attach the support fn. Superuser-only, but a trusted extension's install
+// script runs privileged, so this works on managed/Neon-style installs too.
+pgrx::extension_sql!(
+    "ALTER FUNCTION ts_prox_match(tsvector, text) SUPPORT ts_prox_query_support;",
+    name = "proxmatch_support",
+    requires = [ts_prox_match, ts_prox_query_support],
+);
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pg_schema]
+mod tests {
+    use pgrx::prelude::*;
+
+    fn b(sql: &str) -> bool {
+        Spi::get_one::<bool>(sql).unwrap().unwrap()
+    }
+
+    fn ints(sql: &str) -> Vec<i32> {
+        Spi::get_one::<Vec<i32>>(sql).unwrap().unwrap()
+    }
+
+    #[pg_test]
+    fn positions_basic_and_prefix() {
+        // apple@1 apple@2 orange@3  → two occurrences of apple.
+        assert_eq!(
+            ints("SELECT ts_prox_positions(to_tsvector('simple','apple apple orange'), 'apple')"),
+            vec![1, 2]
+        );
+        // absent lexeme → empty, not NULL.
+        assert!(ints("SELECT ts_prox_positions(to_tsvector('simple','apple'), 'zzz')").is_empty());
+        // appl* spans apple@1 + apply@2.
+        assert_eq!(
+            ints("SELECT ts_prox_positions_prefix(to_tsvector('simple','apple apply orange'), 'appl')"),
+            vec![1, 2]
+        );
+    }
+
+    #[pg_test]
+    fn within_either_order() {
+        // the@1 quick@2 brown@3 fox@4 → |quick − fox| = 2.
+        let v = "to_tsvector('simple','the quick brown fox')";
+        assert!(b(&format!("SELECT ts_prox_within({v}, 'quick', 'fox', 2)")));
+        assert!(b(&format!("SELECT ts_prox_within({v}, 'fox', 'quick', 2)"))); // symmetric
+        assert!(!b(&format!("SELECT ts_prox_within({v}, 'quick', 'fox', 1)")));
+    }
+
+    #[pg_test]
+    fn pre_is_ordered() {
+        // quick@1 brown@2 fox@3.
+        let v = "to_tsvector('simple','quick brown fox')";
+        assert!(b(&format!("SELECT ts_prox_pre({v}, 'quick', 'fox', 2)")));
+        assert!(!b(&format!("SELECT ts_prox_pre({v}, 'fox', 'quick', 2)"))); // wrong order
+    }
+
+    #[pg_test]
+    fn not_within_is_occurrence_level() {
+        // email@1 confidential@2 … confidential@7. One 'confidential' is near
+        // 'email', the other (pos 7) is not — the classic boilerplate case.
+        let v = "to_tsvector('simple','email confidential foo bar baz qux confidential')";
+        // Document-level `confidential AND NOT within(...,3)` would be FALSE here
+        // (an email-adjacent confidential exists); the occurrence-level predicate
+        // correctly finds the isolated one.
+        assert!(b(&format!("SELECT ts_prox_not_within({v}, 'confidential', 'email', 3)")));
+        // Within 6 of *every* confidential occurrence ⇒ none isolated.
+        assert!(!b(&format!("SELECT ts_prox_not_within({v}, 'confidential', 'email', 6)")));
+        // No 'email' at all ⇒ every 'confidential' is isolated.
+        let w = "to_tsvector('simple','confidential report only')";
+        assert!(b(&format!("SELECT ts_prox_not_within({w}, 'confidential', 'email', 5)")));
+    }
+
+    #[pg_test]
+    fn window_pins_same_occurrence() {
+        // alpha@1 xx@2 beta@3 yy@4 gamma@5.
+        let v = "to_tsvector('simple','alpha xx beta yy gamma')";
+        assert!(b(&format!(
+            "SELECT ts_prox_window({v}, ARRAY['alpha','beta','gamma'], ARRAY[2,2])"
+        )));
+        // Tighten the gaps below the spacing ⇒ no single chain fits.
+        assert!(!b(&format!(
+            "SELECT ts_prox_window({v}, ARRAY['alpha','beta','gamma'], ARRAY[1,1])"
+        )));
+    }
+
+    #[pg_test]
+    fn window_is_stricter_than_operator_chain() {
+        // orange@8 apple@10 banana@12 — apple↔banana and apple↔orange are each
+        // within 2, but banana↔orange is 4 apart, so no single strict chain fits.
+        let doc = "one two three four five six seven orange nine apple eleven banana";
+        let v = format!("to_tsvector('simple','{doc}')");
+        // ts_prox_window demands ONE chain apple→banana→orange; orange isn't within 2
+        // of banana ⇒ false.
+        assert!(!b(&format!(
+            "SELECT ts_prox_window({v}, ARRAY['apple','banana','orange'], ARRAY[2,2])"
+        )));
+        // The operator chain composes against the region apple<~2>banana occupied
+        // (both endpoints), so orange attaches to the apple ⇒ true — strictly
+        // looser than ts_prox_window.
+        assert!(proxmatch(doc, "apple <~2> banana <~2> orange"));
+    }
+
+    // --- ts_prox_query skeleton -------------------------------------------
+    // Checked by selection semantics (does the skeleton's tsquery select this
+    // doc?), which is robust to the exact parenthesization to_tsquery produces.
+    fn selects(doc: &str, q: &str) -> bool {
+        let (doc, q) = (doc.replace('\'', "''"), q.replace('\'', "''"));
+        b(&format!("SELECT to_tsvector('simple','{doc}') @@ ts_prox_query('{q}')"))
+    }
+
+    #[pg_test]
+    fn skeleton_boolean_and_proximity() {
+        assert!(selects("a b", "a <~5> b"));
+        assert!(!selects("a", "a <~5> b")); // proximity requires both present
+        assert!(selects("a", "a | b"));
+        assert!(!selects("c", "a | b"));
+        assert!(selects("a c", "(a | b) <~5> c")); // OR distributes into the operand
+        assert!(selects("b c", "(a | b) <~5> c"));
+        assert!(!selects("a", "(a | b) <~5> c")); // missing c
+    }
+
+    #[pg_test]
+    fn skeleton_and_lift_not_within_and_negation() {
+        // (a & b) <~5> c lifts AND out → all three lexemes required.
+        assert!(selects("a b c", "(a & b) <~5> c"));
+        assert!(!selects("a c", "(a & b) <~5> c")); // missing b
+        // <!~N> contributes only the companion term; recheck owns the distance.
+        assert!(selects("confidential", "confidential <!~5> email"));
+        assert!(!selects("email", "confidential <!~5> email"));
+        // Document-level NOT is dropped from the skeleton (recheck owns it).
+        assert!(selects("foo bar", "foo & !bar"));
+        assert!(!selects("baz", "foo & !bar"));
+    }
+
+    #[pg_test]
+    fn skeleton_phrase_and_prefix() {
+        assert!(selects("quick fox", "\"quick fox\"")); // adjacent → native <->
+        assert!(!selects("quick brown fox", "\"quick fox\"")); // not adjacent
+        assert!(selects("apple", "appl*"));
+        assert!(!selects("orange", "appl*"));
+    }
+
+    #[pg_test]
+    fn wildcard_glob_and_quoting() {
+        // suffix / infix / single-char, all via the unified glob (recheck scan).
+        assert!(proxmatch("this text is confidential", "*ial")); // suffix
+        assert!(proxmatch("this text is confidential", "con*ial")); // infix
+        assert!(!proxmatch("this text is public", "con*ial"));
+        assert!(proxmatch("pick the best test", "te?t")); // ? = one char
+        assert!(!proxmatch("pick the best tense", "te?t")); // 'tense' is longer
+        // A glob with a leading literal is index-served standalone (prefix key).
+        assert!(selects("running tests", "te?t")); // skeleton 'te:*'
+        // Suffix glob (no prefix) needs a companion; "study" drives the index.
+        assert!(proxfind("the study of biology", "study <~3> *ology"));
+        assert!(!proxfind("the study of cats", "study <~3> *ology"));
+        // Single-quoted literal: the term is taken verbatim, no wildcard meaning.
+        assert!(proxmatch("we love c sharp", "'c'"));
+        assert!(!proxmatch("we love rust", "'c'"));
+    }
+
+    #[pg_test]
+    fn regex_single_token() {
+        // ##regex## matches whole lexemes via Postgres's own engine.
+        assert!(proxmatch("call me at 123456789 today", "##[0-9]{9}##"));
+        assert!(!proxmatch("call me at 12345 today", "##[0-9]{9}##")); // only 5 digits
+        // anchored to the whole lexeme; the ? here is regex (optional), not a glob.
+        assert!(proxmatch("the colour is nice", "##colou?r##"));
+        assert!(proxmatch("the color is nice", "##colou?r##"));
+        // companion form — "ssn" drives the index, the regex is rechecked.
+        assert!(proxfind("ssn 123456789 here", "ssn <~3> ##[0-9]{9}##"));
+        assert!(!proxfind("ssn abc here", "ssn <~3> ##[0-9]{9}##"));
+    }
+
+    // --- ts_prox_match recheck + full pipeline -----------------------------
+    fn proxmatch(doc: &str, q: &str) -> bool {
+        let (doc, q) = (doc.replace('\'', "''"), q.replace('\'', "''"));
+        b(&format!("SELECT ts_prox_match(to_tsvector('simple','{doc}'), '{q}')"))
+    }
+    // Selection AND recheck together — what the proxsearch()-style wrapper does.
+    fn proxfind(doc: &str, q: &str) -> bool {
+        let (doc, q) = (doc.replace('\'', "''"), q.replace('\'', "''"));
+        b(&format!(
+            "SELECT to_tsvector('simple','{doc}') @@ ts_prox_query('{q}') \
+                 AND ts_prox_match(to_tsvector('simple','{doc}'), '{q}')"
+        ))
+    }
+
+    #[pg_test]
+    fn recheck_within_and_pre() {
+        assert!(proxmatch("a x b", "a <~2> b")); // distance 2, either order
+        assert!(!proxmatch("a x y b", "a <~2> b")); // distance 3
+        assert!(proxmatch("a x y b", "a <~3> b"));
+        assert!(proxmatch("a x b", "a <-2> b")); // pre: a before b, within 2
+        assert!(!proxmatch("b x a", "a <-2> b")); // wrong order for <-N>
+    }
+
+    #[pg_test]
+    fn recheck_native_distance_is_exact() {
+        // <N> stays native tsquery: exactly N apart, ordered.
+        assert!(proxmatch("a x b", "a <2> b")); // b exactly 2 after a
+        assert!(!proxmatch("a x y b", "a <2> b")); // 3 apart ⇒ no
+        assert!(proxmatch("a b", "a <-> b")); // adjacency (= <1>)
+    }
+
+    #[pg_test]
+    fn recheck_not_within_occurrence_level() {
+        // Second 'confidential' (pos 7) is far from the only 'email' (pos 1).
+        assert!(proxmatch("email confidential foo bar baz qux confidential", "confidential <!~5> email"));
+        // Every 'confidential' sits next to an 'email' ⇒ none isolated.
+        assert!(!proxmatch("email confidential confidential email", "confidential <!~5> email"));
+    }
+
+    #[pg_test]
+    fn recheck_not_within_ordered() {
+        // <!-N>: an 'a' with no 'b' in the *next* N positions (b before it is fine).
+        // price@1 foo@2 discount@3: discount is 2 after price ⇒ within ⇒ not isolated.
+        assert!(!proxmatch("price foo discount", "price <!-5> discount"));
+        // discount@1 foo@2 price@3: the only discount is *before* price ⇒ price is
+        // isolated under the ordered rule (whereas <!~> would call it near).
+        assert!(proxmatch("discount foo price", "price <!-5> discount"));
+        assert!(!proxmatch("discount foo price", "price <!~5> discount"));
+    }
+
+    #[pg_test]
+    fn recheck_and_lift_shares_anchor() {
+        // (a & b) <~2> c ⇒ both a and b within 2 of c.
+        assert!(proxmatch("a c b", "(a & b) <~2> c")); // a@1 c@2 b@3
+        assert!(!proxmatch("a w w w w c b", "(a & b) <~2> c")); // a is 5 from c
+    }
+
+    #[pg_test]
+    fn recheck_chained_composition() {
+        // alpha@1 beta@3 gamma@5 — each link within 2.
+        assert!(proxmatch("alpha x beta x gamma", "alpha <~2> beta <~2> gamma"));
+        assert!(!proxmatch("alpha x x x beta x x x gamma", "alpha <~2> beta <~2> gamma"));
+        // Occurrence-linking (why window() is unnecessary in the DSL): alpha-beta
+        // sit together early, a *second* beta sits with gamma far away. A
+        // document-level `within(a,b) & within(b,gamma)` would wrongly match;
+        // composition does not, because gamma must be near the alpha-beta region.
+        assert!(!proxmatch("alpha beta x x x x x x beta gamma", "alpha <~2> beta <~2> gamma"));
+    }
+
+    #[pg_test]
+    fn full_pipeline_selection_then_recheck() {
+        assert!(proxfind("a x b", "a <~2> b")); // selected and within
+        assert!(!proxfind("a x y z b", "a <~2> b")); // selected (both present) but recheck removes it
+        assert!(!proxfind("a alone", "a <~2> b")); // b absent ⇒ not even selected
+    }
+
+    #[pg_test]
+    fn operator_at_tilde_at() {
+        assert!(b("SELECT to_tsvector('simple','a x b') @~@ 'a <~2> b'"));
+        assert!(!b("SELECT to_tsvector('simple','a x y z b') @~@ 'a <~2> b'"));
+    }
+
+    #[pg_test]
+    fn operator_uses_gin_index() {
+        Spi::run("CREATE TEMP TABLE proxtest(id serial, tsv tsvector)").unwrap();
+        // 200 docs that match `a <~2> b` (a@1 b@3) plus a distinct trailing token.
+        Spi::run(
+            "INSERT INTO proxtest(tsv) \
+             SELECT to_tsvector('simple','a x b w'||g) FROM generate_series(1,200) g",
+        )
+        .unwrap();
+        Spi::run("CREATE INDEX ON proxtest USING gin(tsv)").unwrap();
+        Spi::run("ANALYZE proxtest").unwrap();
+        Spi::run("SET enable_seqscan = off").unwrap();
+        Spi::run(
+            "CREATE FUNCTION uses_index(q text) RETURNS bool AS $$ \
+             DECLARE line text; hit bool := false; \
+             BEGIN \
+               FOR line IN EXECUTE 'EXPLAIN SELECT count(*) FROM proxtest WHERE tsv @~@ ' \
+                 || quote_literal(q) LOOP \
+                 IF line LIKE '%Index Cond%ts_prox_query%' THEN hit := true; END IF; \
+               END LOOP; \
+               RETURN hit; \
+             END $$ LANGUAGE plpgsql",
+        )
+        .unwrap();
+        // The support function must turn @~@ into an index condition.
+        assert!(b("SELECT uses_index('a <~2> b')"), "@~@ did not use the GIN index");
+        // …and still return the right rows with the index in play.
+        let n = Spi::get_one::<i64>("SELECT count(*) FROM proxtest WHERE tsv @~@ 'a <~2> b'")
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 200);
+        // A bare wildcard has no index key — it must seq-scan, not error. (The
+        // support function must not inject a failing ts_prox_query for a query that
+        // can't drive the index.)
+        let m = Spi::get_one::<i64>("SELECT count(*) FROM proxtest WHERE tsv @~@ '*5'")
+            .unwrap()
+            .unwrap();
+        assert!(m > 0, "standalone wildcard via @~@ must work as a seq scan");
+    }
+
+    #[pg_test]
+    fn proxmatch_ast_cache_is_correct() {
+        // The per-row AST cache keys on the query string and caches the *parse*,
+        // not the result — so the same query on different docs must re-evaluate,
+        // and switching queries must not reuse a stale AST.
+        assert!(proxmatch("a x b", "a <~2> b"));
+        assert!(!proxmatch("a x y z b", "a <~2> b")); // same query, different doc
+        assert!(proxmatch("a x b", "a <~2> b")); // back again
+        assert!(proxmatch("p q", "p <~1> q")); // different query → cache replaced
+        assert!(!proxmatch("a x b", "p <~1> q"));
+    }
+}
+
+/// Required by `cargo pgrx test`.
+#[cfg(test)]
+pub mod pg_test {
+    pub fn setup(_options: Vec<&str>) {}
+
+    #[must_use]
+    pub fn postgresql_conf_options() -> Vec<&'static str> {
+        vec![]
+    }
+}

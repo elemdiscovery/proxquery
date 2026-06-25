@@ -1,0 +1,11 @@
+# proxquery — positional proximity predicates for tsvector full-text search.
+# Neon-safe by construction: trusted, no shared_preload_libraries, no shared
+# memory, no background workers, no custom WAL/rmgr — pure CPU on an
+# already-materialized tsvector.
+comment = 'positional proximity predicates for tsvector full-text search'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/proxquery'
+
+relocatable = true
+superuser = true
+trusted = true

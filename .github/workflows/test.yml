@@ -1,0 +1,57 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pg${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 16, 17, 18]
+
+    env:
+      # Keep cargo-pgrx in lockstep with the pgrx crate dependency in Cargo.toml.
+      PGRX_VERSION: 0.19.1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build deps for compiling PostgreSQL from source (cargo pgrx init ... download).
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bison flex libreadline-dev zlib1g-dev \
+            libssl-dev libxml2-dev libxslt1-dev xsltproc ccache pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo + pgrx build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: pg${{ matrix.pg }}
+
+      - name: Install cargo-pgrx
+        run: cargo install --locked cargo-pgrx@${PGRX_VERSION}
+
+      - name: Initialize pgrx (pg${{ matrix.pg }})
+        run: cargo pgrx init --pg${{ matrix.pg }} download
+
+      - name: Clippy
+        run: cargo clippy --no-default-features --features pg${{ matrix.pg }} --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo pgrx test --no-default-features --features pg${{ matrix.pg }} pg${{ matrix.pg }}

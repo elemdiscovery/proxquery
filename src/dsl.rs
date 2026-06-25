@@ -1,0 +1,790 @@
+//! The proxquery query DSL — a Postgres-natural superset of `tsquery`.
+//!
+//! We do **not** implement a separate proximity-operator surface syntax; we
+//! expose the equivalent capabilities through operators a Postgres FTS user
+//! already recognizes, so a translator from another surface is straightforward
+//! to write on top (we don't ship one). One grammar, two lowerings (the
+//! README's Layer 1): parse → a
+//! lexeme-presence [`skeleton`] `tsquery` that drives the GIN index, and an
+//! [`eval_match`] positional recheck.
+//!
+//! ## Operators
+//!
+//! Native `tsquery`, unchanged: `&` `|` `!` `( )`, `"a b c"` / `a <-> b`
+//! (adjacency), `a <N> b` (ordered, **exactly** N apart), `appl:*` / `appl*`.
+//!
+//! Added — one bracket, modifiers compose: `~` = either-order, `-` = ordered
+//! (a before b), `!` = negated (occurrence-level):
+//!
+//! | | either order | ordered (a→b) |
+//! |---|---|---|
+//! | within | `a <~N> b` | `a <-N> b` |
+//! | not within | `a <!~N> b` | `a <!-N> b` |
+//!
+//! Precedence (tsquery's own): `|` < `&` < proximity < `!`. Proximity operators
+//! are **left-associative composition** — each pair yields the set of positions
+//! that took part (a "region"), and the next operand is tested against that
+//! region, so multi-term proximity (`a <~5> b <~5> c`) stays occurrence-linked.
+//!
+//! ## Compound-proximity operand rules (normalization)
+//!
+//! A proximity operand may only be *positional* (term / prefix / phrase / an OR
+//! of those / a nested proximity). `&` and `!` are **lifted out**, because
+//! `(a & b)` at one position is ~always false and `!` is not a phrase operand:
+//!
+//! - `(a & b) <~N> c` → `(a <~N> c) & (b <~N> c)`  (distribute, lift AND)
+//! - `(!a)    <~N> b` → `!(a <~N> b)`              (lift NOT above)
+//! - `(a | b) <~N> c` → kept: OR distributes into the position-set union
+//! - `"a b"   <~N> c` → kept: the phrase's positions are its end positions
+
+/// A phrase/distance element.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Atom {
+    Term(String),
+    Prefix(String),
+}
+
+/// The query AST. After [`normalize`], `&`/`|`/`!` appear only at/above the
+/// boolean layer (with `Or` also allowed as a positional operand), and every
+/// proximity operand is positional.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Node {
+    Term(String),
+    Prefix(String),
+    /// A `*`/`?` glob (`*ology`, `f*r`, `te?t`). `glob` is the lowercased pattern;
+    /// `prefix` is its leading literal run (empty if it starts with a wildcard).
+    /// Scanned per-document; a non-empty `prefix` is its index key and fast path.
+    Glob { glob: String, prefix: String },
+    /// `##…##` — a regex matched against whole lexemes via Postgres's own engine.
+    /// Recheck-only (no index key), so it needs a companion term.
+    Regex(String),
+    /// Ordered, **exact**-gap sequence: native `"a b"`, `a <-> b`, `a <N> b`.
+    /// `gaps[i]` is the exact distance from `atoms[i]` to `atoms[i+1]`.
+    Phrase { atoms: Vec<Atom>, gaps: Vec<i32> },
+    And(Vec<Node>),
+    Or(Vec<Node>),
+    Not(Box<Node>),
+    /// `<~N>` (either order) or, when `ordered`, `<-N>` (a before b). Both ≤N.
+    Within { a: Box<Node>, b: Box<Node>, n: i32, ordered: bool },
+    /// `<!~N>` (either order) or, when `ordered`, `<!-N>` (no b after a within N).
+    /// Occurrence-level: some `a` with no qualifying `b`.
+    NotWithin { a: Box<Node>, b: Box<Node>, n: i32, ordered: bool },
+}
+
+const MAX_DISTANCE: i32 = 16383;
+
+fn parse_distance(digits: &str) -> Result<i32, String> {
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("expected a distance, got `{digits}`"));
+    }
+    Ok(digits.parse::<i32>().unwrap_or(MAX_DISTANCE).clamp(1, MAX_DISTANCE))
+}
+
+// ===========================================================================
+// Lexer
+// ===========================================================================
+
+#[derive(Debug, Clone, PartialEq)]
+enum Tok {
+    LParen,
+    RParen,
+    And,                   // &
+    Or,                    // |
+    Not,                   // !
+    PhraseOp(i32),         // <-> => 1, <N> => N   (ordered, exact)
+    PreOp(i32),            // <-N>                 (ordered, within)
+    WithinOp(i32),         // <~N>                 (either order, within)
+    NotWithinOp(i32, bool), // <!~N> (false) / <!-N> (true)
+    Term(String),
+    Prefix(String),
+    Glob(String, String),  // glob pattern, leading literal prefix
+    Regex(String),         // ##...##
+    Phrase(Vec<Atom>),     // "double quoted"
+}
+
+fn is_glob_char(c: char) -> bool {
+    c == '*' || c == '?'
+}
+
+/// Leading literal run of a glob — the characters before the first `*` or `?`.
+fn glob_prefix(glob: &str) -> String {
+    glob.chars().take_while(|&c| !is_glob_char(c)).collect()
+}
+
+/// Classify a standalone word, resolving `*`/`?` wildcards. `appl*` / `appl:*`
+/// stay a fast prefix; anything else with a wildcard becomes a glob.
+fn word_to_tok(word: &str) -> Result<Tok, String> {
+    let lower = word.to_ascii_lowercase();
+    if let Some(stem) = lower.strip_suffix(":*") {
+        if !stem.is_empty() && !stem.contains(is_glob_char) {
+            return Ok(Tok::Prefix(stem.to_string()));
+        }
+    }
+    if !lower.contains(is_glob_char) {
+        return Ok(Tok::Term(lower));
+    }
+    if lower == "*" {
+        return Err("a bare `*` matches everything; give it a literal part".into());
+    }
+    // `appl*` — a single trailing `*` and nothing else special — is the fast path.
+    let body = &lower[..lower.len() - 1];
+    if lower.ends_with('*') && !body.contains(is_glob_char) {
+        return Ok(Tok::Prefix(body.to_string()));
+    }
+    let prefix = glob_prefix(&lower);
+    Ok(Tok::Glob(lower, prefix))
+}
+
+fn word_atom(word: &str) -> Atom {
+    let lower = word.to_ascii_lowercase();
+    for suffix in [":*", "*"] {
+        if let Some(stem) = lower.strip_suffix(suffix) {
+            if !stem.is_empty() {
+                return Atom::Prefix(stem.to_string());
+            }
+        }
+    }
+    Atom::Term(lower)
+}
+
+fn is_word_char(c: char) -> bool {
+    !c.is_whitespace() && !matches!(c, '(' | ')' | '&' | '|' | '!' | '<' | '>' | ',' | '"' | '\'' | '#')
+}
+
+fn bracket_op(content: &str) -> Result<Tok, String> {
+    if content == "-" {
+        Ok(Tok::PhraseOp(1)) // <->
+    } else if let Some(rest) = content.strip_prefix("!~") {
+        Ok(Tok::NotWithinOp(parse_distance(rest)?, false))
+    } else if let Some(rest) = content.strip_prefix("!-") {
+        Ok(Tok::NotWithinOp(parse_distance(rest)?, true))
+    } else if content.starts_with('!') {
+        Err("not-within needs a direction: `<!~N>` (either order) or `<!-N>` (ordered)".into())
+    } else if let Some(rest) = content.strip_prefix('~') {
+        Ok(Tok::WithinOp(parse_distance(rest)?))
+    } else if let Some(rest) = content.strip_prefix('-') {
+        Ok(Tok::PreOp(parse_distance(rest)?))
+    } else {
+        Ok(Tok::PhraseOp(parse_distance(content)?))
+    }
+}
+
+fn lex(input: &str) -> Result<Vec<Tok>, String> {
+    let chars: Vec<char> = input.chars().collect();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+        } else if c == '(' {
+            toks.push(Tok::LParen);
+            i += 1;
+        } else if c == ')' {
+            toks.push(Tok::RParen);
+            i += 1;
+        } else if c == '&' {
+            toks.push(Tok::And);
+            i += 1;
+        } else if c == '|' {
+            toks.push(Tok::Or);
+            i += 1;
+        } else if c == '!' {
+            toks.push(Tok::Not);
+            i += 1;
+        } else if c == '<' {
+            let start = i + 1;
+            let mut j = start;
+            while j < chars.len() && chars[j] != '>' {
+                j += 1;
+            }
+            if j >= chars.len() {
+                return Err("unterminated `<…>` operator".into());
+            }
+            let content: String = chars[start..j].iter().collect();
+            i = j + 1;
+            toks.push(bracket_op(&content)?);
+        } else if c == '"' {
+            i += 1;
+            let start = i;
+            while i < chars.len() && chars[i] != '"' {
+                i += 1;
+            }
+            if i >= chars.len() {
+                return Err("unterminated quoted phrase".into());
+            }
+            let phrase: String = chars[start..i].iter().collect();
+            i += 1;
+            let atoms: Vec<Atom> = phrase.split_whitespace().map(word_atom).collect();
+            if atoms.is_empty() {
+                return Err("empty quoted phrase".into());
+            }
+            toks.push(Tok::Phrase(atoms));
+        } else if c == '\'' {
+            // A single-quoted literal term: no operator or wildcard meaning, with
+            // '' for a literal quote. The escape hatch for terms with special chars.
+            i += 1;
+            let mut lexeme = String::new();
+            loop {
+                match chars.get(i) {
+                    None => return Err("unterminated quoted term".into()),
+                    Some('\'') if chars.get(i + 1) == Some(&'\'') => {
+                        lexeme.push('\'');
+                        i += 2;
+                    }
+                    Some('\'') => {
+                        i += 1;
+                        break;
+                    }
+                    Some(&ch) => {
+                        lexeme.push(ch);
+                        i += 1;
+                    }
+                }
+            }
+            if lexeme.is_empty() {
+                return Err("empty quoted term".into());
+            }
+            toks.push(Tok::Term(lexeme.to_ascii_lowercase()));
+        } else if c == '#' {
+            // ##regex## — everything between the delimiters is the regex verbatim.
+            if chars.get(i + 1) != Some(&'#') {
+                return Err("a single `#` is not valid; use `##regex##` or quote it".into());
+            }
+            i += 2;
+            let start = i;
+            while i + 1 < chars.len() && !(chars[i] == '#' && chars[i + 1] == '#') {
+                i += 1;
+            }
+            if i + 1 >= chars.len() || !(chars[i] == '#' && chars[i + 1] == '#') {
+                return Err("unterminated `##regex##`".into());
+            }
+            let pattern: String = chars[start..i].iter().collect();
+            i += 2;
+            toks.push(Tok::Regex(pattern));
+        } else {
+            let start = i;
+            while i < chars.len() && is_word_char(chars[i]) {
+                i += 1;
+            }
+            if i == start {
+                return Err(format!("unexpected character `{c}`"));
+            }
+            toks.push(word_to_tok(&chars[start..i].iter().collect::<String>())?);
+        }
+    }
+    Ok(toks)
+}
+
+// ===========================================================================
+// Parser  (recursive descent; precedence | < & < proximity < !)
+// ===========================================================================
+
+enum ProxOp {
+    Phrase(i32),
+    Pre(i32),
+    Within(i32),
+    NotWithin(i32, bool),
+}
+
+struct Parser {
+    toks: Vec<Tok>,
+    pos: usize,
+}
+
+impl Parser {
+    fn peek(&self) -> Option<&Tok> {
+        self.toks.get(self.pos)
+    }
+
+    fn bump(&mut self) -> Option<Tok> {
+        let t = self.toks.get(self.pos).cloned();
+        if t.is_some() {
+            self.pos += 1;
+        }
+        t
+    }
+
+    fn parse(&mut self) -> Result<Node, String> {
+        if self.toks.is_empty() {
+            return Err("empty query".into());
+        }
+        let node = self.parse_or()?;
+        if self.pos != self.toks.len() {
+            return Err(format!("unexpected token {:?}", self.toks[self.pos]));
+        }
+        Ok(node)
+    }
+
+    fn parse_or(&mut self) -> Result<Node, String> {
+        let mut branches = vec![self.parse_and()?];
+        while matches!(self.peek(), Some(Tok::Or)) {
+            self.bump();
+            branches.push(self.parse_and()?);
+        }
+        Ok(if branches.len() == 1 { branches.pop().unwrap() } else { Node::Or(branches) })
+    }
+
+    fn parse_and(&mut self) -> Result<Node, String> {
+        let mut branches = vec![self.parse_prox()?];
+        while matches!(self.peek(), Some(Tok::And)) {
+            self.bump();
+            branches.push(self.parse_prox()?);
+        }
+        Ok(if branches.len() == 1 { branches.pop().unwrap() } else { Node::And(branches) })
+    }
+
+    fn parse_prox(&mut self) -> Result<Node, String> {
+        let first = self.parse_unary()?;
+        let mut ops = Vec::new();
+        loop {
+            let op = match self.peek() {
+                Some(&Tok::PhraseOp(n)) => ProxOp::Phrase(n),
+                Some(&Tok::PreOp(n)) => ProxOp::Pre(n),
+                Some(&Tok::WithinOp(n)) => ProxOp::Within(n),
+                Some(&Tok::NotWithinOp(n, ord)) => ProxOp::NotWithin(n, ord),
+                _ => break,
+            };
+            self.bump();
+            ops.push((op, self.parse_unary()?));
+        }
+        build_prox(first, ops)
+    }
+
+    fn parse_unary(&mut self) -> Result<Node, String> {
+        if matches!(self.peek(), Some(Tok::Not)) {
+            self.bump();
+            Ok(Node::Not(Box::new(self.parse_unary()?)))
+        } else {
+            self.parse_atom()
+        }
+    }
+
+    fn parse_atom(&mut self) -> Result<Node, String> {
+        match self.bump() {
+            Some(Tok::LParen) => {
+                let inner = self.parse_or()?;
+                match self.bump() {
+                    Some(Tok::RParen) => Ok(inner),
+                    _ => Err("expected `)`".into()),
+                }
+            }
+            Some(Tok::Term(t)) => Ok(Node::Term(t)),
+            Some(Tok::Prefix(p)) => Ok(Node::Prefix(p)),
+            Some(Tok::Glob(glob, prefix)) => Ok(Node::Glob { glob, prefix }),
+            Some(Tok::Regex(pattern)) => Ok(Node::Regex(pattern)),
+            Some(Tok::Phrase(atoms)) => Ok(phrase_node(atoms)),
+            Some(t) => Err(format!("unexpected token {t:?} (expected a term, phrase, or `(`)")),
+            None => Err("unexpected end of query".into()),
+        }
+    }
+}
+
+fn phrase_node(atoms: Vec<Atom>) -> Node {
+    if atoms.len() == 1 {
+        return match atoms.into_iter().next().unwrap() {
+            Atom::Term(t) => Node::Term(t),
+            Atom::Prefix(p) => Node::Prefix(p),
+        };
+    }
+    let gaps = vec![1; atoms.len() - 1];
+    Node::Phrase { atoms, gaps }
+}
+
+fn as_atom(node: &Node) -> Option<Atom> {
+    match node {
+        Node::Term(t) => Some(Atom::Term(t.clone())),
+        Node::Prefix(p) => Some(Atom::Prefix(p.clone())),
+        _ => None,
+    }
+}
+
+/// Fold a left-associative proximity chain. Phrase/distance operators extend a
+/// contiguous [`Node::Phrase`] (atom operands only); the rest wrap the running
+/// node so the next operand is tested against its position region.
+fn build_prox(first: Node, ops: Vec<(ProxOp, Node)>) -> Result<Node, String> {
+    let mut current = first;
+    for (op, rhs) in ops {
+        current = match op {
+            ProxOp::Phrase(gap) => extend_phrase(current, rhs, gap)?,
+            ProxOp::Pre(n) => Node::Within { a: Box::new(current), b: Box::new(rhs), n, ordered: true },
+            ProxOp::Within(n) => Node::Within { a: Box::new(current), b: Box::new(rhs), n, ordered: false },
+            ProxOp::NotWithin(n, ordered) => {
+                Node::NotWithin { a: Box::new(current), b: Box::new(rhs), n, ordered }
+            }
+        };
+    }
+    Ok(current)
+}
+
+fn extend_phrase(current: Node, rhs: Node, gap: i32) -> Result<Node, String> {
+    const ERR: &str = "phrase/distance operator (`<->`, `<N>`) needs term operands";
+    let rhs_atom = as_atom(&rhs).ok_or(ERR)?;
+    match current {
+        Node::Phrase { mut atoms, mut gaps } => {
+            atoms.push(rhs_atom);
+            gaps.push(gap);
+            Ok(Node::Phrase { atoms, gaps })
+        }
+        other => {
+            let left = as_atom(&other).ok_or(ERR)?;
+            Ok(Node::Phrase { atoms: vec![left, rhs_atom], gaps: vec![gap] })
+        }
+    }
+}
+
+pub fn parse(input: &str) -> Result<Node, String> {
+    let toks = lex(input)?;
+    Parser { toks, pos: 0 }.parse()
+}
+
+// ===========================================================================
+// Normalization  (lift AND/NOT out of proximity operands; keep OR/phrase in)
+// ===========================================================================
+
+pub fn normalize(node: Node) -> Node {
+    match node {
+        Node::And(v) => flatten(true, v.into_iter().map(normalize).collect()),
+        Node::Or(v) => flatten(false, v.into_iter().map(normalize).collect()),
+        Node::Not(x) => Node::Not(Box::new(normalize(*x))),
+        Node::Within { a, b, n, ordered } => make_within(normalize(*a), normalize(*b), n, ordered),
+        Node::NotWithin { a, b, n, ordered } => make_not_within(normalize(*a), normalize(*b), n, ordered),
+        leaf => leaf,
+    }
+}
+
+fn make_within(a: Node, b: Node, n: i32, ordered: bool) -> Node {
+    match a {
+        Node::And(xs) => flatten(true, xs.into_iter().map(|x| make_within(x, b.clone(), n, ordered)).collect()),
+        Node::Not(x) => Node::Not(Box::new(make_within(*x, b, n, ordered))),
+        _ => match b {
+            Node::And(ys) => flatten(true, ys.into_iter().map(|y| make_within(a.clone(), y, n, ordered)).collect()),
+            Node::Not(y) => Node::Not(Box::new(make_within(a, *y, n, ordered))),
+            _ => Node::Within { a: Box::new(a), b: Box::new(b), n, ordered },
+        },
+    }
+}
+
+fn make_not_within(a: Node, b: Node, n: i32, ordered: bool) -> Node {
+    match a {
+        Node::And(xs) => flatten(true, xs.into_iter().map(|x| make_not_within(x, b.clone(), n, ordered)).collect()),
+        Node::Not(x) => Node::Not(Box::new(make_not_within(*x, b, n, ordered))),
+        _ => match b {
+            Node::And(ys) => flatten(true, ys.into_iter().map(|y| make_not_within(a.clone(), y, n, ordered)).collect()),
+            Node::Not(y) => Node::Not(Box::new(make_not_within(a, *y, n, ordered))),
+            _ => Node::NotWithin { a: Box::new(a), b: Box::new(b), n, ordered },
+        },
+    }
+}
+
+fn flatten(is_and: bool, children: Vec<Node>) -> Node {
+    let mut out = Vec::with_capacity(children.len());
+    for c in children {
+        match (is_and, c) {
+            (true, Node::And(inner)) | (false, Node::Or(inner)) => out.extend(inner),
+            (_, other) => out.push(other),
+        }
+    }
+    if out.len() == 1 {
+        out.pop().unwrap()
+    } else if is_and {
+        Node::And(out)
+    } else {
+        Node::Or(out)
+    }
+}
+
+// ===========================================================================
+// Skeleton lowering  ->  lexeme-presence tsquery string
+// ===========================================================================
+
+/// Lower to a `to_tsquery('simple', …)` input string for index selection.
+/// `None` means the subtree imposes no positive constraint (a pure negation, or
+/// an OR with an unconstrained branch) — left entirely to the recheck.
+pub fn skeleton(node: &Node) -> Result<Option<String>, String> {
+    Ok(match node {
+        Node::Term(t) => Some(quote_lexeme(t)),
+        Node::Prefix(p) => Some(format!("{}:*", quote_lexeme(p))),
+        // A glob with a leading literal is index-served via that prefix; one that
+        // starts with a wildcard carries no key and needs a companion term.
+        Node::Glob { prefix, .. } => (!prefix.is_empty()).then(|| format!("{}:*", quote_lexeme(prefix))),
+        Node::Regex(_) => None, // recheck-only, no index key
+        Node::Phrase { atoms, gaps } => Some(phrase_skeleton(atoms, gaps)),
+        Node::Within { a, b, .. } => optional_conj(&[skeleton(a)?, skeleton(b)?]),
+        Node::NotWithin { a, .. } => skeleton(a)?, // companion term, if it carries a key
+        Node::And(v) => {
+            let present: Vec<String> = v.iter().filter_map(|c| skeleton(c).transpose()).collect::<Result<_, _>>()?;
+            if present.is_empty() { None } else { Some(conj(&present)) }
+        }
+        Node::Or(v) => {
+            let mut parts = Vec::with_capacity(v.len());
+            for c in v {
+                match skeleton(c)? {
+                    Some(s) => parts.push(s),
+                    None => return Ok(None), // an unconstrained branch ⇒ whole OR unconstrained
+                }
+            }
+            Some(format!("({})", parts.join(" | ")))
+        }
+        Node::Not(_) => None, // negation is the recheck's job
+    })
+}
+
+/// Conjoin the operands that carry a key; `None` if none do (e.g. a proximity of
+/// two suffix wildcards — the index can't narrow it, so it needs a companion).
+fn optional_conj(parts: &[Option<String>]) -> Option<String> {
+    let present: Vec<String> = parts.iter().flatten().cloned().collect();
+    (!present.is_empty()).then(|| conj(&present))
+}
+
+fn phrase_skeleton(atoms: &[Atom], gaps: &[i32]) -> String {
+    let mut s = atom_skeleton(&atoms[0]);
+    for (atom, &g) in atoms[1..].iter().zip(gaps) {
+        let op = if g == 1 { "<->".to_string() } else { format!("<{g}>") };
+        s = format!("{s} {op} {}", atom_skeleton(atom));
+    }
+    format!("({s})")
+}
+
+fn atom_skeleton(atom: &Atom) -> String {
+    match atom {
+        Atom::Term(t) => quote_lexeme(t),
+        Atom::Prefix(p) => format!("{}:*", quote_lexeme(p)),
+    }
+}
+
+fn conj(parts: &[String]) -> String {
+    if parts.len() == 1 {
+        parts[0].clone()
+    } else {
+        format!("({})", parts.join(" & "))
+    }
+}
+
+fn quote_lexeme(lex: &str) -> String {
+    format!("'{}'", lex.replace('\'', "''"))
+}
+
+pub fn to_tsquery_string(input: &str) -> Result<String, String> {
+    let node = normalize(parse(input)?);
+    skeleton(&node)?.ok_or_else(|| {
+        "query has no positive term to drive the index; add an AND-ed positive term".to_string()
+    })
+}
+
+// ===========================================================================
+// Recheck evaluation  ->  bool  (the positional semantics on a tsvector)
+// ===========================================================================
+//
+// Every *positional* node evaluates to the sorted set of positions where it
+// occurs ([`positions`]); a proximity composes by testing the next operand
+// against that set. The boolean layer ([`eval_match`]) answers true/false using
+// the predicates in [`crate::proximity`].
+
+use crate::proximity;
+use crate::tsvector::TsVector;
+use pgrx::datum::FromDatum;
+use pgrx::pg_sys;
+
+pub fn eval_match(node: &Node, v: &TsVector) -> Result<bool, String> {
+    Ok(match node {
+        Node::And(children) => {
+            for c in children {
+                if !eval_match(c, v)? {
+                    return Ok(false);
+                }
+            }
+            true
+        }
+        Node::Or(children) => {
+            for c in children {
+                if eval_match(c, v)? {
+                    return Ok(true);
+                }
+            }
+            false
+        }
+        Node::Not(x) => !eval_match(x, v)?,
+        Node::Within { a, b, n, ordered } => {
+            let (pa, pb) = (positions(a, v)?, positions(b, v)?);
+            if *ordered {
+                proximity::pre(&pa, &pb, *n)
+            } else {
+                proximity::within(&pa, &pb, *n)
+            }
+        }
+        Node::NotWithin { a, b, n, ordered } => {
+            proximity::not_within(&positions(a, v)?, &positions(b, v)?, *n, *ordered)
+        }
+        Node::Term(_) | Node::Prefix(_) | Node::Glob { .. } | Node::Regex(_) | Node::Phrase { .. } => {
+            !positions(node, v)?.is_empty()
+        }
+    })
+}
+
+fn positions(node: &Node, v: &TsVector) -> Result<Vec<i32>, String> {
+    Ok(match node {
+        Node::Term(t) => v.positions(t.as_bytes()),
+        Node::Prefix(p) => v.positions_prefix(p.as_bytes()),
+        Node::Glob { glob, prefix } => v.positions_matching(prefix.as_bytes(), |lex| glob_match(glob, lex)),
+        Node::Regex(pattern) => {
+            let re = unsafe { Regexp::compile(pattern) };
+            v.positions_matching(b"", |lex| unsafe { re.is_match(lex) })
+        }
+        Node::Phrase { atoms, gaps } => phrase_positions(atoms, gaps, v),
+        Node::Or(children) => {
+            let mut all = Vec::new();
+            for c in children {
+                all.extend(positions(c, v)?);
+            }
+            all.sort_unstable();
+            all.dedup();
+            all
+        }
+        Node::Within { a, b, n, ordered } => within_participants(&positions(a, v)?, &positions(b, v)?, *n, *ordered),
+        Node::NotWithin { a, b, n, ordered } => {
+            not_within_participants(&positions(a, v)?, &positions(b, v)?, *n, *ordered)
+        }
+        Node::And(_) | Node::Not(_) => {
+            return Err("AND/NOT cannot be a proximity operand (normalization should have lifted it)".into())
+        }
+    })
+}
+
+/// OID of `pg_catalog.textregexeq` (the function behind `text ~ text`), looked up
+/// once. It is a builtin, so its OID is stable for the life of the backend.
+fn textregexeq_oid() -> pg_sys::Oid {
+    use std::sync::OnceLock;
+    static OID: OnceLock<pg_sys::Oid> = OnceLock::new();
+    *OID.get_or_init(|| unsafe {
+        let names =
+            pg_sys::stringToQualifiedNameList(c"pg_catalog.textregexeq".as_ptr(), core::ptr::null_mut());
+        let argtypes = [pg_sys::TEXTOID, pg_sys::TEXTOID];
+        pg_sys::LookupFuncName(names, 2, argtypes.as_ptr(), false)
+    })
+}
+
+/// Whole-lexeme regex matching via Postgres's own engine (the function behind
+/// `~`) — no extra dependency, and the dialect matches `~`. The compiled regex is
+/// cached by Postgres across calls; we anchor the pattern to the entire lexeme
+/// and match under the C collation (byte semantics, deterministic).
+struct Regexp {
+    oid: pg_sys::Oid,
+    anchored: pg_sys::Datum,
+}
+
+impl Regexp {
+    /// # Safety
+    /// Must run inside a Postgres memory context (it palloc's the pattern text).
+    unsafe fn compile(pattern: &str) -> Self {
+        let anchored = format!("^(?:{pattern})$");
+        let text = pg_sys::cstring_to_text_with_len(
+            anchored.as_ptr() as *const core::ffi::c_char,
+            anchored.len() as i32,
+        );
+        Regexp { oid: textregexeq_oid(), anchored: pg_sys::Datum::from(text) }
+    }
+
+    /// # Safety
+    /// `lexeme` is read for the duration of the call only.
+    unsafe fn is_match(&self, lexeme: &[u8]) -> bool {
+        let lex = pg_sys::cstring_to_text_with_len(
+            lexeme.as_ptr() as *const core::ffi::c_char,
+            lexeme.len() as i32,
+        );
+        let matched = pg_sys::OidFunctionCall2Coll(
+            self.oid,
+            pg_sys::C_COLLATION_OID,
+            pg_sys::Datum::from(lex),
+            self.anchored,
+        );
+        bool::from_datum(matched, false).unwrap_or(false)
+    }
+}
+
+/// Match a `*`/`?` glob against a lexeme (`?` = one char, `*` = any run), on chars.
+fn glob_match(pattern: &str, lexeme: &[u8]) -> bool {
+    let text = match std::str::from_utf8(lexeme) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize); // last `*` in pattern, and its match point
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+fn atom_positions(a: &Atom, v: &TsVector) -> Vec<i32> {
+    match a {
+        Atom::Term(t) => v.positions(t.as_bytes()),
+        Atom::Prefix(p) => v.positions_prefix(p.as_bytes()),
+    }
+}
+
+/// End positions of an exact-gap sequence: `atoms[i+1]` exactly `gaps[i]` after `atoms[i]`.
+fn phrase_positions(atoms: &[Atom], gaps: &[i32], v: &TsVector) -> Vec<i32> {
+    let mut reach = atom_positions(&atoms[0], v);
+    for (atom, &g) in atoms[1..].iter().zip(gaps) {
+        let cur = atom_positions(atom, v);
+        reach = cur.into_iter().filter(|&c| reach.binary_search(&(c - g)).is_ok()).collect();
+        if reach.is_empty() {
+            break;
+        }
+    }
+    reach
+}
+
+/// Is there a partner for `p` in `others` satisfying the (possibly ordered)
+/// distance `n`? `p_is_left` only matters when `ordered`.
+fn has_partner(p: i32, others: &[i32], n: i32, ordered: bool, p_is_left: bool) -> bool {
+    if others.is_empty() {
+        return false;
+    }
+    if !ordered {
+        let idx = others.partition_point(|&x| x < p);
+        (idx < others.len() && others[idx] - p <= n) || (idx > 0 && p - others[idx - 1] <= n)
+    } else if p_is_left {
+        let idx = others.partition_point(|&x| x <= p);
+        idx < others.len() && others[idx] - p <= n
+    } else {
+        let idx = others.partition_point(|&x| x < p);
+        idx > 0 && p - others[idx - 1] <= n
+    }
+}
+
+/// Positions from `a` and `b` that take part in some satisfying within/pre pair
+/// — the "region" the next proximity operand composes against.
+fn within_participants(a: &[i32], b: &[i32], n: i32, ordered: bool) -> Vec<i32> {
+    let mut out: Vec<i32> = Vec::new();
+    out.extend(a.iter().copied().filter(|&pa| has_partner(pa, b, n, ordered, true)));
+    out.extend(b.iter().copied().filter(|&pb| has_partner(pb, a, n, ordered, false)));
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The isolated `a` positions — those with no qualifying `b` (the occurrences a
+/// nested not-within contributes).
+fn not_within_participants(a: &[i32], b: &[i32], n: i32, ordered: bool) -> Vec<i32> {
+    a.iter().copied().filter(|&pa| !has_partner(pa, b, n, ordered, true)).collect()
+}
