@@ -98,7 +98,7 @@ The DSL is a superset of `tsquery`. Native `tsquery` syntax works unchanged; the
 
 A few comments:
 
-- Proximity operators are read left to right, so `a <~5> b <~5> c` reads as`(a <~5> b) <~5> c`.
+- Proximity operators are read left to right, so `a <~5> b <~5> c` reads as `(a <~5> b) <~5> c`.
 - Adjacent words have a distance of one, so in `a b c` the `a` and `c` have a distance of two.
 - Proximity operators act on the span of the left side term, meaning for `a b c d e f`, the term `(a <~5> f) <~1> c` is a match--the `c` is in between the left side results.
 - A wildcard that starts with `*`/`?` (`*ology`) and a regex (`##…##`) can't be pre-filtered so you need a second term in the query such as in `study <~3> *ology` or else you won't be using the index at all.
