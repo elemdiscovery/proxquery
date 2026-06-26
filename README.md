@@ -2,17 +2,19 @@
 
 ![proxquery](docs/proxquery.png)
 
-A PostgreSQL extension (built with [pgrx](https://github.com/pgcentralfoundation/pgrx)) that adds term-proximity search on top of `tsvector`: "within N words", ordered proximity, occurrence-level "not within N", and phrases. It reads lexeme positions directly out of the `tsvector`, and it plugs into a normal GIN index.
+`proxquery` is a PostgreSQL extension that adds the `@~@` operator with a more flexible term-proximity search syntax on top of `tsvector`. Primary usage is for "within N words", ordered proximity, and occurrence-level "not within N" terms. It uses lexeme positions directly from the `tsvector` and a normal GIN index to the extent possible.
 
-The motivation is to implement query syntax similar to dtSearch and Lucene without also implementing an actual custom index.
+The motivation is to implement query syntax similar to dtSearch and Lucene without also implementing an actual custom index. All the usual [tsvector limitations](https://www.postgresql.org/docs/current/textsearch-limitations.html) apply.
+
+There is also a [plain SQL implementation](#pure-sql-port) for when compiled extensions can't be used.
 
 ## Install
 
 Requires PostgreSQL 16+ (16, 17, and 18 are built and tested).
 
-### Prebuilt binaries (self-managed Postgres)
+### Prebuilt binaries
 
-Every [release](https://github.com/elemdiscovery/proxquery/releases) packages the extension and an installer. Download and run the equivalent of:
+Each [release](https://github.com/elemdiscovery/proxquery/releases) packages the extension and an installer. Download and run the equivalent of:
 
 ```sh
 tar xzf proxquery-<version>-pg17-linux-amd64.tar.gz
@@ -24,8 +26,6 @@ cd proxquery-<version>-pg17-linux-amd64
 ```sql
 CREATE EXTENSION proxquery;
 ```
-
-The binaries link against the build runner's glibc. If that's an issue in real systems we'll better target this.
 
 ### Docker
 
@@ -39,9 +39,9 @@ then `CREATE EXTENSION proxquery;`.
 
 ### Pure-SQL port
 
-On managed Postgres [sql/proxquery_pure.sql](sql/proxquery_pure.sql) is a re-implementation using plain SQL with the same function names and identical results, installed into a dedicated `proxquery` schema.
+For managed Postgres, [sql/proxquery_pure.sql](sql/proxquery_pure.sql) is a re-implementation using plain SQL with the same function names and identical results, installed into a dedicated `proxquery` schema.
 
-The usage difference is that the `@~@` operator needs a C planner support function, so the pure port does **not** implement it and you need to call two functions for each query to properly use the index.
+The usage difference is that the `@~@` operator needs a compiled planner support function, so the pure port does **not** implement it and you need to call two functions for each query to properly use the index.
 
 ```sql
 SELECT * FROM docs
@@ -68,16 +68,9 @@ SELECT * FROM docs WHERE body_tsv @~@ 'quick <~3> fox';
 SELECT * FROM docs WHERE body_tsv @~@ 'confidential <!~5> email';
 ```
 
-The operator `@~@` is using a plain `gin(tsvector)` index. The operator works in two steps: the index selects candidate rows by lexeme, and then the operator rechecks word positions in order to refine the result.
+The operator `@~@` is syntax sugar for the compound usage of `ts_prox_query` and `ts_prox_match`. The `ts_prox_query` portion acts on the plain `gin(tsvector)` index and selects candidate rows by lexeme. The `ts_prox_match` then rechecks word positions in order to refine the result.
 
-Ranking results isn't a goal of this extension, but `ts_prox_query(q)` returns a real `tsquery`, so the `ts_rank_cd` can be used to get a result, but it won't be particularly meaningful for complex queries.
-
-```sql
-SELECT * FROM docs
-WHERE body_tsv @~@ 'quick <~3> fox'
-ORDER BY ts_rank_cd(body_tsv, ts_prox_query('quick <~3> fox')) DESC
-LIMIT 10;
-```
+Ranking results isn't a goal of this extension, but `ts_prox_query(q)` returns a real `tsquery`, so `ts_rank_cd` can be used to get a result. It won't be particularly meaningful for complex queries.
 
 ## Query operators
 
@@ -106,31 +99,33 @@ The DSL is a superset of `tsquery`. Native `tsquery` syntax works unchanged; the
 A few comments:
 
 - Proximity operators are read left to right, so `a <~5> b <~5> c` reads as`(a <~5> b) <~5> c`.
-- A wildcard that starts with `*`/`?` (`*ology`) and a regex (`##…##`) are matched in the recheck and need a companion term, e.g. `study <~3> *ology` or else you won't be using the index at all.
-- A wildcard with a leading literal (`f*r`, `te?t`) uses that as an index prefix.
-- Regex matches whole lexemes in the index after splitting and normalization. If you are trying to do complex regex you probably need to do it before indexing on the raw text.
-- Real world queries written by users can become really degenerate in this syntax. You might want to discourage complexity on the application side.
+- Adjacent words have a distance of one, so in `a b c` the `a` and `c` have a distance of two.
+- Proximity operators act on the span of the left side term, meaning for `a b c d e f`, the term `(a <~5> f) <~1> c` is a match--the `c` is in between the left side results.
+- A wildcard that starts with `*`/`?` (`*ology`) and a regex (`##…##`) can't be pre-filtered so you need a second term in the query such as in `study <~3> *ology` or else you won't be using the index at all.
+- A wildcard with a leading literal (`f*r`, `te?t`) uses that prefix as the index filter.
+- Regex terms match whole lexemes in the tsvector after splitting and normalization. If you are trying to do complex regex you probably need to do it before indexing on the raw text.
+- Real world queries written by users can become really degenerate in this syntax. I suggest discouraging complexity on the application side.
 
 ## Functions
 
-The `@~@` operator is built on functions, which can also be used directly:
+The `@~@` operator is built on functions that can also be used directly:
 
 - `ts_prox_within(tsvector, a, b, n)`, `ts_prox_pre(...)`, `ts_prox_not_within(...)`,
-  `ts_prox_window(tsvector, text[], int[])` — positional predicates.
-- `ts_prox_positions(tsvector, lexeme)` / `ts_prox_positions_prefix(tsvector, prefix)` —
+  `ts_prox_chain(tsvector, text[], int[])` -- positional predicates.
+- `ts_prox_positions(tsvector, lexeme)` / `ts_prox_positions_prefix(tsvector, prefix)` --
   sorted positions of a lexeme.
-- `ts_prox_query(text) -> tsquery` / `ts_prox_match(tsvector, text) -> bool` — the
+- `ts_prox_query(text) -> tsquery` / `ts_prox_match(tsvector, text) -> bool` -- the
   compiler behind `@~@` (index selection and recheck).
 
-Notice `ts_prox_window` isn't the same as using the proximity operators in an associative way and is not available via DSL syntax.
+Notice `ts_prox_chain` isn't the same as using the proximity operators in an associative way and is not available via DSL syntax.
 
-The `ts_prox_window`function instead 'chains' the proximity onto each specific lexeme hit rather than onto the spanning phrase formed by the lexemes matched in the earlier query. (If that makes sense I'm sorry.)
+The `ts_prox_chain` function instead 'chains' the proximity onto each specific lexeme hit rather than onto the spanning phrase formed by the lexemes matched in the query evaluation. (If that makes sense I'm sorry.)
 
-Matching uses the `simple` text search configuration (literal, lowercased).
+Matching uses the `simple` text search configuration.
 
 ## Development
 
-proxquery is built with [pgrx](https://github.com/pgcentralfoundation/pgrx).
+`proxquery` is built with [pgrx](https://github.com/pgcentralfoundation/pgrx).
 
 ### Prerequisites
 

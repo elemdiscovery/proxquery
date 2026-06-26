@@ -31,6 +31,8 @@ END $f$;
 DO $$
 DECLARE
     r record;
+    mr record;
+    mexpr text;
     ext_sch text;
     got_ext text;
     got_pure text;
@@ -55,6 +57,21 @@ BEGIN
            OR got_pure IS DISTINCT FROM r.expected
            OR got_ext IS DISTINCT FROM got_pure THEN
             RAISE WARNING 'FAIL %  ext=[%] pure=[%] expected=[%]', r.label, got_ext, got_pure, r.expected;
+            fails := fails + 1;
+        END IF;
+    END LOOP;
+
+    -- Structured match cases (proxquery_match_cases.sql): derive the recheck expr
+    -- from the (doc, query) tuple; `format` quotes both robustly.
+    FOR mr IN SELECT label, doc, query, expected FROM pg_temp._prox_match ORDER BY label LOOP
+        n := n + 1;
+        mexpr := format('ts_prox_match(to_tsvector(%L, %L), %L)', 'simple', mr.doc, mr.query);
+        got_ext  := pg_temp._prox_eval(ext_sch, mexpr);
+        got_pure := pg_temp._prox_eval('proxquery', mexpr);
+        IF got_ext IS DISTINCT FROM mr.expected
+           OR got_pure IS DISTINCT FROM mr.expected
+           OR got_ext IS DISTINCT FROM got_pure THEN
+            RAISE WARNING 'FAIL match:%  ext=[%] pure=[%] expected=[%]', mr.label, got_ext, got_pure, mr.expected;
             fails := fails + 1;
         END IF;
     END LOOP;

@@ -49,7 +49,7 @@ extension, and returns **identical results** (verified — see
 | `ts_prox_match(tsvector, text) -> bool` | positional recheck |
 | `ts_prox_query_skeleton(text) -> text` | the `to_tsquery` input string |
 | `ts_prox_within / ts_prox_pre / ts_prox_not_within(tsvector, a, b, n)` | positional predicates |
-| `ts_prox_window(tsvector, text[], int[])` | same-occurrence chain |
+| `ts_prox_chain(tsvector, text[], int[])` | same-occurrence chain |
 | `ts_prox_positions / ts_prox_positions_prefix(tsvector, text)` | sorted positions |
 
 The DSL is the same superset of `tsquery` documented in the

@@ -74,8 +74,9 @@ CREATE OR REPLACE FUNCTION _prox_is_word_char(c text) RETURNS boolean
     LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
 $fn$ SELECT $1 !~ '\s' AND position($1 in '()&|!<>,"''#') = 0 $fn$;
 
--- Parse a distance: non-empty digits, clamped to [1, 16383] (matches the Rust
--- `parse_distance` / MAX_DISTANCE clamp, including overflow → 16383).
+-- Parse a distance: non-empty digits, clamped to [0, 16383] (matches the Rust
+-- `parse_distance` / MAX_DISTANCE clamp, including overflow → 16383). `0` is kept
+-- (native tsquery `<0>` = same position), not raised to 1.
 CREATE OR REPLACE FUNCTION _prox_parse_distance(digits text) RETURNS int
     LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
 $fn$
@@ -86,7 +87,7 @@ BEGIN
     IF length(digits) > 5 THEN
         RETURN 16383;
     END IF;
-    RETURN least(greatest(digits::int, 1), 16383);
+    RETURN least(greatest(digits::int, 0), 16383);
 END
 $fn$;
 
@@ -179,24 +180,27 @@ BEGIN
 END
 $fn$;
 
--- The positions of a and b that participate in some satisfying within/pre pair
--- — the "region" a chained proximity operand composes against.
-CREATE OR REPLACE FUNCTION _prox_within_participants(a int[], b int[], n int, ordered boolean) RETURNS int[]
+-- The region a chained within/pre operand composes against: the union of the
+-- spans [least(aᵢ,bⱼ) .. greatest(aᵢ,bⱼ)] of every satisfying pair, densified to a
+-- sorted position set — so a later operand can attach to a term that falls between
+-- a matched pair. Per-pair union (not one global min/max), so two separate matches
+-- don't bridge the gap between them. One covering interval per a-position (its
+-- qualifying partners are contiguous), then generate_series densifies the union.
+CREATE OR REPLACE FUNCTION _prox_within_span(a int[], b int[], n int, ordered boolean) RETURNS int[]
     LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
 $fn$
-    SELECT coalesce(array_agg(p ORDER BY p), '{}'::int[]) FROM (
-        SELECT DISTINCT p FROM (
-            SELECT x AS p FROM unnest(a) x
-              WHERE EXISTS (SELECT 1 FROM unnest(b) y
-                            WHERE CASE WHEN ordered THEN (y > x AND y - x <= n)
-                                       ELSE abs(x - y) <= n END)
-            UNION ALL
-            SELECT y AS p FROM unnest(b) y
-              WHERE EXISTS (SELECT 1 FROM unnest(a) x
-                            WHERE CASE WHEN ordered THEN (x < y AND y - x <= n)
-                                       ELSE abs(x - y) <= n END)
-        ) u
-    ) s
+    SELECT coalesce(array_agg(DISTINCT p ORDER BY p), '{}'::int[])
+    FROM (
+        SELECT generate_series(lo, hi) AS p
+        FROM (
+            SELECT least(x, min(y)) AS lo, greatest(x, max(y)) AS hi
+            FROM unnest(a) AS x
+            JOIN unnest(b) AS y
+              ON CASE WHEN ordered THEN (y > x AND y - x <= n)
+                      ELSE abs(x - y) <= n END
+            GROUP BY x
+        ) spans
+    ) d
 $fn$;
 
 -- The isolated a positions — those with no qualifying b (what a nested
@@ -232,7 +236,7 @@ $fn$ SELECT _prox_arr_not_within(ts_prox_positions(v, a), ts_prox_positions(v, b
 
 -- Same-occurrence chain over `terms`, each consecutive pair within its gaps[i].
 -- gaps must have exactly one fewer element than terms.
-CREATE OR REPLACE FUNCTION ts_prox_window(v tsvector, terms text[], gaps int[]) RETURNS boolean
+CREATE OR REPLACE FUNCTION ts_prox_chain(v tsvector, terms text[], gaps int[]) RETURNS boolean
     LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE STRICT
     SET search_path = proxquery, pg_catalog AS
 $fn$
@@ -245,7 +249,7 @@ DECLARE
     i      int;
 BEGIN
     IF nterms = 0 OR ngaps <> nterms - 1 THEN
-        RAISE EXCEPTION 'ts_prox_window: gaps length must be one less than terms length (got % terms, % gaps)',
+        RAISE EXCEPTION 'ts_prox_chain: gaps length must be one less than terms length (got % terms, % gaps)',
             nterms, ngaps;
     END IF;
     reach := ts_prox_positions(v, terms[1]);
@@ -954,8 +958,8 @@ BEGIN
         END LOOP;
         RETURN coalesce((SELECT array_agg(DISTINCT p ORDER BY p) FROM unnest(res) p), '{}'::int[]);
     ELSIF t = 'within' THEN
-        RETURN _prox_within_participants(_prox_positions(node -> 'a', v), _prox_positions(node -> 'b', v),
-                                         (node ->> 'n')::int, (node ->> 'ord')::boolean);
+        RETURN _prox_within_span(_prox_positions(node -> 'a', v), _prox_positions(node -> 'b', v),
+                                 (node ->> 'n')::int, (node ->> 'ord')::boolean);
     ELSIF t = 'notwithin' THEN
         RETURN _prox_not_within_participants(_prox_positions(node -> 'a', v), _prox_positions(node -> 'b', v),
                                              (node ->> 'n')::int, (node ->> 'ord')::boolean);

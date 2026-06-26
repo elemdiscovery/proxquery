@@ -55,4 +55,4 @@ pushed, so a broken image never reaches GHCR. It pushes multi-arch images:
 
 ## Portability caveat
 
-Releases are built on GitHub's Ubuntu runners, so the `.so` links against that runner's glibc. This might need improvement for real work usage.
+The Dockerfile builds with `glibc` 2.36 so that's the minimum version required on our binary release as well.

@@ -54,16 +54,16 @@ fn ts_prox_not_within(v: TsVector, a: &str, b: &str, n: i32) -> bool {
 /// `gaps[i]`, mutually within the gaps. `gaps` must have exactly one fewer
 /// element than `terms`.
 #[pg_extern(immutable, parallel_safe)]
-fn ts_prox_window(v: TsVector, terms: Vec<String>, gaps: Vec<i32>) -> bool {
+fn ts_prox_chain(v: TsVector, terms: Vec<String>, gaps: Vec<i32>) -> bool {
     if terms.is_empty() || gaps.len() + 1 != terms.len() {
         error!(
-            "ts_prox_window: gaps length must be one less than terms length (got {} terms, {} gaps)",
+            "ts_prox_chain: gaps length must be one less than terms length (got {} terms, {} gaps)",
             terms.len(),
             gaps.len()
         );
     }
     let positions: Vec<Vec<i32>> = terms.iter().map(|t| v.positions(t.as_bytes())).collect();
-    proximity::window(&positions, &gaps)
+    proximity::chain(&positions, &gaps)
 }
 
 // --- proxquery DSL compiler (Milestone 2) --------------------------------
@@ -234,32 +234,48 @@ mod tests {
     }
 
     #[pg_test]
-    fn window_pins_same_occurrence() {
+    fn chain_pins_same_occurrence() {
         // alpha@1 xx@2 beta@3 yy@4 gamma@5.
         let v = "to_tsvector('simple','alpha xx beta yy gamma')";
         assert!(b(&format!(
-            "SELECT ts_prox_window({v}, ARRAY['alpha','beta','gamma'], ARRAY[2,2])"
+            "SELECT ts_prox_chain({v}, ARRAY['alpha','beta','gamma'], ARRAY[2,2])"
         )));
         // Tighten the gaps below the spacing ⇒ no single chain fits.
         assert!(!b(&format!(
-            "SELECT ts_prox_window({v}, ARRAY['alpha','beta','gamma'], ARRAY[1,1])"
+            "SELECT ts_prox_chain({v}, ARRAY['alpha','beta','gamma'], ARRAY[1,1])"
         )));
     }
 
     #[pg_test]
-    fn window_is_stricter_than_operator_chain() {
+    fn chain_pins_a_single_occurrence_across_the_chain() {
+        // alpha@1 beta@2 … beta@9 gamma@10. One beta sits by alpha, another by
+        // gamma, but NO single beta is near both — so the alpha→beta→gamma chain
+        // cannot complete through one occurrence (occurrence chaining, not span).
+        let v = "to_tsvector('simple','alpha beta x x x x x x beta gamma')";
+        assert!(!b(&format!("SELECT ts_prox_chain({v}, ARRAY['alpha','beta','gamma'], ARRAY[2,2])")));
+        // Document-level "a beta near alpha AND a beta near gamma" WOULD be true
+        // here — confirming window is strictly occurrence-pinned, not that.
+        assert!(b(&format!("SELECT ts_prox_within({v}, 'beta', 'alpha', 2)"))
+            && b(&format!("SELECT ts_prox_within({v}, 'beta', 'gamma', 2)")));
+        // A single beta near both ends ⇒ the chain completes through that occurrence.
+        let w = "to_tsvector('simple','alpha beta gamma')"; // alpha@1 beta@2 gamma@3
+        assert!(b(&format!("SELECT ts_prox_chain({w}, ARRAY['alpha','beta','gamma'], ARRAY[1,1])")));
+    }
+
+    #[pg_test]
+    fn chain_is_stricter_than_operator_chain() {
         // orange@8 apple@10 banana@12 — apple↔banana and apple↔orange are each
         // within 2, but banana↔orange is 4 apart, so no single strict chain fits.
         let doc = "one two three four five six seven orange nine apple eleven banana";
         let v = format!("to_tsvector('simple','{doc}')");
-        // ts_prox_window demands ONE chain apple→banana→orange; orange isn't within 2
+        // ts_prox_chain demands ONE chain apple→banana→orange; orange isn't within 2
         // of banana ⇒ false.
         assert!(!b(&format!(
-            "SELECT ts_prox_window({v}, ARRAY['apple','banana','orange'], ARRAY[2,2])"
+            "SELECT ts_prox_chain({v}, ARRAY['apple','banana','orange'], ARRAY[2,2])"
         )));
-        // The operator chain composes against the region apple<~2>banana occupied
-        // (both endpoints), so orange attaches to the apple ⇒ true — strictly
-        // looser than ts_prox_window.
+        // The operator chain composes against the span apple<~2>banana covers
+        // ([10..12]), so orange@8 attaches at distance 2 from the apple end ⇒ true —
+        // strictly looser than ts_prox_chain.
         assert!(proxmatch(doc, "apple <~2> banana <~2> orange"));
     }
 
@@ -426,6 +442,58 @@ mod tests {
     }
 
     #[pg_test]
+    fn ts_prox_chain_pins_occurrence_not_span() {
+        // Same doc (a@1 2@2 b@3 4@4 5@5 c@6). ts_prox_chain is a per-link chain that
+        // carries forward ONE occurrence per term — distinct from the operator
+        // chain's span region (it does not test "is b inside the [a..c] span").
+        let v = "to_tsvector('simple','a 2 b 4 5 c')";
+        // a→b→c places b between by construction (b within 2 of a, c within 3 of b).
+        assert!(b(&format!("SELECT ts_prox_chain({v}, ARRAY['a','b','c'], ARRAY[2,3])")));
+        // a→c→b tests b only against the carried c@6 (distance 3): gap 1 misses, 3 hits.
+        assert!(!b(&format!("SELECT ts_prox_chain({v}, ARRAY['a','c','b'], ARRAY[6,1])")));
+        assert!(b(&format!("SELECT ts_prox_chain({v}, ARRAY['a','c','b'], ARRAY[6,3])")));
+        // The operator chain instead treats the left side as a SPAN, so b@3 (between
+        // a@1 and c@6) attaches at `<~1>` — whereas window must name b in the chain.
+        assert!(proxmatch("a 2 b 4 5 c", "(a <~6> c) <~1> b"));
+    }
+
+    #[pg_test]
+    fn chained_proximity_attaches_term_within_left_side_span() {
+        // doc: a@1 2@2 b@3 4@4 5@5 c@6.  `a <~6> c` matches and occupies the SPAN
+        // [1..6] (the interval between the matched pair), so a term falling between
+        // them attaches even at `<~1>` — b@3 is inside the span (distance 0).
+        let d = "a 2 b 4 5 c";
+        assert!(proxmatch(d, "(a <~6> c) <~1> b")); // b@3 lies inside the [a@1..c@6] span
+        assert!(proxmatch(d, "(c <~6> a) <~1> b")); // inner pair is symmetric
+        // Multiple occurrences: the region is the UNION of per-pair spans, NOT a
+        // global min/max — a term in the gap between two separate matched pairs does
+        // not attach. a@1 c@3 (span [1..3]) … a@10 c@12 (span [10..12]); g@6 is in the gap.
+        let d2 = "a x c x x g x x x a x c"; // a@{1,10} c@{3,12} g@6 x@{2,4,5,7,8,9,11}
+        assert!(!proxmatch(d2, "(a <~2> c) <~1> g")); // g@6 sits between the clusters
+        assert!(proxmatch(d2, "(a <~2> c) <~1> x")); // x@2 is inside the first span [1..3]
+    }
+
+    #[pg_test]
+    fn within_zero_is_same_position() {
+        // Distances clamp to [0, 16383]; `0` is kept (not raised to 1). `<~0>` /
+        // `<0>` mean SAME position (distance 0), matching native tsquery `<0>`.
+        // Distinct lexemes never share a position, so on normal text `<0>` is false —
+        // and crucially it is NOT silently adjacency (which is how it'd behave if 0
+        // were clamped to 1): `<0>` on `a b` is false where `<~1>` is true.
+        assert!(!proxmatch("a b", "a <~0> b")); // a@1 b@2 ⇒ different positions
+        assert!(!proxmatch("a b", "a <0> b")); // <0> ≠ adjacency (would be true if clamped to 1)
+        assert!(proxmatch("a b", "a <~1> b")); //   …whereas <~1> does match adjacency
+        // …but co-located lexemes (a@1 b@1) DO match `<0>` / `<~0>`.
+        let tv = "$$'a':1 'b':1$$::tsvector"; // a and b at the same position
+        assert!(b(&format!("SELECT ts_prox_match({tv}, 'a <~0> b')")));
+        assert!(b(&format!("SELECT ts_prox_match({tv}, 'a <0> b')")));
+        // matches native tsquery exactly (the `<N> unchanged` promise).
+        assert!(b(&format!("SELECT {tv} @@ to_tsquery('simple','a <0> b')")));
+        // ordered `<-0>` (strictly before, at distance ≤0) is contradictory ⇒ false.
+        assert!(!b(&format!("SELECT ts_prox_match({tv}, 'a <-0> b')")));
+    }
+
+    #[pg_test]
     fn recheck_native_distance_is_exact() {
         // <N> stays native tsquery: exactly N apart, ordered.
         assert!(proxmatch("a x b", "a <2> b")); // b exactly 2 after a
@@ -540,6 +608,54 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(m > 0, "standalone wildcard via @~@ must work as a seq scan");
+    }
+
+    #[pg_test]
+    fn operator_index_path_matches_recheck_across_query_types() {
+        // @~@ IS `ts_prox_match` plus a planner support fn that, under a GIN index,
+        // rewrites it to `tsv @@ ts_prox_query(q) AND ts_prox_match(tsv, q)`. Driven by
+        // the SAME structured corpus as the function tests (proxquery_match_cases.sql),
+        // this builds one indexed table from the distinct docs and confirms, for every
+        // distinct query, that @~@ over the index (a) is actually taken when the query
+        // carries an index key and (b) returns exactly the rows the bare recheck does.
+        Spi::run(include_str!("../sql/proxquery_match_cases.sql")).expect("load match corpus");
+        Spi::run("CREATE TEMP TABLE docs(id serial primary key, tsv tsvector)").unwrap();
+        // Distinct docs, duplicated so the planner clearly prefers the index.
+        Spi::run(
+            "INSERT INTO docs(tsv) SELECT to_tsvector('simple', d.doc) \
+             FROM (SELECT DISTINCT doc FROM _prox_match) d, generate_series(1, 20)",
+        )
+        .unwrap();
+        Spi::run("CREATE INDEX ON docs USING gin(tsv)").unwrap();
+        Spi::run("ANALYZE docs").unwrap();
+        // For each distinct query: compare @~@ forced through the index against the
+        // bare recheck (forced seq scan), and require the index plan for keyed queries.
+        // The DO block RAISEs on any divergence, surfacing as a failed Spi call.
+        Spi::run(
+            "DO $$ \
+             DECLARE q text; has_key boolean; s_idx text; s_seq text; line text; plan_hit boolean; \
+             BEGIN \
+               FOR q IN SELECT DISTINCT query FROM _prox_match ORDER BY query LOOP \
+                 BEGIN PERFORM ts_prox_query(q); has_key := true; \
+                 EXCEPTION WHEN OTHERS THEN has_key := false; END; \
+                 SET LOCAL enable_seqscan = off; SET LOCAL enable_indexscan = on; SET LOCAL enable_bitmapscan = on; \
+                 EXECUTE format('SELECT coalesce(array_agg(id ORDER BY id), ''{}''::int[])::text FROM docs WHERE tsv @~@ %L', q) INTO s_idx; \
+                 IF has_key THEN \
+                   plan_hit := false; \
+                   FOR line IN EXECUTE format('EXPLAIN SELECT * FROM docs WHERE tsv @~@ %L', q) LOOP \
+                     IF line LIKE '%Index Cond%ts_prox_query%' THEN plan_hit := true; END IF; \
+                   END LOOP; \
+                   IF NOT plan_hit THEN RAISE EXCEPTION 'index not used for keyed query: %', q; END IF; \
+                 END IF; \
+                 SET LOCAL enable_seqscan = on; SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off; \
+                 EXECUTE format('SELECT coalesce(array_agg(id ORDER BY id), ''{}''::int[])::text FROM docs WHERE ts_prox_match(tsv, %L)', q) INTO s_seq; \
+                 IF s_idx IS DISTINCT FROM s_seq THEN \
+                   RAISE EXCEPTION '@~@ index path % differs from recheck % for query: %', s_idx, s_seq, q; \
+                 END IF; \
+               END LOOP; \
+             END $$",
+        )
+        .expect("@~@ index path must match the recheck for every query");
     }
 
     #[pg_test]
@@ -708,6 +824,7 @@ mod tests {
     fn pure_sql_matches_extension_corpus() {
         Spi::run(include_str!("../sql/proxquery_pure.sql")).expect("load pure-SQL port");
         Spi::run(include_str!("../sql/proxquery_cases.sql")).expect("load shared corpus");
+        Spi::run(include_str!("../sql/proxquery_match_cases.sql")).expect("load match corpus");
         Spi::run(include_str!("../sql/proxquery_diff_test.sql")).expect("differential corpus test");
     }
 

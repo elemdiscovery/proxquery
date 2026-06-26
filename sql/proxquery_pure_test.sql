@@ -18,6 +18,7 @@ SET client_min_messages = notice;
 SET search_path = proxquery, pg_catalog;
 
 \ir proxquery_cases.sql
+\ir proxquery_match_cases.sql
 
 CREATE OR REPLACE FUNCTION _prox_selftest_eval(expr text) RETURNS text
     LANGUAGE plpgsql AS $f$
@@ -29,15 +30,25 @@ EXCEPTION WHEN OTHERS THEN RETURN 'ERR';
 END $f$;
 
 DO $$
-DECLARE r record; fails int := 0; n int;
+DECLARE r record; fails int := 0; n int := 0;
 BEGIN
     FOR r IN SELECT label, _prox_selftest_eval(expr) AS got, expected FROM _prox_cases ORDER BY label LOOP
+        n := n + 1;
         IF r.got IS DISTINCT FROM r.expected THEN
             RAISE WARNING 'FAIL %  got=[%]  expected=[%]', r.label, r.got, r.expected;
             fails := fails + 1;
         END IF;
     END LOOP;
-    SELECT count(*) INTO n FROM _prox_cases;
+    FOR r IN SELECT label,
+                    _prox_selftest_eval(format('ts_prox_match(to_tsvector(%L, %L), %L)', 'simple', doc, query)) AS got,
+                    expected
+             FROM _prox_match ORDER BY label LOOP
+        n := n + 1;
+        IF r.got IS DISTINCT FROM r.expected THEN
+            RAISE WARNING 'FAIL match:%  got=[%]  expected=[%]', r.label, r.got, r.expected;
+            fails := fails + 1;
+        END IF;
+    END LOOP;
     IF fails > 0 THEN
         RAISE EXCEPTION 'proxquery self-test: % of % case(s) FAILED', fails, n;
     END IF;

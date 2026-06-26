@@ -1,36 +1,26 @@
-# A Postgres image with proxquery preinstalled — the container/Kubernetes and
-# "try it now" install path. Self-contained: builds the extension from source
-# against the matching PGDG server-dev package so the .so is ABI- and
-# glibc-compatible with the official postgres:<major>-bookworm runtime.
-#
-#   docker build --build-arg PG_MAJOR=17 -t proxquery:17 .
-#   docker run --rm -e POSTGRES_PASSWORD=pw proxquery:17
-#   # then:  CREATE EXTENSION proxquery;
-#
+# A Postgres image with proxquery preinstalled.
 # PG_MAJOR must be one of the versions the crate supports (16, 17, 18).
 ARG PG_MAJOR=17
 
 FROM rust:1-bookworm AS build
-ARG PG_MAJOR
 ARG PGRX_VERSION=0.19.1
 
-# Add the PGDG apt repo and install the matching server headers. Building against
-# the same packages the runtime image uses keeps the .so loadable there.
+COPY packaging/pgdg-ACCC4CF8.asc /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-      ca-certificates curl gnupg lsb-release \
+      ca-certificates gnupg lsb-release \
       build-essential bison flex libreadline-dev zlib1g-dev libssl-dev pkg-config; \
-    install -d /usr/share/postgresql-common/pgdg; \
-    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-      -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc; \
     echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
-      > /etc/apt/sources.list.d/pgdg.list; \
+      > /etc/apt/sources.list.d/pgdg.list
+
+RUN cargo install --locked "cargo-pgrx@${PGRX_VERSION}"
+
+ARG PG_MAJOR
+RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends "postgresql-server-dev-${PG_MAJOR}"; \
     rm -rf /var/lib/apt/lists/*
-
-RUN cargo install --locked "cargo-pgrx@${PGRX_VERSION}"
 
 WORKDIR /src
 COPY . .
@@ -47,6 +37,11 @@ RUN set -eux; \
     find target -name 'proxquery.control'   -path '*release*' -exec cp {} /out/ \; ; \
     find target -name 'proxquery--*.sql'    -path '*release*' -exec cp {} /out/ \;
 
+# Preserve standalone binaries as `export` for direct packaging.
+FROM scratch AS export
+COPY --from=build /out/ /
+
+# The actual postgres container.
 FROM postgres:${PG_MAJOR}-bookworm
 ARG PG_MAJOR
 LABEL org.opencontainers.image.source="https://github.com/elemdiscovery/proxquery"

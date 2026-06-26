@@ -36,8 +36,23 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      # Layer-cache the build via the GitHub Actions cache. Scoped per PG major
+      # so the parallel matrix legs don't clobber each other's cache. On a repeat
+      # run with an unchanged Dockerfile the apt + cargo-pgrx layers are restored
+      # instead of rebuilt; `load: true` puts the image in the local daemon so
+      # the smoke step below can run it.
       - name: Build image
-        run: docker build --build-arg PG_MAJOR=${{ matrix.pg }} -t proxquery:smoke-${{ matrix.pg }} .
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          load: true
+          tags: proxquery:smoke-${{ matrix.pg }}
+          build-args: PG_MAJOR=${{ matrix.pg }}
+          cache-from: type=gha,scope=docker-smoke-pg${{ matrix.pg }}
+          cache-to: type=gha,mode=max,scope=docker-smoke-pg${{ matrix.pg }}
 
       - name: Boot and CREATE EXTENSION
         run: packaging/smoke.sh proxquery:smoke-${{ matrix.pg }}
