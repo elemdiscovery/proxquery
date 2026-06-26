@@ -1,12 +1,17 @@
 {
     "cSpell.words": [
+        "appl",
         "clippy",
+        "elemdiscovery",
         "ndocs",
+        "PGDG",
         "pgrx",
         "PGXS",
+        "pkglibdir",
         "proxquery",
         "psql",
         "rustup",
+        "sharedir",
         "tsquery",
         "tsvector"
     ]

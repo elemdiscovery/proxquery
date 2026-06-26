@@ -22,9 +22,10 @@
 //! | not within | `a <!~N> b` | `a <!-N> b` |
 //!
 //! Precedence (tsquery's own): `|` < `&` < proximity < `!`. Proximity operators
-//! are **left-associative composition** — each pair yields the set of positions
-//! that took part (a "region"), and the next operand is tested against that
-//! region, so multi-term proximity (`a <~5> b <~5> c`) stays occurrence-linked.
+//! are **left-associative composition** — each pair yields the *span* it covers
+//! (the union of `[min..max]` over satisfying pairs), and the next operand is
+//! tested against that span, so multi-term proximity (`a <~5> b <~5> c`) stays
+//! occurrence-linked and a term falling *between* a matched pair can attach.
 //!
 //! ## Compound-proximity operand rules (normalization)
 //!
@@ -80,7 +81,10 @@ fn parse_distance(digits: &str) -> Result<i32, String> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(format!("expected a distance, got `{digits}`"));
     }
-    Ok(digits.parse::<i32>().unwrap_or(MAX_DISTANCE).clamp(1, MAX_DISTANCE))
+    // Clamp to [0, MAX]. `0` is kept (not raised to 1): native tsquery `<0>` means
+    // "same position", and the proximity ops follow suit (`within(·,0)` = same
+    // position; `pre(·,0)` is unsatisfiable). Overflow saturates to MAX.
+    Ok(digits.parse::<i32>().unwrap_or(MAX_DISTANCE).clamp(0, MAX_DISTANCE))
 }
 
 // ===========================================================================
@@ -694,7 +698,7 @@ fn positions(node: &Node, v: &TsVector) -> Result<Vec<i32>, String> {
             all.dedup();
             all
         }
-        Node::Within { a, b, n, ordered } => within_participants(&positions(a, v)?, &positions(b, v)?, *n, *ordered),
+        Node::Within { a, b, n, ordered } => within_span(&positions(a, v)?, &positions(b, v)?, *n, *ordered),
         Node::NotWithin { a, b, n, ordered } => {
             not_within_participants(&positions(a, v)?, &positions(b, v)?, *n, *ordered)
         }
@@ -826,14 +830,50 @@ fn has_partner(p: i32, others: &[i32], n: i32, ordered: bool, p_is_left: bool) -
     }
 }
 
-/// Positions from `a` and `b` that take part in some satisfying within/pre pair
-/// — the "region" the next proximity operand composes against.
-fn within_participants(a: &[i32], b: &[i32], n: i32, ordered: bool) -> Vec<i32> {
-    let mut out: Vec<i32> = Vec::new();
-    out.extend(a.iter().copied().filter(|&pa| has_partner(pa, b, n, ordered, true)));
-    out.extend(b.iter().copied().filter(|&pb| has_partner(pb, a, n, ordered, false)));
-    out.sort_unstable();
-    out.dedup();
+/// The region a `within`/`pre` contributes when it is itself a proximity operand:
+/// the union of the spans `[min(aᵢ,bⱼ) … max(aᵢ,bⱼ)]` of every satisfying pair,
+/// densified to a sorted position set. This lets the next operand attach to a term
+/// that falls *between* a matched pair; taking the per-pair union (not one global
+/// min/max) keeps two separate matches from bridging the gap between them.
+/// Positions are capped at `MAX_DISTANCE`, so the densified set is bounded.
+fn within_span(a: &[i32], b: &[i32], n: i32, ordered: bool) -> Vec<i32> {
+    // One covering interval per `a` position that has a qualifying partner. All of a
+    // position's qualifying partners are contiguous in sorted `b`, so the leftmost
+    // and rightmost of them (with the position itself) bound its interval. The same
+    // `[min(pa,b[first]) … max(pa,b[last−1])]` formula serves both orders, since for
+    // the ordered case every qualifying `b` is `> pa`.
+    let mut intervals: Vec<(i32, i32)> = Vec::new();
+    for &pa in a {
+        let (first, last) = if ordered {
+            (b.partition_point(|&x| x <= pa), b.partition_point(|&x| x <= pa + n)) // (pa, pa+n]
+        } else {
+            (b.partition_point(|&x| x < pa - n), b.partition_point(|&x| x <= pa + n)) // [pa−n, pa+n]
+        };
+        if first < last {
+            intervals.push((pa.min(b[first]), pa.max(b[last - 1])));
+        }
+    }
+    densify_union(intervals)
+}
+
+/// Merge inclusive intervals and expand to a sorted, unique position list. Merging
+/// before expanding bounds the output to the (capped) position range.
+fn densify_union(mut intervals: Vec<(i32, i32)>) -> Vec<i32> {
+    if intervals.is_empty() {
+        return Vec::new();
+    }
+    intervals.sort_unstable();
+    let mut out = Vec::new();
+    let (mut lo, mut hi) = intervals[0];
+    for &(l, h) in &intervals[1..] {
+        if l <= hi + 1 {
+            hi = hi.max(h);
+        } else {
+            out.extend(lo..=hi);
+            (lo, hi) = (l, h);
+        }
+    }
+    out.extend(lo..=hi);
     out
 }
 

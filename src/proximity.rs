@@ -78,7 +78,7 @@ pub fn not_within(a: &[i32], b: &[i32], n: i32, ordered: bool) -> bool {
     false
 }
 
-/// `window` — same-occurrence chain: positions `p₀ … p_k` exist, each consecutive
+/// `chain` — same-occurrence chain: positions `p₀ … p_k` exist, each consecutive
 /// pair drawn from `terms[i]`, `terms[i+1]` with `|pᵢ − pᵢ₊₁| ≤ gaps[i]`
 /// (either order). `gaps.len()` must be `terms.len() − 1`.
 ///
@@ -86,7 +86,7 @@ pub fn not_within(a: &[i32], b: &[i32], n: i32, ordered: bool) -> bool {
 /// within(b,c)`) cannot express, because it pins the *same* middle occurrence:
 /// `reach` carries forward only the positions of `terms[i]` actually reachable
 /// from the previous term, so `terms[i+1]` must be near one of *those*.
-pub fn window(terms: &[Vec<i32>], gaps: &[i32]) -> bool {
+pub fn chain(terms: &[Vec<i32>], gaps: &[i32]) -> bool {
     if terms.is_empty() || terms.iter().any(|t| t.is_empty()) {
         return false;
     }

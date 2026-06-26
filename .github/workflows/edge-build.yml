@@ -1,0 +1,129 @@
+# Builds and publishes the rolling `edge` pre-release: the "latest main" build.
+#
+# Called by release.yml for every non-release commit (it decides when, so there's
+# no skip-guard here), or run manually via workflow_dispatch. Builds a subset of
+# the matrix (PG 17, amd64 + arm64), versions the artifacts <base>-dev.<n>.g<sha>
+# off the current Cargo.toml version, and republishes a single `edge` GitHub
+# pre-release pointing at the current commit. Edge is FRESH-INSTALL ONLY — no
+# `ALTER EXTENSION ... UPDATE` path is implied. Not for production.
+#
+# Like release-build, the .so is compiled via the Dockerfile's `export` stage
+# (Debian bookworm, glibc 2.36) — the same build the container image uses.
+name: edge-build
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+# A newer edge build supersedes an in-flight one. Static group so it dedupes
+# across the parent runs that call this workflow. Never groups with release
+# builds, so it can't cancel a release.
+concurrency:
+  group: edge
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: edge pg17 ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0   # need full history for the commit count in the version
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      # Stamp the throwaway edge version into Cargo.toml BEFORE the build so the
+      # Docker context (COPY . .) carries it — pgrx reads the version from
+      # Cargo.toml into the .control / .sql. Uncommitted, CI-local only.
+      - name: Stamp the edge version into Cargo.toml
+        id: ver
+        run: |
+          set -euo pipefail
+          BASE="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          COUNT="$(git rev-list --count HEAD)"
+          SHA="$(git rev-parse --short HEAD)"
+          EDGE_VERSION="${BASE}-dev.${COUNT}.g${SHA}"
+          sed -i -E "0,/^version = .*/s//version = \"${EDGE_VERSION}\"/" Cargo.toml
+          echo "edge_version=$EDGE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build the extension and extract artifacts
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          target: export
+          build-args: PG_MAJOR=17
+          outputs: type=local,dest=out
+          cache-from: type=gha,scope=edge-pg17-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=edge-pg17-${{ matrix.arch }}
+
+      - name: Package the tarball
+        id: pkg
+        run: |
+          set -euo pipefail
+          EDGE_VERSION="${{ steps.ver.outputs.edge_version }}"
+          STAGE="proxquery-${EDGE_VERSION}-pg17-linux-${{ matrix.arch }}"
+          mkdir -p "$STAGE" dist
+          cp out/proxquery.so out/proxquery.control out/proxquery--*.sql packaging/install.sh "$STAGE/"
+          chmod +x "$STAGE/install.sh"
+          tar -czf "dist/${STAGE}.tar.gz" "$STAGE"
+          ( cd dist && sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256" )
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.pkg.outputs.stage }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Replace the single rolling `edge` pre-release (and its tag) with this commit's
+  # artifacts. Done once, after both legs finish, to avoid the legs racing.
+  publish:
+    name: publish edge
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Download tarballs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Re-publish the edge pre-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BASE="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          COUNT="$(git rev-list --count HEAD)"
+          SHA="$(git rev-parse --short HEAD)"
+          EDGE_VERSION="${BASE}-dev.${COUNT}.g${SHA}"
+          # Delete the old rolling release + tag, then recreate at this commit.
+          gh release delete edge --yes --cleanup-tag 2>/dev/null || true
+          gh release create edge dist/* \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "edge (${EDGE_VERSION})" \
+            --notes "Rolling pre-release built from the latest main commit (\`${SHA}\`).
+
+          Fresh installs only — no upgrade-path guarantees, not for production.
+          Download the tarball for your PG major + arch, extract, and run ./install.sh."

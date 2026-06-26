@@ -7,13 +7,10 @@ like Cloud SQL, RDS, or Azure, where `CREATE EXTENSION proxquery` isn't an
 option — and as a stepping stone you can later swap for the native extension
 with no query changes.
 
-It is a plain migration file: run it once and you have the whole proxquery
-surface. No superuser, no `shared_preload_libraries`, no `.so`.
+It is a plain migration file: run it once and you have the whole proxquery surface.
 
 ```sh
 psql -d yourdb -f sql/proxquery_pure.sql
-# optional: prove the install matches the extension's behavior
-psql -d yourdb -f sql/proxquery_pure_test.sql      # -> "all 123 cases passed"
 ```
 
 ## Everything lives in a `proxquery` schema
@@ -52,7 +49,7 @@ extension, and returns **identical results** (verified — see
 | `ts_prox_match(tsvector, text) -> bool` | positional recheck |
 | `ts_prox_query_skeleton(text) -> text` | the `to_tsquery` input string |
 | `ts_prox_within / ts_prox_pre / ts_prox_not_within(tsvector, a, b, n)` | positional predicates |
-| `ts_prox_window(tsvector, text[], int[])` | same-occurrence chain |
+| `ts_prox_chain(tsvector, text[], int[])` | same-occurrence chain |
 | `ts_prox_positions / ts_prox_positions_prefix(tsvector, text)` | sorted positions |
 
 The DSL is the same superset of `tsquery` documented in the

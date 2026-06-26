@@ -1,0 +1,127 @@
+# Builds the distributable binaries and attaches them to a GitHub Release.
+#
+# Reused two ways:
+#   * called by release.yml in the same run as a release (the normal path);
+#   * run manually (workflow_dispatch) to rebuild a release's assets — pick the
+#     release tag as the workflow ref in the Actions UI.
+#
+# Each matrix leg compiles the extension via the Dockerfile's `export` stage —
+# the SAME build the container image uses — and lifts out a relocatable tarball
+# (the .so + .control + versioned .sql + install.sh) plus a .sha256, uploaded as
+# a workflow artifact; the publish job attaches them all to the Release.
+
+name: release-build
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  group: release-build-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: pg${{ matrix.pg }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17, 18]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm   # GitHub-hosted arm64 (free for public repos)
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      # Compile in the Dockerfile's bookworm build stage and lift the artifacts
+      # out to ./out. Native runner per arch, so no emulation. The GHA layer cache
+      # (scoped per pg+arch) restores the apt + cargo-pgrx layers across runs; only
+      # the source compile re-runs.
+      - name: Build the extension and extract artifacts
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          target: export
+          build-args: PG_MAJOR=${{ matrix.pg }}
+          outputs: type=local,dest=out
+          cache-from: type=gha,scope=release-pg${{ matrix.pg }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-pg${{ matrix.pg }}-${{ matrix.arch }}
+
+      - name: Package the tarball
+        id: pkg
+        run: |
+          set -euo pipefail
+          # The export stage drops the three install artifacts at ./out; derive
+          # the version from the SQL file pgrx named.
+          SO="out/proxquery.so"
+          CONTROL="out/proxquery.control"
+          SQL="$(find out -name 'proxquery--*.sql' | head -1)"
+          VERSION="$(basename "$SQL" | sed -E 's/^proxquery--(.*)\.sql$/\1/')"
+
+          STAGE="proxquery-${VERSION}-pg${{ matrix.pg }}-linux-${{ matrix.arch }}"
+          mkdir -p "$STAGE"
+          cp "$SO" "$CONTROL" "$SQL" packaging/install.sh "$STAGE/"
+          chmod +x "$STAGE/install.sh"
+          cat > "$STAGE/README.txt" <<EOF
+          proxquery ${VERSION} — PostgreSQL ${{ matrix.pg }} (linux/${{ matrix.arch }})
+
+          Install into the Postgres on your PATH:
+              ./install.sh                 # uses pg_config from PATH
+              PG_CONFIG=/path/to/pg_config ./install.sh
+
+          Then, in the target database:
+              CREATE EXTENSION proxquery;
+
+          Built against Debian bookworm (glibc 2.36); requires equal-or-newer glibc.
+          EOF
+
+          mkdir -p dist
+          tar -czf "dist/${STAGE}.tar.gz" "$STAGE"
+          ( cd dist && sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256" )
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.pkg.outputs.stage }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Gather every leg's tarball and attach them to the Release for this version.
+  publish:
+    name: attach to release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Download all tarballs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attach to the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          TAG="v${VERSION}"
+          # release-plz normally created the Release already; create it for the
+          # standalone tag-push / manual paths if it's missing. `|| true` swallows
+          # a harmless race if two steps ever create concurrently.
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "$TAG" --notes "Automated release." || true
+          gh release upload "$TAG" dist/* --clobber
