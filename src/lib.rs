@@ -304,6 +304,45 @@ mod tests {
     }
 
     #[pg_test]
+    fn backslash_in_literal_term_is_harmless() {
+        // A single-quoted DSL term may contain a backslash; it's a literal lexeme
+        // byte, not an error. But to_tsvector treats backslash as a token separator,
+        // so a normally-built document never holds a backslash lexeme — the term
+        // matches nothing, via both the recheck and the full operator.
+        let q = "$$'a\\b'$$"; // the DSL term  'a\b'
+        assert!(!b(&format!("SELECT ts_prox_match(to_tsvector('simple','a b'), {q})")));
+        assert!(!b(&format!("SELECT to_tsvector('simple','a b') @~@ {q}")));
+        // It still compiles to a valid index skeleton (no error / NULL).
+        assert!(b(&format!("SELECT ts_prox_query({q}) IS NOT NULL")));
+    }
+
+    #[pg_test]
+    fn prefix_colon_star_translates_like_sugar() {
+        // Our `appl*` sugar and native tsquery `appl:*` lower to the SAME quoted
+        // prefix: the lexeme is single-quoted, the `:*` marker sits outside it.
+        fn skel(q: &str) -> String {
+            Spi::get_one::<String>(&format!("SELECT ts_prox_query_skeleton('{q}')")).unwrap().unwrap()
+        }
+        assert_eq!(skel("appl*"), "'appl':*");
+        assert_eq!(skel("appl:*"), "'appl':*"); // native form → identical skeleton
+    }
+
+    #[pg_test]
+    fn prefix_native_form_and_exact_term() {
+        // Native tsquery `appl:*` behaves identically to the `appl*` sugar — as a
+        // standalone term, via index selection, and as a proximity operand.
+        assert!(proxmatch("the apple pie", "appl:*"));
+        assert!(selects("the apple pie", "appl:*"));
+        assert!(proxmatch("apple pie", "appl:* <~2> pie"));
+        // A prefix is INCLUSIVE of the exact term (`starts_with`; a word is its own
+        // prefix): `apple*` matches "apple" itself, not only longer words.
+        assert!(proxmatch("apple", "apple*")); // exact
+        assert!(proxmatch("applesauce", "apple*")); // longer
+        assert!(!proxmatch("appl", "apple*")); // shorter than the prefix ⇒ no
+        assert!(selects("apple", "apple:*")); // inclusive via index selection too
+    }
+
+    #[pg_test]
     fn wildcard_glob_and_quoting() {
         // suffix / infix / single-char, all via the unified glob (recheck scan).
         assert!(proxmatch("this text is confidential", "*ial")); // suffix
@@ -334,6 +373,24 @@ mod tests {
         assert!(!proxfind("ssn abc here", "ssn <~3> ##[0-9]{9}##"));
     }
 
+    #[pg_test]
+    fn regex_anchoring_is_ours_and_user_anchors_are_harmless() {
+        // We wrap every ##regex## as `^(?:pattern)$` (see Regexp::compile), matching
+        // the WHOLE lexeme — so a partial pattern never substring-matches a longer
+        // lexeme.
+        assert!(proxmatch("the colour is nice", "##colou?r##"));
+        assert!(!proxmatch("the colourful flag", "##colou?r##")); // 'colourful' ≠ full
+        // A user's own ^…$ is redundant but harmless (becomes `^(?:^colou?r$)$`).
+        assert!(proxmatch("the colour is nice", "##^colou?r$##"));
+        assert!(proxmatch("the colour is nice", "##^colou?r##")); // one-sided anchor too
+        assert!(proxmatch("the colour is nice", "##colou?r$##"));
+        // The non-capturing group keeps alternation scoped under our anchors, so
+        // each branch is still a full-lexeme match.
+        assert!(proxmatch("the cat sat", "##cat|dog##"));
+        assert!(proxmatch("the dog ran", "##cat|dog##"));
+        assert!(!proxmatch("category dogma", "##cat|dog##")); // neither is a whole lexeme
+    }
+
 
     // --- ts_prox_match recheck + full pipeline -----------------------------
     fn proxmatch(doc: &str, q: &str) -> bool {
@@ -356,6 +413,16 @@ mod tests {
         assert!(proxmatch("a x y b", "a <~3> b"));
         assert!(proxmatch("a x b", "a <-2> b")); // pre: a before b, within 2
         assert!(!proxmatch("b x a", "a <-2> b")); // wrong order for <-N>
+    }
+
+    #[pg_test]
+    fn recheck_within_distance_is_position_gap() {
+        // a@1 b@2 c@3 → distance is the position gap |a − c| = 2 (the intervening
+        // 'b' counts), so within 2 matches; within 1 (adjacency) does not.
+        assert!(proxmatch("a b c", "a <~2> c"));
+        assert!(proxmatch("a b c", "c <~2> a")); // symmetric: c within 2 of a
+        assert!(!proxmatch("a b c", "a <~1> c")); // gap is 2, not 1
+        assert!(!proxmatch("a b c", "c <~1> a")); // symmetric the other way too
     }
 
     #[pg_test]
@@ -383,6 +450,24 @@ mod tests {
         // isolated under the ordered rule (whereas <!~> would call it near).
         assert!(proxmatch("discount foo price", "price <!-5> discount"));
         assert!(!proxmatch("discount foo price", "price <!~5> discount"));
+    }
+
+    #[pg_test]
+    fn recheck_not_within_term_shared_with_phrase_operand() {
+        // The comparison term ('confidential') is BOTH the left operand and the
+        // tail of the right phrase operand. A phrase contributes its END positions,
+        // so a 'confidential' that *is* a "privileged and confidential" tail sits
+        // within 0 of the phrase (itself) ⇒ never isolated. Only a 'confidential'
+        // away from any such run can be — i.e. "a confidential used outside the
+        // privilege-claim boilerplate".
+        let q = "confidential <!~5> \"privileged and confidential\"";
+        // The sole confidential is the phrase tail ⇒ none isolated ⇒ false.
+        assert!(!proxmatch("privileged and confidential", q));
+        // A second confidential far from the phrase tail (conf@3 vs conf@12) ⇒
+        // that one is isolated ⇒ true.
+        assert!(proxmatch("privileged and confidential w w w w w w w w confidential", q));
+        // …but a standalone confidential within 5 of the phrase tail ⇒ not isolated.
+        assert!(!proxmatch("privileged and confidential foo confidential", q));
     }
 
     #[pg_test]
@@ -572,6 +657,14 @@ mod tests {
         Spi::run("SELECT ts_prox_query('*ology')").unwrap();
     }
 
+    #[pg_test(error = "ts_prox_match: a bare `*` matches everything; give it a literal part")]
+    fn err_dangling_bare_star() {
+        // A hanging bare `*` (`something *`, space-separated) is rejected at parse
+        // time — it would match every lexeme. (Attached, `something*` is a normal
+        // prefix search; see prefix_native_form_and_exact_term.)
+        Spi::run("SELECT ts_prox_match(to_tsvector('simple','something here'), 'something *')").unwrap();
+    }
+
     #[pg_test(error = "ts_prox_match: expected `)`")]
     fn err_unbalanced_parens() {
         Spi::run("SELECT ts_prox_match(to_tsvector('simple','a b'), '(a <~5> b')").unwrap();
@@ -601,17 +694,27 @@ mod tests {
         Spi::run("SELECT ts_prox_match(to_tsvector('simple','alpha beta'), 'alpha | ##[##')").unwrap();
     }
 
-    // --- pure-SQL port -----------------------------------------------------
+    // --- pure-SQL port parity ----------------------------------------------
     // The extension-free port (sql/proxquery_pure.sql) must stay behavior-
-    // identical to this extension. Loading it into a `proxquery` schema and
-    // running its assertion suite (sql/proxquery_pure_test.sql, the same 123
-    // known-good values used here) via Spi runs that parity check on every CI
-    // Postgres version, right alongside the Rust tests. The self-test RAISEs on
-    // any mismatch, which surfaces as a failed Spi call here.
+    // identical to this extension, on every CI Postgres version.
+    // The portable corpus (sql/proxquery_cases.sql) is the single source of truth.
+    // The differential runner executes every case against BOTH the native extension
+    // (schema `public`) and the pure-SQL port (schema `proxquery`) and asserts they
+    // agree with each other and with the expected value — so the two implementations
+    // can't drift. The fuzz runner does the same on randomly generated query/doc
+    // pairs. Both require both implementations in one session (the cargo-pgrx-test
+    // environment); the psql-standalone golden check lives in proxquery_pure_test.sql.
     #[pg_test]
-    fn pure_sql_port_matches_extension() {
+    fn pure_sql_matches_extension_corpus() {
         Spi::run(include_str!("../sql/proxquery_pure.sql")).expect("load pure-SQL port");
-        Spi::run(include_str!("../sql/proxquery_pure_test.sql")).expect("pure-SQL self-test");
+        Spi::run(include_str!("../sql/proxquery_cases.sql")).expect("load shared corpus");
+        Spi::run(include_str!("../sql/proxquery_diff_test.sql")).expect("differential corpus test");
+    }
+
+    #[pg_test]
+    fn pure_sql_matches_extension_fuzz() {
+        Spi::run(include_str!("../sql/proxquery_pure.sql")).expect("load pure-SQL port");
+        Spi::run(include_str!("../sql/proxquery_fuzz_test.sql")).expect("differential fuzz test");
     }
 }
 

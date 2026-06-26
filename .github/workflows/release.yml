@@ -1,0 +1,98 @@
+# Orchestrates everything that happens on a push to main (see docs/RELEASING.md).
+#
+# release-plz tells us authoritatively whether THIS push landed a release (it
+# compares Cargo.toml's version to the git tags — independent of how the Release
+# PR was merged: squash, merge commit, or rebase all work). We branch on that:
+#
+#   release commit  -> build the full binary matrix, attach to the v<x.y.z> tag
+#   any other commit -> build + publish the rolling `edge` pre-release
+#
+# Because the decision comes from release-plz's output, there is no commit-message
+# guessing and no need to force a repo-wide squash-merge setting.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # Keep the Release PR current on every push. Separate job so its (non-cancel)
+  # concurrency group can't block or be blocked by the release job below.
+  release-pr:
+    name: release-plz PR
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-plz-pr-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      # Mint a short-lived token from the deployer GitHub App. Acting as the App
+      # (rather than the default GITHUB_TOKEN) is what lets the bot-opened Release
+      # PR trigger CI (test.yml). See docs/RELEASING.md.
+      - name: Generate a token from the deployer GitHub App
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.ELEMENTAL_DEPLOYER_CLIENT_ID }}
+          private-key: ${{ secrets.ELEMENTAL_DEPLOYER_APP_PK }}
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+  # The gate. `released` is 'true' only on the commit that merged the Release PR.
+  release:
+    name: release-plz release
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.release-plz.outputs.releases_created }}
+    steps:
+      - name: Generate a token from the deployer GitHub App
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.ELEMENTAL_DEPLOYER_CLIENT_ID }}
+          private-key: ${{ secrets.ELEMENTAL_DEPLOYER_APP_PK }}
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - id: release-plz
+        uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
+        with:
+          command: release
+        env:
+          # Acting as the App so the release tag/release events are attributed to
+          # it and can trigger downstream workflows. The binary build below runs
+          # as a needs: job in THIS run, so it doesn't depend on the token.
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+
+  # Release commit: full PG 16/17/18 x amd64/arm64 matrix, attached to the Release.
+  build-release:
+    name: build release binaries
+    needs: release
+    if: ${{ needs.release.outputs.released == 'true' }}
+    uses: ./.github/workflows/release-build.yml
+    secrets: inherit
+    permissions:
+      contents: write
+
+  # Every other commit: rolling edge pre-release (PG 17, amd64 + arm64).
+  build-edge:
+    name: build edge
+    needs: release
+    if: ${{ needs.release.outputs.released != 'true' }}
+    uses: ./.github/workflows/edge-build.yml
+    secrets: inherit
+    permissions:
+      contents: write

@@ -1,0 +1,31 @@
+# release-plz config — Gate 1 of the release flow (see docs/RELEASING.md).
+#
+# release-plz watches conventional-commit history on `main` and keeps a single
+# "Release PR" open that bumps the version in Cargo.toml/Cargo.lock and writes
+# CHANGELOG.md. Merging that PR is the deliberate, human gate: it tags `v<X.Y.Z>`
+# and cuts the GitHub Release, which in turn drives the binary build.
+#
+# This is a cdylib Postgres extension, not a crates.io library, so every
+# crates.io-facing feature is turned off here; `publish = false` also lives in
+# Cargo.toml so plain `cargo` refuses to publish too.
+
+[workspace]
+# Never push to crates.io (redundant with Cargo.toml's publish = false, but
+# explicit so the intent is obvious from the release config alone).
+publish = false
+
+# cargo-semver-checks diffs a crate's public API against its last crates.io
+# release to pick the bump. There is no public Rust API here (it's a cdylib)
+# and nothing on crates.io to diff against, so disable it — the bump comes
+# purely from conventional commits.
+semver_check = false
+
+# Tag + GitHub Release on merge of the Release PR. Tag format is the default
+# `v{{ version }}`, which .github/workflows/release-build.yml keys off.
+git_tag_enable = true
+git_release_enable = true
+
+# Give the Release PR a stable, readable title. Nothing keys off this anymore
+# (the release/edge split uses release-plz's output, not the commit message) —
+# it just keeps the title consistent regardless of single-crate vs. workspace.
+pr_name = "chore: release v{{ version }}"

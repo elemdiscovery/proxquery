@@ -1,0 +1,43 @@
+# Smoke-tests the Docker build path that the rest of CI doesn't cover.
+#
+# test.yml compiles against pgrx's own downloaded Postgres; this builds the
+# Dockerfile (extension compiled against the PGDG server-dev package, loaded into
+# the official postgres:<major> image) and confirms it actually boots and runs
+# `CREATE EXTENSION`. Catches compile/ABI/glibc breaks in the image before they
+# reach `promote`. Path-filtered so it only runs when something relevant changes.
+name: docker-smoke
+
+on:
+  push:
+    branches: [main]
+    paths: &paths
+      - Dockerfile
+      - "src/**"
+      - "sql/**"
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/docker-smoke.yml
+  pull_request:
+    paths: *paths
+  workflow_dispatch:
+
+concurrency:
+  group: docker-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: docker pg${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17, 18]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Build image
+        run: docker build --build-arg PG_MAJOR=${{ matrix.pg }} -t proxquery:smoke-${{ matrix.pg }} .
+
+      - name: Boot and CREATE EXTENSION
+        run: packaging/smoke.sh proxquery:smoke-${{ matrix.pg }}

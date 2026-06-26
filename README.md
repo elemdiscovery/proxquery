@@ -2,29 +2,46 @@
 
 ![proxquery](docs/proxquery.png)
 
-A PostgreSQL extension (built with [pgrx](https://github.com/pgcentralfoundation/pgrx))
-that adds term-proximity search on top of `tsvector`: "within N words", ordered
-proximity, occurrence-level "not within N", and phrases. It reads lexeme positions
-directly out of the `tsvector`, and it plugs into a normal GIN index.
+A PostgreSQL extension (built with [pgrx](https://github.com/pgcentralfoundation/pgrx)) that adds term-proximity search on top of `tsvector`: "within N words", ordered proximity, occurrence-level "not within N", and phrases. It reads lexeme positions directly out of the `tsvector`, and it plugs into a normal GIN index.
 
 The motivation is to implement query syntax similar to dtSearch and Lucene without also implementing an actual custom index.
 
 ## Install
 
+Requires PostgreSQL 16+ (16, 17, and 18 are built and tested).
+
+### Prebuilt binaries (self-managed Postgres)
+
+Every [release](https://github.com/elemdiscovery/proxquery/releases) packages the extension and an installer. Download and run the equivalent of:
+
+```sh
+tar xzf proxquery-<version>-pg17-linux-amd64.tar.gz
+cd proxquery-<version>-pg17-linux-amd64
+./install.sh                 # targets the Postgres on PATH (pg_config)
+# or: PG_CONFIG=/path/to/pg_config ./install.sh
+```
+
 ```sql
 CREATE EXTENSION proxquery;
 ```
 
-Requires PostgreSQL 16+. To build and install it from source, see [Development](#development).
+The binaries link against the build runner's glibc. If that's an issue in real systems we'll better target this.
 
-### No compiled extension? Use the pure-SQL port
+### Docker
 
-On managed Postgres where you can't load a custom extension (Cloud SQL, RDS,
-Azure, …), [sql/proxquery_pure.sql](sql/proxquery_pure.sql) is a drop-in,
-extension-free implementation — a plain migration with the same function names
-and identical results, installed into a dedicated `proxquery` schema. The single
-indexable `@~@` operator needs a C planner support function, so the pure port
-omits it and you write the two-clause form it expands to (the index-served path):
+A Postgres image with proxquery preinstalled:
+
+```sh
+docker run --rm -e POSTGRES_PASSWORD=pw ghcr.io/elemdiscovery/proxquery:pg17
+```
+
+then `CREATE EXTENSION proxquery;`.
+
+### Pure-SQL port
+
+On managed Postgres [sql/proxquery_pure.sql](sql/proxquery_pure.sql) is a re-implementation using plain SQL with the same function names and identical results, installed into a dedicated `proxquery` schema.
+
+The usage difference is that the `@~@` operator needs a C planner support function, so the pure port does **not** implement it and you need to call two functions for each query to properly use the index.
 
 ```sql
 SELECT * FROM docs
@@ -32,15 +49,13 @@ WHERE body_tsv @@ proxquery.ts_prox_query('quick <~3> fox')   -- GIN index selec
   AND proxquery.ts_prox_match(body_tsv, 'quick <~3> fox');      -- recheck refines
 ```
 
-The native extension is relocatable, so migrating is just
-`DROP SCHEMA proxquery CASCADE; CREATE EXTENSION proxquery SCHEMA proxquery;` —
-those two-clause queries keep working verbatim. See
-[docs/PURE_SQL.md](docs/PURE_SQL.md) for the full story.
+The practical difference is that the pure SQL implementation is much, much slower.
+
+If you somehow get the real extension installed later, the migration from the pure SQL implementation to the extension is `DROP SCHEMA proxquery CASCADE; CREATE EXTENSION proxquery SCHEMA proxquery;`. The two-clause queries keep working as-is. See [docs/PURE_SQL.md](docs/PURE_SQL.md) for some AI-babble details.
 
 ## Usage
 
-Query a `tsvector` column with the `@~@` operator. The right-hand side is a query
-string (the DSL below).
+Query a `tsvector` column with the `@~@` operator. The right-hand side is a query string (the DSL below).
 
 ```sql
 -- a plain GIN index drives candidate selection
@@ -55,7 +70,7 @@ SELECT * FROM docs WHERE body_tsv @~@ 'confidential <!~5> email';
 
 The operator `@~@` is using a plain `gin(tsvector)` index. The operator works in two steps: the index selects candidate rows by lexeme, and then the operator rechecks word positions in order to refine the result.
 
-Ranking results isn't really a goal of this extension, but `ts_prox_query(q)` returns a real `tsquery`, so the `ts_rank_cd` can be used to get some sort of result.
+Ranking results isn't a goal of this extension, but `ts_prox_query(q)` returns a real `tsquery`, so the `ts_rank_cd` can be used to get a result, but it won't be particularly meaningful for complex queries.
 
 ```sql
 SELECT * FROM docs
@@ -66,8 +81,7 @@ LIMIT 10;
 
 ## Query operators
 
-The DSL is a superset of `tsquery`. Native `tsquery` syntax works unchanged; the
-`<…>` proximity operators are the additions.
+The DSL is a superset of `tsquery`. Native `tsquery` syntax works unchanged; the `<…>` proximity operators are the additions.
 
 | Syntax | Meaning |
 | --- | --- |
@@ -75,7 +89,7 @@ The DSL is a superset of `tsquery`. Native `tsquery` syntax works unchanged; the
 | `a \| b` | either term (OR) |
 | `!a` | term absent (NOT) |
 | `( )` | grouping |
-| `appl*` | prefix |
+| `appl*` | prefix (`:*` works too) |
 | `*ology` | suffix |
 | `f*r` | infix |
 | `te?t` | single character (`?`) |
@@ -92,13 +106,14 @@ The DSL is a superset of `tsquery`. Native `tsquery` syntax works unchanged; the
 A few comments:
 
 - Proximity operators are read left to right, so `a <~5> b <~5> c` reads as`(a <~5> b) <~5> c`.
-- A wildcard that starts with `*`/`?` (`*ology`) and a regex (`##…##`) are matched in the recheck and need a companion term, e.g. `study <~3> *ology`.
+- A wildcard that starts with `*`/`?` (`*ology`) and a regex (`##…##`) are matched in the recheck and need a companion term, e.g. `study <~3> *ology` or else you won't be using the index at all.
 - A wildcard with a leading literal (`f*r`, `te?t`) uses that as an index prefix.
 - Regex matches whole lexemes in the index after splitting and normalization. If you are trying to do complex regex you probably need to do it before indexing on the raw text.
+- Real world queries written by users can become really degenerate in this syntax. You might want to discourage complexity on the application side.
 
 ## Functions
 
-The operator is built on plain SQL functions, which can also be used directly:
+The `@~@` operator is built on functions, which can also be used directly:
 
 - `ts_prox_within(tsvector, a, b, n)`, `ts_prox_pre(...)`, `ts_prox_not_within(...)`,
   `ts_prox_window(tsvector, text[], int[])` — positional predicates.
@@ -220,6 +235,14 @@ cargo pgrx run pg16 --no-default-features --features pg16
 ```
 
 (Run `cargo pgrx init --pg16 …` first so pgrx knows about that instance.)
+
+## Releasing
+
+Releases are conventional-commit driven. release-plz keeps a Release PR up to
+date on `main`; merging it tags `v<x.y.z>` and builds the prebuilt binaries,
+while every other commit publishes a rolling `edge` pre-release. Pushing Docker
+images to GHCR is a separate manual step. The full flow and the promotion steps
+are in [docs/RELEASING.md](docs/RELEASING.md).
 
 ## License
 
