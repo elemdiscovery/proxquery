@@ -499,6 +499,14 @@ mod tests {
         assert!(proxmatch("a x b", "a <2> b")); // b exactly 2 after a
         assert!(!proxmatch("a x y b", "a <2> b")); // 3 apart ⇒ no
         assert!(proxmatch("a b", "a <-> b")); // adjacency (= <1>)
+        // `<->` is exactly `<1>` (both hardcode gap 1, bypassing the distance clamp),
+        // and distinct from `<0>` (same position) since the honor-0 change.
+        let skel = |q: &str| Spi::get_one::<String>(&format!("SELECT ts_prox_query_skeleton('{q}')")).unwrap().unwrap();
+        assert_eq!(skel("a <-> b"), skel("a <1> b")); // identical lowering
+        assert_eq!(skel("a <-> b"), "('a' <-> 'b')");
+        assert!(proxmatch("a b", "a <1> b")); // adjacent ⇒ true
+        assert!(!proxmatch("a x b", "a <1> b")); // exactly 1, so distance 2 ⇒ false
+        assert_ne!(skel("a <-> b"), skel("a <0> b")); // <-> is 1, not same-position
     }
 
     #[pg_test]
