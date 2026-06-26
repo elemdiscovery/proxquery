@@ -1,11 +1,6 @@
 # proxquery
 
-```txt
-   ,_,
-  (@~@)
-  ()_()
-   " "
-```
+![proxquery](docs/proxquery.png)
 
 A PostgreSQL extension (built with [pgrx](https://github.com/pgcentralfoundation/pgrx))
 that adds term-proximity search on top of `tsvector`: "within N words", ordered
