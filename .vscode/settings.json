@@ -1,7 +1,9 @@
 {
     "cSpell.words": [
         "appl",
+        "cdylib",
         "clippy",
+        "codegen",
         "elemdiscovery",
         "ndocs",
         "PGDG",
@@ -13,6 +15,7 @@
         "rustup",
         "sharedir",
         "tsquery",
-        "tsvector"
+        "tsvector",
+        "wordfrequency"
     ]
 }

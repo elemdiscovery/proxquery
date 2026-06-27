@@ -1,0 +1,119 @@
+name: large benchmark
+
+# Manually triggered, large, repeatable performance benchmark. Generates a
+# deterministic synthetic corpus (real COCA term distribution + synthetic tail),
+# indexes it with a plain GIN index, and times the native extension against the
+# pure-SQL port. The small tier is parity-gated (the job's real pass/fail); the
+# large tier shows how the extension scales where the pure port is too slow.
+on:
+  workflow_dispatch:
+    inputs:
+      small_mb:
+        description: "Small tier corpus size (MiB) — extension + pure-SQL + parity"
+        default: "100"
+      large_mb:
+        description: "Large tier corpus size (MiB) — extension only (up to ~2048)"
+        default: "1024"
+      small_queries:
+        description: "Number of queries on the small (pure-SQL) tier"
+        default: "100"
+      large_queries:
+        description: "Number of queries on the large (extension-only) tier"
+        default: "200"
+      run_large:
+        description: "Run the large extension-only tier"
+        type: boolean
+        default: true
+      seed:
+        description: "Corpus RNG seed (changes the corpus; keep fixed to compare runs)"
+        default: "0.42"
+
+concurrency:
+  group: large-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    name: large benchmark (pg17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      PGRX_VERSION: 0.19.1
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bison flex libreadline-dev zlib1g-dev \
+            libssl-dev libxml2-dev libxslt1-dev xsltproc ccache pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache cargo + pgrx build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: bench-large-pg17
+
+      - name: Install cargo-pgrx
+        run: cargo install --locked cargo-pgrx@${PGRX_VERSION}
+
+      # Shares the pg17 cache key with the test workflow, so the compiled
+      # PostgreSQL is built once and reused across workflows and runs.
+      - name: Cache the pgrx-built PostgreSQL (~/.pgrx)
+        id: pgrx-pg
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
+        with:
+          path: ~/.pgrx
+          key: pgrx-${{ runner.os }}-${{ runner.arch }}-pg17-${{ env.PGRX_VERSION }}
+
+      - name: Initialize pgrx (pg17)
+        if: steps.pgrx-pg.outputs.cache-hit != 'true'
+        run: cargo pgrx init --pg17 download
+
+      - name: Install extension into the managed instance
+        run: |
+          cargo pgrx install --no-default-features --features pg17 \
+            --pg-config "$(sed -n 's/^pg17 = "\(.*\)"/\1/p' ~/.pgrx/config.toml)"
+
+      - name: Start the managed instance
+        run: cargo pgrx start pg17
+
+      - name: Run the large benchmark (parity-gated)
+        id: bench
+        env:
+          SMALL_MB: ${{ inputs.small_mb }}
+          LARGE_MB: ${{ inputs.large_mb }}
+          SMALL_QUERIES: ${{ inputs.small_queries }}
+          LARGE_QUERIES: ${{ inputs.large_queries }}
+          RUN_LARGE: ${{ inputs.run_large && '1' || '0' }}
+          SEED: ${{ inputs.seed }}
+        run: |
+          PGCONFIG="$(sed -n 's/^pg17 = "\(.*\)"/\1/p' ~/.pgrx/config.toml)"
+          export PATH="$(dirname "$PGCONFIG"):$PATH"
+          export PGHOST="$HOME/.pgrx" PGPORT=28817   # pgrx default: 28800 + major
+          bash bench/large/run.sh
+          echo "report=$(ls -t bench/reports/large_bench_*.md | head -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        if: always() && steps.bench.outputs.report != ''
+        run: cat "${{ steps.bench.outputs.report }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: large-bench-report
+          path: bench/reports/large_bench_*.md
+          if-no-files-found: ignore
+
+      # The bench starts the managed instance; stop it so the ~/.pgrx cache is
+      # saved with a clean (not-running) data directory.
+      - name: Stop the managed instance
+        if: always()
+        run: cargo pgrx stop pg17 || true

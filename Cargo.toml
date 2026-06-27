@@ -5,11 +5,6 @@ edition = "2021"
 description = "Positional proximity predicates for tsvector full-text search"
 license = "MIT"
 repository = "https://github.com/elemdiscovery/proxquery"
-# This crate is a cdylib Postgres extension, not a consumable library: there is
-# nothing to publish to crates.io. `publish = false` makes that explicit and
-# tells release-plz to tag + cut a GitHub Release without ever calling
-# `cargo publish`. See release-plz.toml and .github/workflows/release-plz.yml.
-publish = false
 
 [lib]
 crate-type = ["cdylib"]
