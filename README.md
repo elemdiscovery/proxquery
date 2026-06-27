@@ -117,6 +117,25 @@ WHERE body_tsv @@ proxquery.ts_prox_query('running <~3> shoes', 'english')
   AND proxquery.ts_prox_match(body_tsv, 'running <~3> shoes', 'english');
 ```
 
+### Custom text search configuration
+
+This kind of custom configuration also works.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS unaccent;
+
+DROP TEXT SEARCH CONFIGURATION IF EXISTS simple_unaccent;
+
+CREATE TEXT SEARCH CONFIGURATION simple_unaccent (COPY = simple);
+
+ALTER TEXT SEARCH CONFIGURATION simple_unaccent
+    ALTER MAPPING FOR
+        asciiword, word, numword,
+        asciihword, hword, numhword,
+        hword_asciipart, hword_part, hword_numpart
+    WITH unaccent, simple;
+```
+
 ## Functions
 
 The `@~@` operator is built on functions that can also be used directly:

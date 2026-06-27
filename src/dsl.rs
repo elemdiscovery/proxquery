@@ -134,9 +134,12 @@ fn word_to_tok(word: &str) -> Result<Tok, String> {
         return Err("a bare `*` matches everything; give it a literal part".into());
     }
     // `appl*` — a single trailing `*` and nothing else special — is the fast path.
-    let body = &lower[..lower.len() - 1];
-    if lower.ends_with('*') && !body.contains(is_glob_char) {
-        return Ok(Tok::Prefix(body.to_string()));
+    // `strip_suffix` is char-safe; a byte-index slice (`lower[..len-1]`) would panic on
+    // a glob ending in a multibyte char (e.g. `café*` once folded, or `*é`).
+    if let Some(body) = lower.strip_suffix('*') {
+        if !body.contains(is_glob_char) {
+            return Ok(Tok::Prefix(body.to_string()));
+        }
     }
     let prefix = glob_prefix(&lower);
     Ok(Tok::Glob(lower, prefix))
@@ -739,6 +742,55 @@ fn prefix_norm_cfg(cfg: pg_sys::Oid, p: &str) -> Vec<u8> {
     }
 }
 
+/// Fold one literal glob run through `cfg`: its single resolved lexeme, or the run
+/// verbatim when `cfg` yields 0 or >1 lexemes (the same 0/1/>1 fan-out as terms).
+fn fold_run(cfg: pg_sys::Oid, run: &str) -> String {
+    match resolve_lexemes(cfg, run).as_slice() {
+        [one] => String::from_utf8(one.clone()).unwrap_or_else(|_| run.to_owned()),
+        _ => run.to_owned(),
+    }
+}
+
+/// Fold a glob's literal runs (maximal non-`*`/`?` substrings) through `cfg`, leaving
+/// the wildcards untouched, so a wildcard search inherits the column's character
+/// normalization and agrees with the folded `to_tsquery(cfg, 'p':*)` index probe.
+/// Mirrors the pure port's `_prox_fold_glob`. Returns the folded pattern and its
+/// recomputed leading prefix (so the `positions_matching` scan-narrowing keys off the
+/// folded lexemes too).
+fn fold_glob_cfg(cfg: pg_sys::Oid, glob: &str) -> (String, String) {
+    let mut out = String::new();
+    let mut run = String::new();
+    for ch in glob.chars() {
+        if is_glob_char(ch) {
+            if !run.is_empty() {
+                out.push_str(&fold_run(cfg, &run));
+                run.clear();
+            }
+            out.push(ch);
+        } else {
+            run.push(ch);
+        }
+    }
+    if !run.is_empty() {
+        out.push_str(&fold_run(cfg, &run));
+    }
+    let prefix = glob_prefix(&out);
+    (out, prefix)
+}
+
+/// Positions of a glob, resolving its literal runs through `cfg` when one is given
+/// (config-aware recheck) or scanning the stored lexemes verbatim otherwise (the
+/// `simple` 2-arg fast path).
+fn glob_positions(cfg: Option<pg_sys::Oid>, glob: &str, prefix: &str, v: &TsVector) -> Vec<i32> {
+    match cfg {
+        Some(c) => {
+            let (fg, fp) = fold_glob_cfg(c, glob);
+            v.positions_matching(fp.as_bytes(), |lex| glob_match(&fg, lex))
+        }
+        None => v.positions_matching(prefix.as_bytes(), |lex| glob_match(glob, lex)),
+    }
+}
+
 pub fn eval_match(node: &Node, v: &TsVector, cfg: Option<pg_sys::Oid>) -> Result<bool, String> {
     Ok(match node {
         Node::And(children) => {
@@ -777,8 +829,9 @@ pub fn eval_match(node: &Node, v: &TsVector, cfg: Option<pg_sys::Oid>) -> Result
 
 fn positions(node: &Node, v: &TsVector, cfg: Option<pg_sys::Oid>) -> Result<Vec<i32>, String> {
     Ok(match node {
-        // Term/Prefix resolve through the config (when one is given); glob/regex
-        // scan the *stored* lexemes verbatim and are config-agnostic by design.
+        // Term/Prefix/Glob resolve through the config (when one is given), so a
+        // wildcard search folds like the column was built; regex stays verbatim (its
+        // skeleton emits no index key, so there is no probe to keep it consistent with).
         Node::Term(t) => match cfg {
             Some(c) => term_positions_cfg(c, t, v),
             None => v.positions(t.as_bytes()),
@@ -787,7 +840,7 @@ fn positions(node: &Node, v: &TsVector, cfg: Option<pg_sys::Oid>) -> Result<Vec<
             Some(c) => v.positions_prefix(&prefix_norm_cfg(c, p)),
             None => v.positions_prefix(p.as_bytes()),
         },
-        Node::Glob { glob, prefix } => v.positions_matching(prefix.as_bytes(), |lex| glob_match(glob, lex)),
+        Node::Glob { glob, prefix } => glob_positions(cfg, glob, prefix, v),
         Node::Regex(pattern) => {
             // Patterns are validated up front (see `validate_regexes`), so by the
             // time the recheck runs the regex is known to compile.
@@ -909,7 +962,7 @@ fn atom_positions(a: &Atom, v: &TsVector, cfg: Option<pg_sys::Oid>) -> Vec<i32> 
             Some(c) => v.positions_prefix(&prefix_norm_cfg(c, p)),
             None => v.positions_prefix(p.as_bytes()),
         },
-        Atom::Glob { glob, prefix } => v.positions_matching(prefix.as_bytes(), |lex| glob_match(glob, lex)),
+        Atom::Glob { glob, prefix } => glob_positions(cfg, glob, prefix, v),
     }
 }
 

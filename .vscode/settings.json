@@ -1,11 +1,18 @@
 {
     "cSpell.words": [
         "appl",
+        "asciihword",
+        "asciipart",
+        "asciiword",
         "cdylib",
         "clippy",
         "codegen",
         "elemdiscovery",
+        "hword",
         "ndocs",
+        "numhword",
+        "numpart",
+        "numword",
         "PGDG",
         "pgrx",
         "PGXS",
@@ -17,6 +24,7 @@
         "sharedir",
         "tsquery",
         "tsvector",
+        "unaccent",
         "wordfrequency"
     ]
 }
