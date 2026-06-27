@@ -1066,11 +1066,48 @@ CREATE OR REPLACE FUNCTION _prox_resolve_lexemes(term text, cfg regconfig) RETUR
     SET search_path = proxquery, pg_catalog AS
 $fn$ SELECT coalesce(array_agg(DISTINCT lexeme), '{}'::text[]) FROM unnest(to_tsvector(cfg, term)) $fn$;
 
+-- Fold a glob's literal runs (the maximal non-`*`/`?` substrings) through `cfg`,
+-- leaving the wildcards untouched, so a glob matches the column's normalized lexemes
+-- the same way a plain term does — and the same way the `to_tsquery(cfg, 'p':*)`
+-- skeleton already folds the glob's prefix on the index side. A run is replaced only
+-- when `cfg` resolves it to exactly one lexeme (the common alphabetic/accented case);
+-- a run that yields 0 or >1 lexemes (punctuated/host/alphanumeric/stopword) is kept
+-- verbatim, mirroring the 0/1/>1 fan-out in the term/prefix branches. The fold can
+-- only ever improve matching or leave a run as-is — it never blanks a glob out.
+CREATE OR REPLACE FUNCTION _prox_fold_glob(g text, cfg regconfig) RETURNS text
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
+    SET search_path = proxquery, pg_catalog AS
+$fn$
+DECLARE
+    out text := '';
+    m   text[];
+    lex text[];
+BEGIN
+    -- each match is either a literal run (m[1]) or a single wildcard (m[2])
+    FOR m IN SELECT regexp_matches(g, '([^*?]+)|([*?])', 'g') LOOP
+        IF m[2] IS NOT NULL THEN
+            out := out || m[2];                       -- wildcard: unchanged
+        ELSE
+            lex := _prox_resolve_lexemes(m[1], cfg);  -- = distinct to_tsvector(cfg, run)
+            IF array_length(lex, 1) = 1 THEN
+                out := out || lex[1];                 -- fold to the column's lexeme form
+            ELSE
+                out := out || m[1];                   -- 0 or >1 lexemes: keep verbatim
+            END IF;
+        END IF;
+    END LOOP;
+    RETURN out;
+END
+$fn$;
+
 -- Rewrite the parsed AST so every term/prefix is resolved to its config lexeme(s),
 -- then evaluate with the unchanged `_prox_eval`. A term → its single lexeme, or an
 -- OR of lexemes (stemmer/thesaurus), or an empty OR (stopword ⇒ matches nothing). A
 -- prefix → its normalized form (so an accented prefix matches the unaccented stored
--- lexemes, as the skeleton does). Glob/regex are left verbatim (config-agnostic).
+-- lexemes, as the skeleton does). A glob's literal runs are folded through `cfg` too
+-- (see `_prox_fold_glob`), so wildcard searches inherit the column's character
+-- normalization and agree with the folded `to_tsquery(cfg, 'p':*)` index probe; regex
+-- is left verbatim (its skeleton emits no key, so there is no probe to disagree with).
 -- Phrase atoms are resolved in place when they yield a single lexeme (the common
 -- case); a phrase atom carries one lexeme, so multi-lexeme atoms are left as-is.
 CREATE OR REPLACE FUNCTION _prox_resolve_ast(node jsonb, cfg regconfig) RETURNS jsonb
@@ -1084,6 +1121,7 @@ DECLARE
     atoms jsonb := '[]'::jsonb;
     c    jsonb;
     a    jsonb;
+    fg   text;
     i    int;
 BEGIN
     IF t = 'term' THEN
@@ -1105,7 +1143,12 @@ BEGIN
         ELSE
             RETURN node;                                               -- 0 or >1 ⇒ raw prefix
         END IF;
-    ELSIF t IN ('glob', 'regex') THEN
+    ELSIF t = 'glob' THEN
+        -- recompute the literal prefix from the FOLDED glob so the starts_with()
+        -- scan-narrowing in _prox_pos_glob keys off the folded lexemes too.
+        fg := _prox_fold_glob(node ->> 'g', cfg);
+        RETURN jsonb_build_object('t', 'glob', 'g', fg, 'p', _prox_glob_prefix(fg));
+    ELSIF t = 'regex' THEN
         RETURN node;                                                   -- scan stored lexemes verbatim
     ELSIF t = 'phrase' THEN
         FOR a IN SELECT value FROM jsonb_array_elements(node -> 'atoms') AS x(value) LOOP
@@ -1114,6 +1157,9 @@ BEGIN
                 IF array_length(lex, 1) = 1 THEN
                     a := jsonb_build_object('t', a ->> 't', 'v', lex[1]);
                 END IF;
+            ELSIF a ->> 't' = 'glob' THEN
+                fg := _prox_fold_glob(a ->> 'g', cfg);                  -- fold phrase globs too
+                a := jsonb_build_object('t', 'glob', 'g', fg, 'p', _prox_glob_prefix(fg));
             END IF;
             atoms := atoms || jsonb_build_array(a);
         END LOOP;

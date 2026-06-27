@@ -27,7 +27,11 @@ terms are normalized, change the config — proxquery follows.
 -- You own the config (this one folds accents; needs the `unaccent` extension):
 CREATE TEXT SEARCH CONFIGURATION simple_unaccent (COPY = simple);
 ALTER TEXT SEARCH CONFIGURATION simple_unaccent
-  ALTER MAPPING FOR asciiword, word, hword, hword_part WITH unaccent, simple;
+  ALTER MAPPING FOR
+    asciiword, word, numword,
+    asciihword, hword, numhword,
+    hword_asciipart, hword_part, hword_numpart
+  WITH unaccent, simple;
 ```
 
 ## The surface
@@ -85,11 +89,31 @@ Bitmap Heap Scan on docs
   `to_tsvector(cfg, term)` and unions their positions; a `Prefix` is normalized
   through the config before the prefix scan (so `café*` matches the stored `cafe…`).
   Resolution is cached per `(config, term)` for the scan.
-- **What stays config-agnostic.** Globs (`*ology`, `te?t`) and `##regex##` scan
-  the **stored** lexemes verbatim — they are matched as-is, by design. Under a
-  stemming config that means they match stems (`*ology` won't match a stored
-  `biolog`); that is the only sensible behavior, since the stored lexeme is what
-  exists. Keep wildcard/regex literal parts in mind under a normalizing config.
+- **Wildcards fold too.** A glob's **literal runs** (the maximal non-`*`/`?`
+  substrings of `*ology`, `te?t`, `caf?`) resolve through `to_tsvector(cfg, run)` —
+  the same routine the column was built with — so wildcard searches inherit the
+  config's character normalization and agree with the folded `to_tsquery(cfg,'p':*)`
+  probe. On `simple_unaccent`, `caf?` / `*ré` strip accents like the column; on
+  `simple` they stay accent-sensitive. The wildcards themselves pass through
+  untouched, and a run that resolves to 0 or >1 lexemes (a punctuated/host/numeric
+  fragment, a stopword) is **kept verbatim** — the fold only ever improves matching
+  or leaves a run as-is, never blanks a glob out. This is sound because character
+  folding (lower/unaccent) is per-character and commutes with `*`/`?`.
+- **What stays config-agnostic.** `##regex##` scans the **stored** lexemes verbatim
+  (its skeleton emits no index key, so there is no probe to keep it consistent with);
+  normalize regex literals to the config yourself if needed.
+
+**Limits of wildcard folding** (inherent to mixing wildcards with dictionaries):
+
+- *Token transforms don't apply to fragments.* Folding reflects the config's
+  **character** normalization (lowercase/unaccent). Stemming/stopwords/thesaurus are
+  token-level and can't apply to a wildcard fragment: under a stemming config a glob
+  run that is a whole word folds to its stem (`running*` → `run*`, consistent with the
+  probe), but an interior/partial fragment usually can't match a stored stem at all
+  (`*ology` won't find a stored `biolog`) — same as a plain term wouldn't.
+- *`?` over an expanding fold.* Some folds are 1→many (`ß`→`ss`, `æ`→`ae`). Since `?`
+  is fixed-width and runs are folded without rewriting wildcard counts, a `?` placed
+  exactly over such a character can be off by one (`*` is unaffected). Rare.
 
 ## Locale independence as a bonus
 
@@ -111,8 +135,9 @@ across `C` and `en_US.UTF-8`.)
   zero lexemes and so matches nothing — consistently in both ports.
 - **Multi-lexeme terms.** A term a stemmer/thesaurus expands to several lexemes is
   treated as their OR (positions unioned) — correct for same-position synonyms.
-- **Wildcards / regex** match stored lexemes (= stems under a stemming config); see
-  above.
+- **Wildcards** fold their literal runs through the config (so they match the stored,
+  normalized lexemes); **regex** matches stored lexemes verbatim. See *How it works*
+  for the folding rules and limits.
 - **Pass the config you built the column with.** Like `to_tsquery('english', …)`,
   resolution uses whatever `regconfig` you name; a mismatch against the column's
   config silently under-matches.

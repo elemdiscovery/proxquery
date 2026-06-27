@@ -33,9 +33,12 @@ DECLARE
     r record;
     mr record;
     mexpr text;
+    pexpr text;
     ext_sch text;
     got_ext text;
     got_pure text;
+    got_probe_ext text;
+    got_probe_pure text;
     fails int := 0;
     n int := 0;
 BEGIN
@@ -75,6 +78,39 @@ BEGIN
             fails := fails + 1;
         END IF;
     END LOOP;
+
+    -- Config-aware cases (proxquery_config_cases.sql, if loaded): the 3-arg recheck
+    -- under each row's config, on both implementations, plus the soundness invariant —
+    -- a `true` recheck whose query carries an index key must be selected by the probe
+    -- too (recheck ⟹ probe). A bare leading-wildcard glob has no positive key, so
+    -- `ts_prox_query` raises ('needs a companion term'); that collapses the probe to
+    -- 'ERR' and soundness is skipped for that row (the index isn't used there anyway).
+    IF to_regclass('pg_temp._prox_cfg_match') IS NOT NULL THEN
+        FOR mr IN SELECT label, cfg, doc, query, expected FROM pg_temp._prox_cfg_match ORDER BY label LOOP
+            n := n + 1;
+            mexpr := format('ts_prox_match(to_tsvector(%L::regconfig, %L), %L, %L::regconfig)',
+                            mr.cfg, mr.doc, mr.query, mr.cfg);
+            got_ext  := pg_temp._prox_eval(ext_sch, mexpr);
+            got_pure := pg_temp._prox_eval('proxquery', mexpr);
+            IF got_ext IS DISTINCT FROM mr.expected
+               OR got_pure IS DISTINCT FROM mr.expected
+               OR got_ext IS DISTINCT FROM got_pure THEN
+                RAISE WARNING 'FAIL cfg:%  ext=[%] pure=[%] expected=[%]', mr.label, got_ext, got_pure, mr.expected;
+                fails := fails + 1;
+            END IF;
+            IF mr.expected = 'true' THEN
+                pexpr := format('(to_tsvector(%L::regconfig, %L) @@ ts_prox_query(%L, %L::regconfig))',
+                                mr.cfg, mr.doc, mr.query, mr.cfg);
+                got_probe_ext  := pg_temp._prox_eval(ext_sch, pexpr);
+                got_probe_pure := pg_temp._prox_eval('proxquery', pexpr);
+                IF got_probe_ext = 'false' OR got_probe_pure = 'false' THEN
+                    RAISE WARNING 'FAIL cfg-soundness:%  recheck=true but probe ext=[%] pure=[%] (recheck ⟹ probe violated)',
+                                  mr.label, got_probe_ext, got_probe_pure;
+                    fails := fails + 1;
+                END IF;
+            END IF;
+        END LOOP;
+    END IF;
 
     IF fails > 0 THEN
         RAISE EXCEPTION 'proxquery differential test: % of % case(s) FAILED (extension/pure/expected disagree)', fails, n;

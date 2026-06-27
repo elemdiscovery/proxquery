@@ -981,6 +981,157 @@ mod tests {
         ));
     }
 
+    #[pg_test]
+    fn config_aware_glob_casefold() {
+        // A glob's literal runs resolve through `cfg` just like a term — here `simple`,
+        // whose `to_tsvector` Unicode-lowercases a run the ASCII-only query lexer leaves
+        // alone. `*É` folds to `*é` and matches the stored lexeme `café` …
+        assert!(b("SELECT ts_prox_match(to_tsvector('simple','un CAFÉ noir'),'*É','simple')"));
+        // … but the accent is PRESERVED (folds case, not accent), so it does not match
+        // the unaccented `cafe` — proving the feature is config-driven, not hardcoded.
+        assert!(!b("SELECT ts_prox_match(to_tsvector('simple','un cafe noir'),'*É','simple')"));
+        // The 2-arg `simple` path is unchanged: ASCII-only lower leaves `É`, so no match.
+        assert!(!b("SELECT ts_prox_match(to_tsvector('simple','un CAFÉ noir'),'*É')"));
+        // Verbatim fallback: a run resolving to 0/>1 lexemes (punctuated/alphanumeric)
+        // is kept as-is — no empty result, no error, identical to the 2-arg behavior.
+        assert!(b("SELECT ts_prox_match(to_tsvector('simple','x foo.bar baz'),'foo.bar*','simple')"));
+        assert!(b("SELECT ts_prox_match(to_tsvector('simple','an abc123 token'),'abc123*','simple')"));
+        // Operator form, leading-literal glob (index-drivable): folds through the cfg.
+        assert!(b("SELECT to_tsvector('simple','this is confidential') @~@ proxquery('simple','con*ial')"));
+    }
+
+    #[pg_test]
+    fn config_aware_glob_unaccent() {
+        // The headline: on an accent-folding column, WILDCARD searches strip accents
+        // too. Needs contrib `unaccent`; skip cleanly where it isn't installed (some
+        // source builds) — the contrib-free `config_aware_glob_casefold` covers the
+        // mechanism, and the shared corpus exercises this whenever unaccent is present.
+        if !b("SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'unaccent')") {
+            return;
+        }
+        Spi::run("CREATE EXTENSION IF NOT EXISTS unaccent").unwrap();
+        Spi::run("DROP TEXT SEARCH CONFIGURATION IF EXISTS simple_unaccent").unwrap();
+        Spi::run("CREATE TEXT SEARCH CONFIGURATION simple_unaccent (COPY = simple)").unwrap();
+        Spi::run(
+            "ALTER TEXT SEARCH CONFIGURATION simple_unaccent \
+             ALTER MAPPING FOR asciiword, word, numword, \
+                               asciihword, hword, numhword, \
+                               hword_asciipart, hword_part, hword_numpart \
+             WITH unaccent, simple",
+        )
+        .unwrap();
+
+        // `?` / suffix / infix wildcards all fold their literal runs to the unaccented
+        // lexeme form the column was built with.
+        assert!(b("SELECT ts_prox_match(to_tsvector('simple_unaccent','un café noir'),'caf?','simple_unaccent')"));
+        assert!(b("SELECT ts_prox_match(to_tsvector('simple_unaccent','bien paré ici'),'*ré','simple_unaccent')"));
+        // `p` is recomputed from the FOLDED glob (`café*o` → `cafe*o`), so the prefix
+        // scan keys off `cafe` and reaches `cafezinho`.
+        assert!(b("SELECT ts_prox_match(to_tsvector('simple_unaccent','o cafezinho'),'café*o','simple_unaccent')"));
+        // Operator form.
+        assert!(b("SELECT to_tsvector('simple_unaccent','o cafezinho') @~@ proxquery('simple_unaccent','café*o')"));
+        // The SAME query is accent-SENSITIVE on plain `simple` (no match) — the column's
+        // config, not the library, decides whether accents are stripped.
+        assert!(!b("SELECT ts_prox_match(to_tsvector('simple','o cafezinho'),'café*o','simple')"));
+
+        // GIN-index soundness on a folding column: the probe folds the glob prefix
+        // (`'cafe':*`) and selects the candidate; the recheck — now folding the same way
+        // — confirms it. This is the original silent-miss bug (probe yes, recheck no),
+        // closed: every selected row survives the recheck.
+        Spi::run("CREATE TEMP TABLE uacc(id serial, tsv tsvector)").unwrap();
+        Spi::run(
+            "INSERT INTO uacc(tsv) SELECT to_tsvector('simple_unaccent','o cafezinho numero '||g) \
+             FROM generate_series(1,300) g",
+        )
+        .unwrap();
+        Spi::run("CREATE INDEX ON uacc USING gin(tsv)").unwrap();
+        Spi::run("ANALYZE uacc").unwrap();
+        Spi::run("SET enable_seqscan = off").unwrap();
+        let n = Spi::get_one::<i64>(
+            "SELECT count(*) FROM uacc WHERE tsv @~@ proxquery('simple_unaccent','café*o')",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 300, "index-served folded glob dropped rows the recheck accepts");
+    }
+
+    #[pg_test]
+    fn config_aware_index_unaccent_prox() {
+        // Companion to `config_aware_glob_unaccent` (globs) and the inline-tsvector
+        // config corpus (which proves recheck⟹probe soundness but never touches an
+        // index): this confirms PROXIMITY / PHRASE / alphanumeric queries on an
+        // accent-folding column are actually SERVED BY the GIN index under the expanded
+        // mapping — the @~@ support fn turns each into an `Index Cond … ts_prox_query`
+        // (folded keys like `cafe2`/`mp3`), and the index result equals the bare
+        // recheck. Needs contrib `unaccent`; skip cleanly where it isn't installed.
+        if !b("SELECT EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'unaccent')") {
+            return;
+        }
+        Spi::run("CREATE EXTENSION IF NOT EXISTS unaccent").unwrap();
+        Spi::run("DROP TEXT SEARCH CONFIGURATION IF EXISTS simple_unaccent").unwrap();
+        Spi::run("CREATE TEXT SEARCH CONFIGURATION simple_unaccent (COPY = simple)").unwrap();
+        Spi::run(
+            "ALTER TEXT SEARCH CONFIGURATION simple_unaccent \
+             ALTER MAPPING FOR asciiword, word, numword, \
+                               asciihword, hword, numhword, \
+                               hword_asciipart, hword_part, hword_numpart \
+             WITH unaccent, simple",
+        )
+        .unwrap();
+
+        // The three docs that should match (each duplicated 20×) buried in noise, so
+        // the planner clearly prefers the index. `café-bar` → `café-bar`:2 `café`:3
+        // `bar`:4 (compound + parts at consecutive positions); `café2` → `cafe2`;
+        // `mp3-café` → `mp3-cafe`:1 `mp3`:2 `cafe`:3.
+        Spi::run("CREATE TEMP TABLE pdocs(id serial primary key, tsv tsvector)").unwrap();
+        Spi::run(
+            "INSERT INTO pdocs(tsv) SELECT to_tsvector('simple_unaccent', d) \
+             FROM unnest(ARRAY['le café-bar ferme','un café2 noir','un mp3-café ok']) d, \
+                  generate_series(1, 20)",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO pdocs(tsv) SELECT to_tsvector('simple_unaccent','thé vert numero '||g) \
+             FROM generate_series(1, 500) g",
+        )
+        .unwrap();
+        Spi::run("CREATE INDEX ON pdocs USING gin(tsv)").unwrap();
+        Spi::run("ANALYZE pdocs").unwrap();
+        Spi::run("SET enable_seqscan = off").unwrap();
+        Spi::run(
+            "CREATE FUNCTION uses_index_u(q text) RETURNS bool AS $$ \
+             DECLARE line text; hit bool := false; \
+             BEGIN \
+               FOR line IN EXECUTE \
+                 'EXPLAIN SELECT count(*) FROM pdocs WHERE tsv @~@ proxquery(''simple_unaccent'', ' \
+                 || quote_literal(q) || ')' LOOP \
+                 IF line LIKE '%Index Cond%ts_prox_query%' THEN hit := true; END IF; \
+               END LOOP; \
+               RETURN hit; \
+             END $$ LANGUAGE plpgsql",
+        )
+        .unwrap();
+
+        // Each query: the @~@ plan must be index-driven AND return exactly its 20 rows.
+        for (q, want) in [
+            ("cafe <-> bar", 20i64),    // hyphenated parts, accent-folded
+            ("\"cafe bar ferme\"", 20), // phrase spanning the compound + both parts
+            ("cafe2 <-> noir", 20),     // numword folded to `cafe2`
+            ("mp3 <-> cafe", 20),       // numhword parts adjacent
+        ] {
+            assert!(
+                b(&format!("SELECT uses_index_u('{q}')")),
+                "@~@ did not use the GIN index for `{q}` on simple_unaccent",
+            );
+            let n = Spi::get_one::<i64>(&format!(
+                "SELECT count(*) FROM pdocs WHERE tsv @~@ proxquery('simple_unaccent','{q}')"
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(n, want, "wrong row count for `{q}` on simple_unaccent");
+        }
+    }
+
     // --- pure-SQL port parity ----------------------------------------------
     // The extension-free port (sql/proxquery_pure.sql) must stay behavior-
     // identical to this extension, on every CI Postgres version.
@@ -996,6 +1147,7 @@ mod tests {
         Spi::run(include_str!("../sql/proxquery_pure.sql")).expect("load pure-SQL port");
         Spi::run(include_str!("../sql/proxquery_cases.sql")).expect("load shared corpus");
         Spi::run(include_str!("../sql/proxquery_match_cases.sql")).expect("load match corpus");
+        Spi::run(include_str!("../sql/proxquery_config_cases.sql")).expect("load config corpus");
         Spi::run(include_str!("../sql/proxquery_diff_test.sql")).expect("differential corpus test");
     }
 
