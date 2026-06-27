@@ -23,6 +23,14 @@ jobs:
   release-pr:
     name: release-plz PR
     runs-on: ubuntu-latest
+    # git_only mode makes release-plz run `cargo package` (with a verify build)
+    # to enumerate the crate's files. pgrx can't build without a Postgres/clang/
+    # PGRX_HOME toolchain, so use pgrx's docs.rs mode: DOCS_RS=1 makes pgrx-pg-sys
+    # skip bindgen and compile against its bundled bindings. This only affects
+    # release-plz's internal bookkeeping build — the real artifacts are built by
+    # edge-build.yml / release-build.yml, which deliberately do NOT set this.
+    env:
+      DOCS_RS: "1"
     concurrency:
       group: release-plz-pr-${{ github.ref }}
       cancel-in-progress: false
@@ -48,6 +56,10 @@ jobs:
   release:
     name: release-plz release
     runs-on: ubuntu-latest
+    # See release-pr above: DOCS_RS=1 lets release-plz's `cargo package` step
+    # build pgrx without a Postgres toolchain when determining the next version.
+    env:
+      DOCS_RS: "1"
     outputs:
       released: ${{ steps.release-plz.outputs.releases_created }}
     steps:
