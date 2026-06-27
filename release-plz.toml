@@ -24,6 +24,12 @@ git_only = true
 # purely from conventional commits.
 semver_check = false
 
+# Pre-1.0, release-plz defaults to feat -> patch (Cargo SemVer reserves 0.x
+# minor bumps for breaking changes). We don't publish to crates.io, so that
+# rule doesn't bind us: bump feat -> minor, as documented in docs/RELEASING.md.
+# (Breaking changes already bump the minor pre-1.0 by default.)
+features_always_increment_minor = true
+
 # Tag + GitHub Release on merge of the Release PR. Tag format is the default
 # `v{{ version }}`, which .github/workflows/release-build.yml keys off.
 git_tag_enable = true
@@ -33,3 +39,31 @@ git_release_enable = true
 # (the release/edge split uses release-plz's output, not the commit message) —
 # it just keeps the title consistent regardless of single-crate vs. workspace.
 pr_name = "chore: release v{{ version }}"
+
+# How the CHANGELOG is rendered (release-plz embeds git-cliff). Keep entries to
+# user-facing changes; skip tooling/noise and release-plz's own release commits
+# (otherwise the previous release leaks into the next changelog's "Other").
+[changelog]
+# Never drop a breaking change, even if its type matches a skip rule below.
+protect_breaking_commits = true
+commit_parsers = [
+    # User-facing — kept, under Keep-a-Changelog headings.
+    { message = "^feat",   group = "added" },
+    { message = "^fix",    group = "fixed" },
+    { message = "^perf",   group = "performance" },
+    { message = "^revert", group = "changed" },
+
+    # Also kept, in their own sections.
+    { message = "^docs",   group = "documentation" },
+    { message = "^test",   group = "testing" },
+
+    # Development noise — dropped.
+    { message = "^refactor", skip = true },
+    { message = "^style",    skip = true },
+    { message = "^chore",    skip = true },   # incl. "chore: release vX.Y.Z"
+    { message = "^ci",       skip = true },
+    { message = "^build",    skip = true },
+
+    # Anything else (non-conventional: "Update CHANGELOG", merge commits) — dropped.
+    { message = "^.*",       skip = true },
+]
