@@ -242,3 +242,7 @@ are in [docs/RELEASING.md](docs/RELEASING.md).
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### Word Frequency Data
+
+The [docs/wordfrequency.info-top-5000.txt](docs/wordfrequency.info-top-5000.txt) used in testing comes from [www.wordfrequency.info](https://www.wordfrequency.info/samples.asp) and can only be redistributed with attribution.
