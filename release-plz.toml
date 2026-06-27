@@ -6,13 +6,17 @@
 # and cuts the GitHub Release, which in turn drives the binary build.
 #
 # This is a cdylib Postgres extension, not a crates.io library, so every
-# crates.io-facing feature is turned off here; `publish = false` also lives in
-# Cargo.toml so plain `cargo` refuses to publish too.
+# crates.io-facing feature is turned off here. `git_only` is the key switch: it
+# makes release-plz read versions from git tags (not crates.io) and skip
+# `cargo publish` entirely.
 
 [workspace]
-# Never push to crates.io (redundant with Cargo.toml's publish = false, but
-# explicit so the intent is obvious from the release config alone).
-publish = false
+# Unpublished crate: derive versions from git tags, not crates.io, and skip
+# `cargo publish`. This supersedes `publish = false` (the two can't both be
+# true). Without it, release-plz queries crates.io for the "last release";
+# since proxquery isn't published there, it can't compute version bumps after
+# the first tag and stops opening Release PRs.
+git_only = true
 
 # cargo-semver-checks diffs a crate's public API against its last crates.io
 # release to pick the bump. There is no public Rust API here (it's a cdylib)
