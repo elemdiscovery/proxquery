@@ -12,6 +12,7 @@
         "pkglibdir",
         "proxquery",
         "psql",
+        "regconfig",
         "rustup",
         "sharedir",
         "tsquery",

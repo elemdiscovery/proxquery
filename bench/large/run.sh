@@ -71,6 +71,8 @@ raw_small="$(psqlq -d "$DB_S" \
   -v tail_words="$TAIL_WORDS" -v zipf_s="$ZIPF_S" \
   -v nqueries="$SMALL_QUERIES" -v iters="$SMALL_ITERS" -v with_pure=1 -f "$SQL")"
 s_wall=$(( $(date +%s) - s_start ))
+# raw per-query timings, for an easy reference point (gitignored)
+psqlq -d "$DB_S" -c "\copy (SELECT id, shape, q, candidates, matches, ext_op_ms, ext_2cl_ms, pure_2cl_ms FROM results ORDER BY id) TO 'bench/reports/results_small.csv' WITH (FORMAT csv, HEADER true)"
 
 raw_large=""; l_wall=0
 if [ "$RUN_LARGE" = "1" ]; then
@@ -82,6 +84,7 @@ if [ "$RUN_LARGE" = "1" ]; then
     -v tail_words="$TAIL_WORDS" -v zipf_s="$ZIPF_S" \
     -v nqueries="$LARGE_QUERIES" -v iters="$LARGE_ITERS" -v with_pure=0 -f "$SQL")"
   l_wall=$(( $(date +%s) - l_start ))
+  psqlq -d "$DB_L" -c "\copy (SELECT id, shape, q, candidates, matches, ext_op_ms FROM results ORDER BY id) TO 'bench/reports/results_large.csv' WITH (FORMAT csv, HEADER true)"
 fi
 
 # ---- machine / version context ----
@@ -120,6 +123,10 @@ git_dirty=""; { git -C "$ROOT" diff --quiet 2>/dev/null && git -C "$ROOT" diff -
   echo
   echo "## Small tier — extension vs pure-SQL port (${SMALL_MB} MiB)"
   echo
+  echo "Phase timing (wall seconds — where the run's time went)"
+  echo
+  section "$raw_small" "phase timing"
+  echo
   echo "Vocabulary"
   echo
   section "$raw_small" "vocabulary"
@@ -143,6 +150,10 @@ git_dirty=""; { git -C "$ROOT" diff --quiet 2>/dev/null && git -C "$ROOT" diff -
     echo
     echo "## Large tier — extension only (${LARGE_MB} MiB)"
     echo
+    echo "Phase timing (wall seconds)"
+    echo
+    section "$raw_large" "phase timing"
+    echo
     echo "Corpus"
     echo
     section "$raw_large" "corpus shape"
@@ -157,8 +168,10 @@ git_dirty=""; { git -C "$ROOT" diff --quiet 2>/dev/null && git -C "$ROOT" diff -
   fi
   echo
   echo "- \`ext_op_ms\` — extension single operator \`tsv @~@ q\` (real-world usage)"
-  echo "- \`ext_2cl_ms\` — extension, written as the portable two-clause form"
-  echo "- \`pure_2cl_ms\` — pure-SQL port, the same two clauses"
+  echo "- \`ext_2cl_ms\` — extension, written as the portable two-clause form (small tier only)"
+  echo "- \`pure_2cl_ms\` — pure-SQL port, the same two clauses (small tier only)"
+  echo
+  echo "Raw per-query timings: \`bench/reports/results_small.csv\`$( [ "$RUN_LARGE" = "1" ] && echo ", \`bench/reports/results_large.csv\`")."
 } > "$REPORT"
 
 echo "wrote ${REPORT#$ROOT/}  (small ${s_wall}s$( [ "$RUN_LARGE" = "1" ] && echo ", large ${l_wall}s"))" >&2

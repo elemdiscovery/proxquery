@@ -93,6 +93,20 @@ CREATE FUNCTION ts_prox_query(query text) RETURNS tsquery
     requires = [ts_prox_query_skeleton],
 );
 
+// Config-aware skeleton: same presence skeleton, but lowered through the column's
+// text-search config (`to_tsquery(cfg, …)` stems/unaccents the lexemes exactly as
+// the recheck's `to_tsvector(cfg, term)` does, so selection and recheck agree). The
+// skeleton string itself is config-independent — only the wrapping config changes.
+pgrx::extension_sql!(
+    r#"
+CREATE FUNCTION ts_prox_query(query text, cfg regconfig) RETURNS tsquery
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+    AS $$ SELECT to_tsquery(cfg, ts_prox_query_skeleton($1)) $$;
+"#,
+    name = "ts_prox_query_cfg_wrapper",
+    requires = [ts_prox_query_skeleton],
+);
+
 thread_local! {
     // The recheck runs per candidate row with the same constant query string, so
     // re-parsing it each time is pure overhead. Cache the parsed+normalized AST
@@ -127,7 +141,26 @@ fn ts_prox_match(v: TsVector, query: &str) -> bool {
         Ok(n) => n,
         Err(e) => error!("ts_prox_match: {e}"),
     };
-    match dsl::eval_match(&node, &v) {
+    match dsl::eval_match(&node, &v, None) {
+        Ok(m) => m,
+        Err(e) => error!("ts_prox_match: {e}"),
+    }
+}
+
+/// Config-aware recheck: resolve each query *term* through `cfg`
+/// (`to_tsvector(cfg, term)`) so it matches a column built with that text-search
+/// config (stemmed/unaccented/locale-folded lexemes). The `simple` 2-arg
+/// [`ts_prox_match`] is the literal-lexeme fast path; this is the explicit-config
+/// form behind the 3-arg `ts_prox_match(tsvector, text, regconfig)` overload and
+/// the `@~@ proxquery(cfg, q)` operator. `cfg` arrives as a plain `oid` (regconfig
+/// is binary-coercible); the SQL wrappers do the `regconfig::oid` cast.
+#[pg_extern(immutable, parallel_safe)]
+fn ts_prox_match_cfg(v: TsVector, query: &str, cfg: pgrx::pg_sys::Oid) -> bool {
+    let node = match cached_ast(query) {
+        Ok(n) => n,
+        Err(e) => error!("ts_prox_match: {e}"),
+    };
+    match dsl::eval_match(&node, &v, Some(cfg)) {
         Ok(m) => m,
         Err(e) => error!("ts_prox_match: {e}"),
     }
@@ -169,6 +202,54 @@ pgrx::extension_sql!(
     "ALTER FUNCTION ts_prox_match(tsvector, text) SUPPORT ts_prox_query_support;",
     name = "proxmatch_support",
     requires = [ts_prox_match, ts_prox_query_support],
+);
+
+// --- config-aware surface: 3-arg overloads + the @~@ proxquery(cfg, q) operator ---
+//
+// The 3-arg `ts_prox_query`/`ts_prox_match` are the explicit-config two-clause form
+// (always index-served, like the 2-arg). The `@~@` operator can't take a third arg,
+// so the config rides in a typed right operand: `tsv @~@ proxquery(cfg, q)`. A second
+// `@~@` over the `proxquery` composite keeps one operator symbol; its support fn
+// (shared with the 2-arg) rewrites it to `tsv @@ ts_prox_query(proxquery)` for the GIN
+// index. `simple`-config callers keep using the plain `text` operator unchanged.
+pgrx::extension_sql!(
+    r#"
+-- 3-arg recheck: regconfig cast to oid for the internal (regconfig is an oid alias).
+CREATE FUNCTION ts_prox_match(v tsvector, query text, cfg regconfig) RETURNS bool
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+    AS $$ SELECT ts_prox_match_cfg($1, $2, $3::oid) $$;
+
+-- The typed right operand for @~@: a (config, query) pair.
+CREATE TYPE proxquery AS (cfg regconfig, q text);
+
+CREATE FUNCTION proxquery(cfg regconfig, q text) RETURNS proxquery
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ SELECT ROW($1, $2)::proxquery $$;
+
+-- Skeleton + recheck over the typed operand. The support fn injects
+-- `ts_prox_query(proxquery)` as the GIN index condition, deconstructing the pair
+-- inside this IMMUTABLE function (so it constant-folds at plan time).
+CREATE FUNCTION ts_prox_query(pq proxquery) RETURNS tsquery
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+    AS $$ SELECT to_tsquery(($1).cfg, ts_prox_query_skeleton(($1).q)) $$;
+
+-- plpgsql (not sql) so the planner does NOT inline the operator into a bare
+-- ts_prox_match_cfg() call — inlining would strip the @~@ OpExpr and bypass the
+-- support function, losing the index. (The 2-arg text operator stays indexable for
+-- the same reason: its function is a non-inlinable C function.)
+CREATE FUNCTION ts_prox_match(v tsvector, pq proxquery) RETURNS bool
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE STRICT
+    AS $$ BEGIN RETURN ts_prox_match_cfg(v, pq.q, pq.cfg::oid); END $$;
+
+CREATE OPERATOR @~@ (
+    LEFTARG = tsvector,
+    RIGHTARG = proxquery,
+    FUNCTION = ts_prox_match
+);
+
+ALTER FUNCTION ts_prox_match(tsvector, proxquery) SUPPORT ts_prox_query_support;
+"#,
+    name = "proxquery_config_aware",
+    requires = [ts_prox_query_skeleton, ts_prox_match_cfg, ts_prox_query_support],
 );
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -816,6 +897,88 @@ mod tests {
         // Validation is up front, so a malformed regex fails the query even when a
         // sibling branch (`alpha`) would have matched and short-circuited eval.
         Spi::run("SELECT ts_prox_match(to_tsvector('simple','alpha beta'), 'alpha | ##[##')").unwrap();
+    }
+
+    // --- config-aware surface (3-arg overloads + @~@ proxquery operator) ----
+
+    #[pg_test]
+    fn config_aware_english_stemming() {
+        // The headline: a SURFACE query term matches the stored STEM under `english`.
+        assert!(b("SELECT ts_prox_match(to_tsvector('english','the running shoes'),'running <~2> shoes','english')"));
+        assert!(b("SELECT ts_prox_match(to_tsvector('english','the running shoes'),'run <~2> shoe','english')"));
+        // The 2-arg simple path is literal — it does NOT match the stem (unchanged).
+        assert!(!b("SELECT ts_prox_match(to_tsvector('english','the running shoes'),'running <~2> shoes')"));
+        // The skeleton is config-independent; only the wrapping config differs, so the
+        // 3-arg selection picks the stemmed lexemes.
+        assert_eq!(
+            Spi::get_one::<String>("SELECT ts_prox_query('running <~2> shoes','english')::text").unwrap().unwrap(),
+            "'run' & 'shoe'"
+        );
+        assert!(b("SELECT to_tsvector('english','the running shoes') @@ ts_prox_query('running <~2> shoes','english')"));
+        assert!(!b("SELECT to_tsvector('english','the walking shoes') @@ ts_prox_query('running <~2> shoes','english')"));
+    }
+
+    #[pg_test]
+    fn config_aware_operator_proxquery() {
+        // `tsv @~@ proxquery(cfg, q)`: the config rides in the typed right operand,
+        // keeping one operator symbol.
+        assert!(b("SELECT to_tsvector('english','the running shoes') @~@ proxquery('english','running <~2> shoes')"));
+        assert!(!b("SELECT to_tsvector('english','the walking shoes') @~@ proxquery('english','running <~2> shoes')"));
+        // The plain text operator stays `simple` (unchanged) — literal, no stemming.
+        assert!(!b("SELECT to_tsvector('english','the running shoes') @~@ 'running <~2> shoes'"));
+    }
+
+    #[pg_test]
+    fn config_aware_operator_uses_gin_index() {
+        // The typed operator must be index-served too — the support fn injects
+        // `tsv @@ ts_prox_query(proxquery)` as the GIN index condition.
+        Spi::run("CREATE TEMP TABLE ptc(id serial, tsv tsvector)").unwrap();
+        Spi::run(
+            "INSERT INTO ptc(tsv) SELECT to_tsvector('english','the running shoes number '||g) \
+             FROM generate_series(1,300) g",
+        )
+        .unwrap();
+        Spi::run("CREATE INDEX ON ptc USING gin(tsv)").unwrap();
+        Spi::run("ANALYZE ptc").unwrap();
+        Spi::run("SET enable_seqscan = off").unwrap();
+        Spi::run(
+            "CREATE FUNCTION uses_index_cfg(cfg text, q text) RETURNS bool AS $$ \
+             DECLARE line text; hit bool := false; \
+             BEGIN \
+               FOR line IN EXECUTE 'EXPLAIN SELECT count(*) FROM ptc WHERE tsv @~@ proxquery(' \
+                 || quote_literal(cfg) || '::regconfig, ' || quote_literal(q) || ')' LOOP \
+                 IF line LIKE '%Index Cond%ts_prox_query%' THEN hit := true; END IF; \
+               END LOOP; \
+               RETURN hit; \
+             END $$ LANGUAGE plpgsql",
+        )
+        .unwrap();
+        assert!(
+            b("SELECT uses_index_cfg('english','running <~2> shoes')"),
+            "@~@ proxquery(cfg,q) did not use the GIN index"
+        );
+        let n = Spi::get_one::<i64>(
+            "SELECT count(*) FROM ptc WHERE tsv @~@ proxquery('english','running <~2> shoes')",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(n, 300);
+    }
+
+    #[pg_test]
+    fn config_aware_user_defined_config() {
+        // A user-defined config works exactly like a built-in — proxquery only ever
+        // passes the regconfig you name into `to_tsvector`. (Custom config, no contrib
+        // dependency: a copy of english under a different name.)
+        Spi::run("DROP TEXT SEARCH CONFIGURATION IF EXISTS myeng").unwrap();
+        Spi::run("CREATE TEXT SEARCH CONFIGURATION myeng (COPY = english)").unwrap();
+        assert!(b("SELECT ts_prox_match(to_tsvector('myeng','the running shoes'),'running <~2> shoes','myeng')"));
+        assert!(b("SELECT to_tsvector('myeng','the running shoes') @~@ proxquery('myeng','running <~2> shoes')"));
+        // Two-clause form selects via the same custom config.
+        assert!(b(
+            "SELECT to_tsvector('myeng','the running shoes') @@ ts_prox_query('running <~2> shoes','myeng') \
+             AND ts_prox_match(to_tsvector('myeng','the running shoes'),'running <~2> shoes','myeng')"
+        ));
     }
 
     // --- pure-SQL port parity ----------------------------------------------
