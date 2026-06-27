@@ -1,111 +1,133 @@
-# Config-aware proxquery (design sketch — not implemented)
+# Config-aware proxquery
 
-Today proxquery is **`simple`-only**. This sketches what it would take to make it
-work against a `tsvector` built with any text-search configuration (`english`,
-etc.). It is a design note for later, not a spec of shipped behavior.
+By default proxquery matches lexemes **literally** (the `simple` text-search
+config: lowercase, no stemming). The config-aware surface lets it instead match a
+`tsvector` built with **any** text-search configuration — `english` (stemming),
+a custom `simple_unaccent` (accent-folding), your own dictionary chain — so a
+surface query term finds the normalized lexemes the column actually stores.
 
-## The problem
+The headline: against an `english` column, `running <~3> shoes` matches a document
+stored as `run … shoe`. Against a `simple_unaccent` column, `CAFÉ` matches `café`.
 
-proxquery matches by *lexeme*. It currently lexifies query terms as `simple`
-(literal, lowercased) in **two** places that must agree:
+## The idea: proxquery *consumes* a config, it doesn't author one
 
-1. **Skeleton** (index selection): `to_tsquery('simple', …)`.
-2. **Recheck** (`ts_prox_match`): a literal, lowercased byte lookup of each term in
-   the `tsvector`.
+proxquery matches by **lexeme**. Under a non-`simple` config the stored lexemes
+are normalized (stemmed, unaccented, locale-folded), so a query term has to be run
+through the **same** config to find them. proxquery does that by resolving each
+term through `to_tsvector(cfg, term)` — the exact routine that built your column —
+and lowering the index skeleton through `to_tsquery(cfg, …)`. Both sides use the
+identical Postgres dictionaries, so selection and recheck agree by construction.
 
-If the column was built with, say, `english`, the stored lexemes are stems
-(`running` → `run`) and stopwords are dropped. proxquery looks up the literal
-`running`, misses, and — because the skeleton's `to_tsquery('simple', …)` selects
-**zero candidates** — the query returns nothing before the recheck even runs. The
-`<N>` operator is no exception: its distance math is config-independent (positions
-count stopwords on any config), but the *terms* inside it are still `simple`.
+The normalization policy lives entirely in **your** text-search config, not in
+proxquery. proxquery only threads the `regconfig` you name into `to_tsvector` /
+`to_tsquery`; it contains no stemming or unaccent logic of its own. To change how
+terms are normalized, change the config — proxquery follows.
 
-So the fix is entirely about **lexifying query terms through the column's config**,
-consistently on both sides.
-
-## Where the config comes from
-
-A `tsvector` carries no config, so proxquery has to be told which one to use.
-
-- **GUC `proxquery.config`** (regconfig, default `simple`) — the default for the
-  `@~@` operator, which is binary (`tsvector @~@ text`) and has no room for a
-  third argument.
-- **Explicit 3-arg functions** for fine control without the operator sugar:
-  `ts_prox_query(text, regconfig)` and `ts_prox_match(tsvector, text, regconfig)`.
-  The existing 2-arg forms keep reading the GUC.
-
-The `@~@` path therefore picks up the config from the GUC (`SET proxquery.config =
-'english'`), which is session-scoped, not per-query. Per-query control means using
-the 3-arg functions directly (and the two-clause form), giving up the single
-operator. Document that trade-off.
-
-## Term resolution
-
-Resolve each query term to its lexeme set under the config, **once per query**
-(not per document), and cache it on the parsed node:
-
-```
-lexemes(term) = distinct lexemes of  to_tsvector(<config>, term)
+```sql
+-- You own the config (this one folds accents; needs the `unaccent` extension):
+CREATE TEXT SEARCH CONFIGURATION simple_unaccent (COPY = simple);
+ALTER TEXT SEARCH CONFIGURATION simple_unaccent
+  ALTER MAPPING FOR asciiword, word, hword, hword_part WITH unaccent, simple;
 ```
 
-- **1 lexeme** — the normal case (`running` → `run`).
-- **≥2 lexemes** — thesaurus/compound dictionaries can emit several. Treat the term
-  as the OR of them: union their positions. The existing position-set model already
-  does this (same as an OR-group or a prefix), so no new machinery.
-- **0 lexemes** — the term is a **stopword** (or tokenizes to nothing). It can't be
-  located, so a proximity/phrase over it is meaningless. Reject with a clear error
-  (`"the" is a stopword under config "english"`), consistent with the
-  reject-and-refine stance elsewhere. (Silently dropping it would desync the
-  skeleton and the recheck.)
+## The surface
 
-The skeleton side is easier: just pass the config to `to_tsquery(<config>, …)` —
-it already runs each lexeme through the config's dictionaries. (Verify that
-single-quoted lexemes in `to_tsquery` are still normalized; they should be.)
+The config is passed **explicitly** (there is no session GUC — config is per
+query, and stays `IMMUTABLE` so it folds into the index condition):
 
-## What changes, by piece
+| Form | Use |
+| --- | --- |
+| `ts_prox_query(text, regconfig)` | index-selection skeleton under a config |
+| `ts_prox_match(tsvector, text, regconfig)` | positional recheck under a config |
+| `tsvector @~@ proxquery(cfg, q)` | the single indexable operator, config in a typed right operand |
 
-| Piece | Today (`simple`) | Config-aware |
-|---|---|---|
-| skeleton | `to_tsquery('simple', s)` | `to_tsquery(<cfg>, s)` |
-| term recheck | literal byte lookup | resolve to lexeme set via `<cfg>`, union positions |
-| `@~@` | implicit `simple` | reads `proxquery.config` GUC |
-| functions | 2-arg | add 3-arg `(…, regconfig)` overloads |
+The existing 2-arg `ts_prox_query(text)` / `ts_prox_match(tsvector, text)` and the
+plain `tsvector @~@ text` operator are unchanged — still `simple`, still literal.
+This is purely additive.
 
-The **consistency invariant** is the thing to get right: skeleton and recheck must
-resolve every term identically (same config, same stopword handling), or recall
-breaks (the recheck only ever filters down from what the index returned).
+### As the two-clause form (works everywhere, incl. the pure-SQL port)
 
-## Hard parts / caveats
+```sql
+CREATE INDEX ON docs USING gin (body_tsv);   -- body_tsv = to_tsvector('english', body)
 
-- **Phrases + stopwords.** Under `english`, `"the quick fox"` must become
-  `quick <2> fox` — the dropped stopword widens the gap, exactly as
-  `phraseto_tsquery` accounts for it. proxquery's exact-gap phrase recheck would
-  have to reproduce that stopword-offset arithmetic. This is the gnarliest sub-
-  problem; the skeleton can lean on `phraseto_tsquery(<cfg>, …)`, but the recheck
-  needs the same offsets.
-- **Wildcards / regex match stems.** `*ology` and `##…##` scan the *stored*
-  lexemes, which under `english` are stems (`biology` may be stored as `biolog`).
-  So wildcard/regex semantics are only crisp under `simple`; under a stemming
-  config they match stems, not surface forms. Document as best-effort, or restrict
-  wildcards/regex to `simple`.
-- **Per-row cost.** `ts_prox_match` re-parses (and would re-resolve) the query per
-  row. Resolution must be hoisted/cached per query (e.g. a backend-local cache
-  keyed by `(query, config)`), or it calls `to_tsvector` per term per row.
-- **Operator can't carry per-query config** — see the GUC trade-off above.
+SELECT * FROM docs
+WHERE body_tsv @@ ts_prox_query('running <~3> shoes', 'english')   -- Bitmap Index Scan
+  AND ts_prox_match(body_tsv, 'running <~3> shoes', 'english');     -- recheck filter
+```
+
+### As the single operator (extension only)
+
+```sql
+SELECT * FROM docs
+WHERE body_tsv @~@ proxquery('english', 'running <~3> shoes');
+```
+
+`proxquery(cfg, q)` builds a typed `(regconfig, text)` pair; a second `@~@` over
+that type keeps one operator symbol. Its planner support function rewrites it to
+`body_tsv @@ ts_prox_query(proxquery)` for the GIN index, so it plans **exactly**
+like the two-clause form — index selection plus recheck:
+
+```text
+Bitmap Heap Scan on docs
+  Filter: (body_tsv @~@ '(english,"running <~3> shoes")'::proxquery)   -- recheck
+  ->  Bitmap Index Scan on docs_body_tsv_idx
+        Index Cond: (body_tsv @@ ts_prox_query('(english,…)'::proxquery))  -- selection
+```
+
+## How it works
+
+- **Skeleton (selection).** The skeleton string is **config-independent** — the
+  same presence skeleton as `simple`. Only the wrapping config differs:
+  `to_tsquery(cfg, ts_prox_query_skeleton(q))`. `to_tsquery` runs each quoted
+  lexeme through the config's dictionaries (`'running'` → `'run'`), so the index
+  selects on the stored, normalized lexemes.
+- **Recheck (positions).** Each `Term` resolves to its lexeme set via
+  `to_tsvector(cfg, term)` and unions their positions; a `Prefix` is normalized
+  through the config before the prefix scan (so `café*` matches the stored `cafe…`).
+  Resolution is cached per `(config, term)` for the scan.
+- **What stays config-agnostic.** Globs (`*ology`, `te?t`) and `##regex##` scan
+  the **stored** lexemes verbatim — they are matched as-is, by design. Under a
+  stemming config that means they match stems (`*ology` won't match a stored
+  `biolog`); that is the only sensible behavior, since the stored lexeme is what
+  exists. Keep wildcard/regex literal parts in mind under a normalizing config.
+
+## Locale independence as a bonus
+
+The `simple` default folds case **by the database locale**, so an uppercase
+accented term (`CAFÉ`) can mismatch a stored `café` on a `C`/`C.UTF-8` database vs
+an `en_US.UTF-8` one. Routing terms through a config that **unaccents** (e.g.
+`simple_unaccent`) removes the accented characters entirely, so matching becomes
+ASCII and **locale-independent** — `CAFÉ` finds `café` on any collation. (Verified
+across `C` and `en_US.UTF-8`.)
+
+## Caveats
+
+- **Phrases + stopwords.** A quoted phrase resolves its atoms independently, so a
+  phrase whose atoms include a stopword under the config (e.g. `"the quick fox"`
+  under `english`) matches nothing — the exact-gap recheck doesn't reproduce the
+  dropped-stopword offset that `phraseto_tsquery` would. Use proximity operators
+  (`quick <~2> fox`) for stopword-spanning phrases, or `simple`.
+- **Stopword terms.** A bare term that the config drops (a stopword) resolves to
+  zero lexemes and so matches nothing — consistently in both ports.
+- **Multi-lexeme terms.** A term a stemmer/thesaurus expands to several lexemes is
+  treated as their OR (positions unioned) — correct for same-position synonyms.
+- **Wildcards / regex** match stored lexemes (= stems under a stemming config); see
+  above.
+- **Pass the config you built the column with.** Like `to_tsquery('english', …)`,
+  resolution uses whatever `regconfig` you name; a mismatch against the column's
+  config silently under-matches.
 
 ## Backward compatibility
 
-Default the GUC to `simple`; the 2-arg functions and current `@~@` behavior are
-unchanged. This is purely additive.
+The 2-arg functions and the `tsvector @~@ text` operator are untouched (`simple`,
+literal). Everything above is additive.
 
-## Rough implementation order
+## Pure-SQL parity
 
-1. Register the `proxquery.config` GUC (regconfig, default `simple`).
-2. Thread a config (GUC or arg) into `ts_prox_query` / `ts_prox_match`; add 3-arg
-   overloads.
-3. Skeleton: swap `'simple'` for the config in the `to_tsquery` call.
-4. Recheck: a `resolve(term, cfg) -> Vec<lexeme>` (via `to_tsvector(cfg, term)`),
-   cached per query; route `Term` lookups through it; error on stopwords.
-5. Decide wildcard/regex policy under non-`simple` (best-effort vs `simple`-only).
-6. Phrase stopword-offset handling (or restrict phrases to `simple` first).
-7. Tests against an `english` column; verify skeleton/recheck parity.
+The pure-SQL port ([PURE_SQL.md](PURE_SQL.md)) ships the same 3-arg
+`ts_prox_query` / `ts_prox_match` overloads, with identical results — both ports
+call the same Postgres `to_tsvector` / `to_tsquery` builtins, so they can't drift
+(checked by the differential and fuzz suites, now including config-aware cases).
+The `@~@ proxquery(cfg, q)` operator is **extension only** — like `@~@` itself, its
+planner support function is C-only — so under the pure port you write the two-clause
+form with the 3-arg functions.

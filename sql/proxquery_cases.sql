@@ -96,4 +96,24 @@ INSERT INTO _prox_cases(label, expr, expected) VALUES
   ('z0b',    $e$ ts_prox_match($$'a':1 'b':1$$::tsvector,'a <~0> b') $e$, $x$true$x$),
   ('z0c',    $e$ ts_prox_match($$'a':1 'b':1$$::tsvector,'a <0> b') $e$, $x$true$x$),
   ('z0e',    $e$ ts_prox_match($$'a':1 'b':1$$::tsvector,'a <-0> b') $e$, $x$false$x$),
-  ('z0f',    $e$ ts_prox_query_skeleton('a <0> b') $e$, $x$('a' <0> 'b')$x$);
+  ('z0f',    $e$ ts_prox_query_skeleton('a <0> b') $e$, $x$('a' <0> 'b')$x$),
+  -- non-ASCII surface coverage: position accessor, prefix scan, skeleton lowering.
+  -- Locale-robust (no uppercase accents); see docs/CONFIG_AWARE.md for the
+  -- uppercase-accent / config-aware lexing discussion.
+  ('uc1',    $e$ ts_prox_positions(to_tsvector('simple','le café est bon'),'café') $e$, $x${2}$x$),
+  ('uc2',    $e$ ts_prox_positions(to_tsvector('simple','中文 文档 搜索'),'中文') $e$, $x${1}$x$),
+  ('uc3',    $e$ ts_prox_query_skeleton('中文 <~2> 搜索') $e$, $x$('中文' & '搜索')$x$),
+  ('uc4',    $e$ ts_prox_positions_prefix(to_tsvector('simple','café cafétéria caffeine'),'café') $e$, $x${1,2}$x$),
+  -- config-aware (3-arg): query terms resolved through the column's text-search
+  -- config via to_tsvector(cfg, term). Built-in 'english' (stemming) keeps these
+  -- locale-independent and runnable on both implementations. The 2-arg simple forms
+  -- are unchanged; the headline is a SURFACE query term matching a stored STEM.
+  ('cfg1', $e$ ts_prox_match(to_tsvector('english','the running shoes'),'running <~2> shoes','english') $e$, $x$true$x$),
+  ('cfg2', $e$ ts_prox_match(to_tsvector('english','the running shoes'),'run <~2> shoe','english') $e$, $x$true$x$),
+  ('cfg3', $e$ ts_prox_match(to_tsvector('english','the walking shoes'),'running <~2> shoes','english') $e$, $x$false$x$),
+  ('cfg4', $e$ ts_prox_query('running <~2> shoes','english')::text $e$, $x$'run' & 'shoe'$x$),
+  ('cfg5', $e$ to_tsvector('english','the running shoes') @@ ts_prox_query('running <~2> shoes','english') $e$, $x$true$x$),
+  ('cfg6', $e$ to_tsvector('english','the running shoes') @@ ts_prox_query('running <~2> shoes','english') AND ts_prox_match(to_tsvector('english','the running shoes'),'running <~2> shoes','english') $e$, $x$true$x$),
+  ('cfg7', $e$ ts_prox_match(to_tsvector('english','quick brown foxes jumped'),'fox <~2> jump','english') $e$, $x$true$x$),
+  ('cfg8', $e$ ts_prox_match(to_tsvector('english','the running shoes'),'"running shoes"','english') $e$, $x$true$x$),
+  ('cfg9', $e$ ts_prox_match(to_tsvector('english','the running shoes'),'walking <~2> shoes','english') $e$, $x$false$x$);

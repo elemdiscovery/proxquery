@@ -47,6 +47,8 @@ extension, and returns **identical results** (verified — see
 | --- | --- |
 | `ts_prox_query(text) -> tsquery` | index-selection skeleton |
 | `ts_prox_match(tsvector, text) -> bool` | positional recheck |
+| `ts_prox_query(text, regconfig) -> tsquery` | config-aware skeleton |
+| `ts_prox_match(tsvector, text, regconfig) -> bool` | config-aware recheck |
 | `ts_prox_query_skeleton(text) -> text` | the `to_tsquery` input string |
 | `ts_prox_within / ts_prox_pre / ts_prox_not_within(tsvector, a, b, n)` | positional predicates |
 | `ts_prox_chain(tsvector, text[], int[])` | same-occurrence chain |
@@ -116,7 +118,7 @@ Absolute ms vary by machine; the ratio is the point:
 | `confidential <!~5> email` | 3652 | 17 ms | 247 ms | ~14× |
 | `ssn <~3> ##[0-9]{9}##` | 3552 | 83 ms | 358 ms | ~4× |
 
-So expect **roughly 4–16× slower**: ~an order of magnitude for term-driven
+So expect **roughly 4–30+× slower**: ~an order of magnitude for term-driven
 proximity (the `unnest` + re-parse overhead per candidate), shrinking to ~4×
 when a shared cost dominates the recheck — here both implementations run the
 identical Postgres regex engine over the candidates. The cost scales with the
@@ -194,9 +196,13 @@ ergonomic; same plan).
 
 ## What's not here
 
-- **`@~@`** and its planner support function (C-only) — see above.
-- Config-aware lexing is still `simple`-only, same as the extension today (see
-  [CONFIG_AWARE.md](CONFIG_AWARE.md)).
+- **`@~@`** and its planner support function (C-only) — see above. This includes
+  the config-carrying `@~@ proxquery(cfg, q)` overload; under the pure port you use
+  the 3-arg two-clause form instead (next bullet).
+- Config-aware lexing **is** here: the 3-arg `ts_prox_query(text, regconfig)` and
+  `ts_prox_match(tsvector, text, regconfig)` overloads match a column built with any
+  text-search config (stemmed, unaccented, …), identical to the extension (see
+  [CONFIG_AWARE.md](CONFIG_AWARE.md)). Only the single operator is missing.
 
 ## Parity with the extension
 

@@ -164,6 +164,24 @@ impl TsVector {
         }
     }
 
+    /// Every lexeme in the pool, in stored (sorted) order. Used to enumerate the
+    /// lexemes of a freshly built `to_tsvector(cfg, term)` during config-aware term
+    /// resolution — those vectors are tiny (one term's tokens), so the copy is cheap.
+    pub fn all_lexemes(&self) -> Vec<Vec<u8>> {
+        let n = self.size();
+        let mut out = Vec::with_capacity(n);
+        if n == 0 {
+            return out;
+        }
+        unsafe {
+            let (entries, strptr) = self.parts();
+            for i in 0..n {
+                out.push(self.lexeme(entries, strptr, i).to_vec());
+            }
+        }
+        out
+    }
+
     /// Sorted positions of `lexeme` — empty if it is absent or carries no positions.
     pub fn positions(&self, lexeme: &[u8]) -> Vec<i32> {
         let mut out = Vec::new();

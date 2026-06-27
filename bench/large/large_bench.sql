@@ -45,6 +45,11 @@ SET maintenance_work_mem = '512MB';
   \set pure 'sql/proxquery_pure.sql'
 \endif
 
+-- Phase wall-clock markers, so the report shows where the time actually went
+-- (corpus build vs searches) — a useful reference on a shared CI runner.
+CREATE TEMP TABLE phase_t(name text, ts timestamptz);
+INSERT INTO phase_t VALUES ('start', clock_timestamp());
+
 -- Native extension into public (incl. the @~@ operator); pure-SQL port into the
 -- proxquery schema. Restore a search_path that sees both.
 DROP EXTENSION IF EXISTS proxquery CASCADE;
@@ -55,7 +60,9 @@ SET search_path = public, proxquery, pg_catalog;
 -- Vocabulary, query list, corpus (shared with inspect.sql).
 \i bench/large/_vocab.sql
 \i bench/large/_queries.sql
+INSERT INTO phase_t VALUES ('setup (extension + vocab + queries)', clock_timestamp());
 \i bench/large/_corpus.sql
+INSERT INTO phase_t VALUES ('corpus (generate + GIN)', clock_timestamp());
 
 -- ================================================================= benchmark
 -- avg server-side ms over `iters` runs, after a warmup that also primes caches.
@@ -91,8 +98,11 @@ BEGIN
     EXECUTE format('SELECT count(*) FROM corpus WHERE body_tsv @@ public.ts_prox_query(%L)', r.q) INTO cand;
     EXECUTE format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q) INTO matc;
     exop := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q), it);
-    ex2  := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @@ public.ts_prox_query(%L) AND public.ts_prox_match(body_tsv,%L)', r.q, r.q), it);
     IF do_pure THEN
+      -- ext_2cl is the apples-to-apples denominator for the pure slowdown ratio;
+      -- it is ~identical to ext_op (the operator IS the two-clause form), so it is
+      -- only worth timing when the pure port is also being timed.
+      ex2  := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @@ public.ts_prox_query(%L) AND public.ts_prox_match(body_tsv,%L)', r.q, r.q), it);
       -- Parity here is a per-query match-COUNT check (cheap): a differing count
       -- proves a differing row set. The exhaustive row-set identity guarantee is
       -- the matrix job's dedicated pure_sql_port_matches_extension test; this is
@@ -101,13 +111,22 @@ BEGIN
       pu2 := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @@ proxquery.ts_prox_query(%L) AND proxquery.ts_prox_match(body_tsv,%L)', r.q, r.q), it);
       dis := abs(matc - pmatc);
     ELSE
-      pu2 := NULL; dis := NULL;
+      ex2 := NULL; pu2 := NULL; dis := NULL;
     END IF;
     INSERT INTO results VALUES (r.id, r.shape, r.q, cand, matc, exop, ex2, pu2, dis);
   END LOOP;
 END $run$;
+INSERT INTO phase_t VALUES ('searches', clock_timestamp());
 
 -- ------------------------------------------------------------------- reports
+\echo ''
+\echo '== phase timing (wall seconds) =='
+SELECT name AS phase,
+       round(extract(epoch FROM ts - lag(ts) OVER (ORDER BY ts))::numeric, 1) AS seconds
+FROM phase_t
+ORDER BY ts
+OFFSET 1;   -- drop the 'start' anchor row
+
 \echo ''
 \echo '== results: overall (avg ms/query over iters; lower is better) =='
 SELECT count(*)                          AS queries,

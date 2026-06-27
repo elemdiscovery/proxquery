@@ -1047,9 +1047,121 @@ EXCEPTION WHEN OTHERS THEN
 END
 $fn$;
 
--- NOTE: no `@~@` operator. The native extension's single indexable operator
--- needs a C planner support function that cannot be written in SQL; a SQL-only
--- look-alike would silently seq-scan every query. So proximity queries here are
--- always written as the two index-served clauses (the same plan the operator
--- expands to under the extension):
---     WHERE tsv @@ proxquery.ts_prox_query(q) AND proxquery.ts_prox_match(tsv, q)
+-- ===========================================================================
+-- Config-aware surface (3-arg overloads)
+-- ===========================================================================
+--
+-- The 2-arg forms above are `simple`-only (literal lexemes). The 3-arg forms take
+-- a `regconfig` so a column built with any text-search config (stemmed, unaccented,
+-- a custom `simple_unaccent`, …) can be matched: each query *term* is resolved
+-- through `to_tsvector(cfg, term)` — the same routine that built the column — so the
+-- recheck agrees with the column and with the `to_tsquery(cfg, …)` skeleton. Globs
+-- and regexes scan the stored lexemes verbatim and stay config-agnostic. These call
+-- the SAME Postgres builtins as the native extension, so the two ports stay in parity.
+
+-- Distinct lexemes a term resolves to under `cfg` (its tokens run through the
+-- config's dictionaries). Empty for a stopword / a term that tokenizes to nothing.
+CREATE OR REPLACE FUNCTION _prox_resolve_lexemes(term text, cfg regconfig) RETURNS text[]
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE
+    SET search_path = proxquery, pg_catalog AS
+$fn$ SELECT coalesce(array_agg(DISTINCT lexeme), '{}'::text[]) FROM unnest(to_tsvector(cfg, term)) $fn$;
+
+-- Rewrite the parsed AST so every term/prefix is resolved to its config lexeme(s),
+-- then evaluate with the unchanged `_prox_eval`. A term → its single lexeme, or an
+-- OR of lexemes (stemmer/thesaurus), or an empty OR (stopword ⇒ matches nothing). A
+-- prefix → its normalized form (so an accented prefix matches the unaccented stored
+-- lexemes, as the skeleton does). Glob/regex are left verbatim (config-agnostic).
+-- Phrase atoms are resolved in place when they yield a single lexeme (the common
+-- case); a phrase atom carries one lexeme, so multi-lexeme atoms are left as-is.
+CREATE OR REPLACE FUNCTION _prox_resolve_ast(node jsonb, cfg regconfig) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
+    SET search_path = proxquery, pg_catalog AS
+$fn$
+DECLARE
+    t    text := node ->> 't';
+    lex  text[];
+    arr  jsonb := '[]'::jsonb;
+    atoms jsonb := '[]'::jsonb;
+    c    jsonb;
+    a    jsonb;
+    i    int;
+BEGIN
+    IF t = 'term' THEN
+        lex := _prox_resolve_lexemes(node ->> 'v', cfg);
+        IF coalesce(array_length(lex, 1), 0) = 0 THEN
+            RETURN jsonb_build_object('t', 'or', 'c', '[]'::jsonb);     -- stopword ⇒ matches nothing
+        ELSIF array_length(lex, 1) = 1 THEN
+            RETURN jsonb_build_object('t', 'term', 'v', lex[1]);
+        ELSE
+            FOR i IN 1 .. array_length(lex, 1) LOOP
+                arr := arr || jsonb_build_array(jsonb_build_object('t', 'term', 'v', lex[i]));
+            END LOOP;
+            RETURN jsonb_build_object('t', 'or', 'c', arr);             -- union of lexeme positions
+        END IF;
+    ELSIF t = 'prefix' THEN
+        lex := _prox_resolve_lexemes(node ->> 'v', cfg);
+        IF array_length(lex, 1) = 1 THEN
+            RETURN jsonb_build_object('t', 'prefix', 'v', lex[1]);
+        ELSE
+            RETURN node;                                               -- 0 or >1 ⇒ raw prefix
+        END IF;
+    ELSIF t IN ('glob', 'regex') THEN
+        RETURN node;                                                   -- scan stored lexemes verbatim
+    ELSIF t = 'phrase' THEN
+        FOR a IN SELECT value FROM jsonb_array_elements(node -> 'atoms') AS x(value) LOOP
+            IF a ->> 't' IN ('term', 'prefix') THEN
+                lex := _prox_resolve_lexemes(a ->> 'v', cfg);
+                IF array_length(lex, 1) = 1 THEN
+                    a := jsonb_build_object('t', a ->> 't', 'v', lex[1]);
+                END IF;
+            END IF;
+            atoms := atoms || jsonb_build_array(a);
+        END LOOP;
+        RETURN jsonb_build_object('t', 'phrase', 'atoms', atoms, 'gaps', node -> 'gaps');
+    ELSIF t IN ('and', 'or') THEN
+        FOR c IN SELECT value FROM jsonb_array_elements(node -> 'c') AS x(value) LOOP
+            arr := arr || jsonb_build_array(_prox_resolve_ast(c, cfg));
+        END LOOP;
+        RETURN jsonb_build_object('t', t, 'c', arr);
+    ELSIF t = 'not' THEN
+        RETURN jsonb_build_object('t', 'not', 'x', _prox_resolve_ast(node -> 'x', cfg));
+    ELSIF t IN ('within', 'notwithin') THEN
+        RETURN jsonb_build_object('t', t,
+            'a', _prox_resolve_ast(node -> 'a', cfg),
+            'b', _prox_resolve_ast(node -> 'b', cfg),
+            'n', node -> 'n', 'ord', node -> 'ord');
+    ELSE
+        RETURN node;
+    END IF;
+END
+$fn$;
+
+-- 3-arg skeleton: lower through the column's config (to_tsquery(cfg, …) normalizes
+-- the lexemes exactly as the recheck's to_tsvector(cfg, term) does).
+CREATE OR REPLACE FUNCTION ts_prox_query(query text, cfg regconfig) RETURNS tsquery
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+    SET search_path = proxquery, pg_catalog AS
+$fn$ SELECT to_tsquery(cfg, ts_prox_query_skeleton(query)) $fn$;
+
+-- 3-arg recheck: resolve terms through cfg, then evaluate.
+CREATE OR REPLACE FUNCTION ts_prox_match(v tsvector, query text, cfg regconfig) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE STRICT
+    SET search_path = proxquery, pg_catalog AS
+$fn$
+DECLARE
+    node jsonb;
+BEGIN
+    node := _prox_resolve_ast(_prox_normalize(_prox_parse(query)), cfg);
+    PERFORM _prox_validate_regexes(node);
+    RETURN _prox_eval(node, v);
+EXCEPTION WHEN OTHERS THEN
+    RAISE EXCEPTION 'ts_prox_match: %', SQLERRM;
+END
+$fn$;
+
+-- NOTE: no `@~@` operator (neither the 2-arg nor the `proxquery(cfg, q)` overload).
+-- The native extension's single indexable operator needs a C planner support
+-- function that cannot be written in SQL; a SQL-only look-alike would silently
+-- seq-scan every query. So proximity queries here are always written as the two
+-- index-served clauses (the same plan the operator expands to under the extension):
+--     WHERE tsv @@ proxquery.ts_prox_query(q [,cfg]) AND proxquery.ts_prox_match(tsv, q [,cfg])

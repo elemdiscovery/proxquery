@@ -22,6 +22,13 @@ The pure-SQL port is ~30–60× slower, so running it on a multi-GiB corpus is n
 practical; the small tier covers the head-to-head comparison + parity, and the
 large tier shows how the extension alone scales.
 
+Each tier's report includes a **phase-timing** table (wall seconds for setup /
+corpus generation / searches) so you can see where the run's time actually went,
+and writes **raw per-query timings** to `bench/reports/results_{small,large}.csv`
+(both uploaded as the workflow artifact). `ext_2cl_ms` (≈ identical to `ext_op_ms`)
+is only timed on the small tier, where it is the denominator of the pure
+`slowdown` ratio.
+
 ## Repeatability
 
 Everything is deterministic given the parameters:

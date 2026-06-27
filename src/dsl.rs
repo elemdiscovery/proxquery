@@ -640,12 +640,110 @@ use crate::proximity;
 use crate::tsvector::TsVector;
 use pgrx::datum::FromDatum;
 use pgrx::pg_sys;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 
-pub fn eval_match(node: &Node, v: &TsVector) -> Result<bool, String> {
+// --- config-aware term resolution -----------------------------------------
+//
+// A query term matches by *lexeme*. Under a non-`simple` text-search config the
+// stored lexemes are normalized (stemmed, unaccented, lowercased by locale, …),
+// so a query term must be run through the SAME config to find them. We resolve
+// `term -> lexeme(s)` via `to_tsvector(cfg, term)` — the exact routine that built
+// the column — so the recheck agrees with the column, and with the
+// `to_tsquery(cfg, …)` skeleton, by construction. `cfg = None` is the historical
+// `simple` fast path (literal byte lookup), kept byte-identical for the 2-arg API.
+
+/// OID of `pg_catalog.to_tsvector(regconfig, text)`, looked up once (builtin, stable
+/// for the backend).
+fn to_tsvector_oid() -> pg_sys::Oid {
+    use std::sync::OnceLock;
+    static OID: OnceLock<pg_sys::Oid> = OnceLock::new();
+    *OID.get_or_init(|| unsafe {
+        let names =
+            pg_sys::stringToQualifiedNameList(c"pg_catalog.to_tsvector".as_ptr(), core::ptr::null_mut());
+        let argtypes = [pg_sys::REGCONFIGOID, pg_sys::TEXTOID];
+        pg_sys::LookupFuncName(names, 2, argtypes.as_ptr(), false)
+    })
+}
+
+/// Cache of a term's resolved lexemes (`Rc` so the hot path clones a refcount, not
+/// the Vec). Nested `config -> term -> lexemes` so a cache hit looks the term up by
+/// `&str` (no per-row `String` allocation); the owned key is built only on a miss.
+type ResolveCache = HashMap<pg_sys::Oid, HashMap<String, Rc<Vec<Vec<u8>>>>>;
+
+thread_local! {
+    // Resolution is per-row in the recheck but `(cfg, term)` repeats across rows of
+    // a scan, so memoize. Bounded by the query vocabulary.
+    static RESOLVE_CACHE: RefCell<ResolveCache> = RefCell::new(HashMap::new());
+}
+
+/// Distinct lexemes of `to_tsvector(cfg, term)` (the term run through the config's
+/// dictionaries). Empty when the term is a stopword / tokenizes to nothing.
+fn resolve_lexemes(cfg: pg_sys::Oid, term: &str) -> Rc<Vec<Vec<u8>>> {
+    if let Some(hit) =
+        RESOLVE_CACHE.with(|m| m.borrow().get(&cfg).and_then(|inner| inner.get(term)).cloned())
+    {
+        return hit;
+    }
+    let lexemes = unsafe {
+        let text = pg_sys::cstring_to_text_with_len(
+            term.as_ptr() as *const core::ffi::c_char,
+            term.len() as i32,
+        );
+        let datum = pg_sys::OidFunctionCall2Coll(
+            to_tsvector_oid(),
+            pg_sys::InvalidOid,
+            pg_sys::Datum::from(cfg),
+            pg_sys::Datum::from(text),
+        );
+        match TsVector::from_polymorphic_datum(datum, false, pg_sys::TSVECTOROID) {
+            Some(tsv) => tsv.all_lexemes(),
+            None => Vec::new(),
+        }
+    };
+    let rc = Rc::new(lexemes);
+    RESOLVE_CACHE
+        .with(|m| m.borrow_mut().entry(cfg).or_default().insert(term.to_owned(), Rc::clone(&rc)));
+    rc
+}
+
+/// Positions of a term resolved under `cfg`: the union over its lexeme(s) (a
+/// stemmer/thesaurus may emit several, treated like an OR of co-located synonyms).
+fn term_positions_cfg(cfg: pg_sys::Oid, term: &str, v: &TsVector) -> Vec<i32> {
+    let lexemes = resolve_lexemes(cfg, term);
+    match lexemes.as_slice() {
+        [] => Vec::new(),
+        [one] => v.positions(one),
+        many => {
+            let mut all = Vec::new();
+            for l in many {
+                all.extend(v.positions(l));
+            }
+            all.sort_unstable();
+            all.dedup();
+            all
+        }
+    }
+}
+
+/// The prefix to scan for a `Prefix` node under `cfg` — the prefix text normalized
+/// through the config (so an accented prefix matches the unaccented stored lexemes,
+/// matching what `to_tsquery(cfg, 'p':*)` selects). Falls back to the raw prefix when
+/// the config yields zero or several lexemes.
+fn prefix_norm_cfg(cfg: pg_sys::Oid, p: &str) -> Vec<u8> {
+    let lexemes = resolve_lexemes(cfg, p);
+    match lexemes.as_slice() {
+        [one] => one.clone(),
+        _ => p.as_bytes().to_vec(),
+    }
+}
+
+pub fn eval_match(node: &Node, v: &TsVector, cfg: Option<pg_sys::Oid>) -> Result<bool, String> {
     Ok(match node {
         Node::And(children) => {
             for c in children {
-                if !eval_match(c, v)? {
+                if !eval_match(c, v, cfg)? {
                     return Ok(false);
                 }
             }
@@ -653,15 +751,15 @@ pub fn eval_match(node: &Node, v: &TsVector) -> Result<bool, String> {
         }
         Node::Or(children) => {
             for c in children {
-                if eval_match(c, v)? {
+                if eval_match(c, v, cfg)? {
                     return Ok(true);
                 }
             }
             false
         }
-        Node::Not(x) => !eval_match(x, v)?,
+        Node::Not(x) => !eval_match(x, v, cfg)?,
         Node::Within { a, b, n, ordered } => {
-            let (pa, pb) = (positions(a, v)?, positions(b, v)?);
+            let (pa, pb) = (positions(a, v, cfg)?, positions(b, v, cfg)?);
             if *ordered {
                 proximity::pre(&pa, &pb, *n)
             } else {
@@ -669,18 +767,26 @@ pub fn eval_match(node: &Node, v: &TsVector) -> Result<bool, String> {
             }
         }
         Node::NotWithin { a, b, n, ordered } => {
-            proximity::not_within(&positions(a, v)?, &positions(b, v)?, *n, *ordered)
+            proximity::not_within(&positions(a, v, cfg)?, &positions(b, v, cfg)?, *n, *ordered)
         }
         Node::Term(_) | Node::Prefix(_) | Node::Glob { .. } | Node::Regex(_) | Node::Phrase { .. } => {
-            !positions(node, v)?.is_empty()
+            !positions(node, v, cfg)?.is_empty()
         }
     })
 }
 
-fn positions(node: &Node, v: &TsVector) -> Result<Vec<i32>, String> {
+fn positions(node: &Node, v: &TsVector, cfg: Option<pg_sys::Oid>) -> Result<Vec<i32>, String> {
     Ok(match node {
-        Node::Term(t) => v.positions(t.as_bytes()),
-        Node::Prefix(p) => v.positions_prefix(p.as_bytes()),
+        // Term/Prefix resolve through the config (when one is given); glob/regex
+        // scan the *stored* lexemes verbatim and are config-agnostic by design.
+        Node::Term(t) => match cfg {
+            Some(c) => term_positions_cfg(c, t, v),
+            None => v.positions(t.as_bytes()),
+        },
+        Node::Prefix(p) => match cfg {
+            Some(c) => v.positions_prefix(&prefix_norm_cfg(c, p)),
+            None => v.positions_prefix(p.as_bytes()),
+        },
         Node::Glob { glob, prefix } => v.positions_matching(prefix.as_bytes(), |lex| glob_match(glob, lex)),
         Node::Regex(pattern) => {
             // Patterns are validated up front (see `validate_regexes`), so by the
@@ -688,19 +794,21 @@ fn positions(node: &Node, v: &TsVector) -> Result<Vec<i32>, String> {
             let re = unsafe { Regexp::compile(pattern) };
             v.positions_matching(b"", |lex| unsafe { re.is_match(lex) })
         }
-        Node::Phrase { atoms, gaps } => phrase_positions(atoms, gaps, v),
+        Node::Phrase { atoms, gaps } => phrase_positions(atoms, gaps, v, cfg),
         Node::Or(children) => {
             let mut all = Vec::new();
             for c in children {
-                all.extend(positions(c, v)?);
+                all.extend(positions(c, v, cfg)?);
             }
             all.sort_unstable();
             all.dedup();
             all
         }
-        Node::Within { a, b, n, ordered } => within_span(&positions(a, v)?, &positions(b, v)?, *n, *ordered),
+        Node::Within { a, b, n, ordered } => {
+            within_span(&positions(a, v, cfg)?, &positions(b, v, cfg)?, *n, *ordered)
+        }
         Node::NotWithin { a, b, n, ordered } => {
-            not_within_participants(&positions(a, v)?, &positions(b, v)?, *n, *ordered)
+            not_within_participants(&positions(a, v, cfg)?, &positions(b, v, cfg)?, *n, *ordered)
         }
         Node::And(_) | Node::Not(_) => {
             return Err("AND/NOT cannot be a proximity operand (normalization should have lifted it)".into())
@@ -791,19 +899,25 @@ fn glob_match(pattern: &str, lexeme: &[u8]) -> bool {
     pi == p.len()
 }
 
-fn atom_positions(a: &Atom, v: &TsVector) -> Vec<i32> {
+fn atom_positions(a: &Atom, v: &TsVector, cfg: Option<pg_sys::Oid>) -> Vec<i32> {
     match a {
-        Atom::Term(t) => v.positions(t.as_bytes()),
-        Atom::Prefix(p) => v.positions_prefix(p.as_bytes()),
+        Atom::Term(t) => match cfg {
+            Some(c) => term_positions_cfg(c, t, v),
+            None => v.positions(t.as_bytes()),
+        },
+        Atom::Prefix(p) => match cfg {
+            Some(c) => v.positions_prefix(&prefix_norm_cfg(c, p)),
+            None => v.positions_prefix(p.as_bytes()),
+        },
         Atom::Glob { glob, prefix } => v.positions_matching(prefix.as_bytes(), |lex| glob_match(glob, lex)),
     }
 }
 
 /// End positions of an exact-gap sequence: `atoms[i+1]` exactly `gaps[i]` after `atoms[i]`.
-fn phrase_positions(atoms: &[Atom], gaps: &[i32], v: &TsVector) -> Vec<i32> {
-    let mut reach = atom_positions(&atoms[0], v);
+fn phrase_positions(atoms: &[Atom], gaps: &[i32], v: &TsVector, cfg: Option<pg_sys::Oid>) -> Vec<i32> {
+    let mut reach = atom_positions(&atoms[0], v, cfg);
     for (atom, &g) in atoms[1..].iter().zip(gaps) {
-        let cur = atom_positions(atom, v);
+        let cur = atom_positions(atom, v, cfg);
         reach = cur.into_iter().filter(|&c| reach.binary_search(&(c - g)).is_ok()).collect();
         if reach.is_empty() {
             break;

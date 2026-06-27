@@ -99,4 +99,19 @@ INSERT INTO _prox_match(label, doc, query, expected) VALUES
   ('span2',$d$a 2 b 4 5 c$d$,                          $q$(a <~5> c) <~2> b$q$,                  $x$true$x$),
   ('span3',$d$a x c x x g x x x a x c$d$,              $q$(a <~2> c) <~1> g$q$,                  $x$false$x$),
   ('span4',$d$a x c x x g x x x a x c$d$,              $q$(a <~2> c) <~1> x$q$,                  $x$true$x$),
-  ('chstrict',$d$one two three four five six seven orange nine apple eleven banana$d$, $q$apple <~2> banana <~2> orange$q$, $x$true$x$);
+  ('chstrict',$d$one two three four five six seven orange nine apple eleven banana$d$, $q$apple <~2> banana <~2> orange$q$, $x$true$x$),
+  -- non-ASCII: accented Latin and CJK. Locale-INDEPENDENT (no uppercase to case-fold),
+  -- so they agree on any CI collation. Two things are deliberately NOT asserted here
+  -- because their tokenization is locale-dependent (see docs/CONFIG_AWARE.md):
+  -- uppercase-accent case-folding, and emoji (a token under C, dropped under en_US.UTF-8).
+  ('u1',  $d$le café est bon$d$,                     $q$café$q$,                                $x$true$x$),
+  ('u2',  $d$le café est bon$d$,                     $q$café <~2> bon$q$,                       $x$true$x$),
+  ('u3',  $d$le café est bon$d$,                     $q$café <~1> bon$q$,                       $x$false$x$),
+  ('u4',  $d$résumé and resume$d$,                   $q$résumé$q$,                              $x$true$x$),
+  ('u5',  $d$plain resume here$d$,                   $q$résumé$q$,                              $x$false$x$),
+  ('u6',  $d$el niño pequeño$d$,                     $q$niño$q$,                                $x$true$x$),
+  ('u7',  $d$el niño pequeño$d$,                     $q$nino$q$,                                $x$false$x$),
+  ('u8',  $d$中文 文档 搜索$d$,                        $q$中文$q$,                                 $x$true$x$),
+  ('u9',  $d$中文 文档 搜索$d$,                        $q$中文 <~2> 搜索$q$,                       $x$true$x$),
+  ('u10', $d$中文 文档 搜索$d$,                        $q$中文 <~1> 搜索$q$,                       $x$false$x$),
+  ('u11', $d$日本語$d$,                               $q$日本$q$,                                 $x$false$x$);
