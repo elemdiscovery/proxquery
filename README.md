@@ -49,7 +49,7 @@ SELECT * FROM docs WHERE proxquery.ts_prox_search(body_tsv, 'quick <~3> fox');
 
 The `ts_prox_search` function relies on the query planner inlining the underlying function. I recommend testing your actual application usage with `EXPLAIN` to ensure it works as expected, and move the function logic into your application if necessary.
 
-The practical difference is that the pure SQL implementation is much, much slower for the scenarios that aren't supported in standard syntax. There are some [unnecessarily complex benchmarks](https://github.com/elemdiscovery/proxquery/actions/workflows/benchmark.yml) breaking down performance differences by query type.
+The practical difference is that the pure SQL implementation is much, much slower for the scenarios that require parsing the stored `ts_vector`. There are some [unnecessarily complex benchmarks](https://github.com/elemdiscovery/proxquery/actions/workflows/benchmark.yml) breaking down performance differences by query type.
 
 The intended usage of the `.sql` file is that you can install it using your usual migration process. Updates (if desired) would be done by full replacement in another migration.
 

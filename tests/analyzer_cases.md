@@ -108,7 +108,7 @@ Per-character CJK segmentation.
 ## Compatibility folding (NFKC)
 
 The index superimposes an NFKC-folded variant, and the query side folds to it too, so a
-fullwidth / half-width / Roman-numeral spelling matches its ASCII/normal equivalent either
+full-width / half-width / Roman-numeral spelling matches its ASCII/normal equivalent either
 direction. Non-ASCII digits are NOT compatibility-equivalent, so they stay distinct (the
 NFKC boundary).
 
