@@ -161,3 +161,14 @@ EXPLAIN (COSTS off, TIMING off, SUMMARY off)
 SELECT count(*) FROM bench
 WHERE body_tsv @@ proxquery.ts_prox_query('a <~3> b')
   AND proxquery.ts_prox_match(body_tsv, 'a <~3> b');
+
+-- The @~@ operator on a within/pre shape must be served the SAME way: the planner
+-- support keeps the selective `a & b` presence skeleton as the Index Cond + the `@~@`
+-- positional recheck as the heap Filter. (It must NOT rewrite the clause to the native
+-- `<~>` OR-expansion, which is non-selective and the planner mis-estimates into a seq
+-- scan — the within pessimization. Only phrase/exact/boolean are rewritten to a bare
+-- native `@@` that drops the recheck.) Expect: Bitmap Index Scan on `ts_prox_query(...)`.
+\echo ''
+\echo '== plan: the @~@ operator (within) is index-served via the a&b skeleton, NOT a seq scan =='
+EXPLAIN (COSTS off, TIMING off, SUMMARY off)
+SELECT count(*) FROM bench WHERE body_tsv @~@ 'a <~3> b';

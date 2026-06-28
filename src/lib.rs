@@ -100,9 +100,12 @@ CREATE FUNCTION ts_prox_query(query text) RETURNS tsquery
 /// the positional recheck for a query that maps cleanly onto native `tsquery` phrase
 /// operators (bounded within/pre/phrase over plain terms — see
 /// [`dsl::native_tsquery_string`]), or NULL when the query isn't native-expressible.
-/// This is the expansion the `@~@` planner support rewrites a constant query to (the
-/// support fn folds it to a tsquery constant itself); exposed so one can check whether
-/// — and to what — a query pushes down (`SELECT ts_prox_query_native('a <~3> b')`).
+/// This is the recheck-dropping form the pure-SQL port and `ts_prox_match`'s native
+/// fast-path use; exposed so one can check whether — and to what — a query pushes down
+/// (`SELECT ts_prox_query_native('a <~3> b')`). NOTE: the `@~@` planner support only
+/// *rewrites a constant clause* to this for phrase/exact/boolean shapes; `within`/`pre`
+/// keep the selective `a & b` skeleton + recheck instead (see
+/// [`dsl::simplify_tsquery_string`]), even though they stay native-expressible here.
 #[pg_extern(immutable, parallel_safe, strict)]
 fn ts_prox_query_native_string(query: &str) -> Option<String> {
     dsl::native_tsquery_string(query)
@@ -892,19 +895,38 @@ mod tests {
                IF line LIKE pat THEN hit := true; END IF; END LOOP; RETURN hit; END $$ LANGUAGE plpgsql",
         ).unwrap();
 
-        // Native (Δ ≤ 32): the `@~@` clause is rewritten to a plain `tsv @@ <tsquery>`
-        // (a folded phrase literal), so the GIN index serves it and the positional
-        // recheck is gone entirely — no `@~@`, no `ts_prox_match`.
-        assert!(b("SELECT plan_has('a <~2> b', '%Bitmap Index Scan%')"), "native must be index-served");
-        assert!(!b("SELECT plan_has('a <~2> b', '%@~@%')"), "native must drop the @~@ recheck");
-        assert!(!b("SELECT plan_has('a <~2> b', '%ts_prox_match%')"), "native must drop the ts_prox_match recheck");
+        // Native AND selective (phrase / exact `<N>` / boolean): the `@~@` clause is
+        // rewritten to a plain `tsv @@ <tsquery>` (a folded phrase literal), so the GIN
+        // index serves it and the positional recheck is gone entirely — no `@~@`, no
+        // `ts_prox_match`. `a <2> b` is the near docs' exact gap (a@1 b@3) ⇒ 200 rows.
+        assert!(b("SELECT plan_has('a <2> b', '%Bitmap Index Scan%')"), "exact <N> must be index-served");
+        assert!(!b("SELECT plan_has('a <2> b', '%@~@%')"), "exact <N> must drop the @~@ recheck");
+        assert!(!b("SELECT plan_has('a <2> b', '%ts_prox_match%')"), "exact <N> must drop the ts_prox_match recheck");
+        let ph = Spi::get_one::<i64>("SELECT count(*) FROM nt WHERE tsv @~@ 'a <2> b'").unwrap().unwrap();
+        let phre = Spi::get_one::<i64>("SELECT count(*) FROM nt WHERE ts_prox_match(tsv, 'a <2> b')").unwrap().unwrap();
+        assert_eq!(ph, 200);
+        assert_eq!(ph, phre);
+
+        // within/pre (`<~N>` / `<-N>`) are native-EXPRESSIBLE, but their native form is an
+        // OR over exact gaps — NOT a selective index probe. `simplify` must therefore NOT
+        // rewrite the clause to it (that would make the OR-of-phrases the sole index
+        // driver, which the planner mis-estimates into a seq scan). within/pre instead
+        // keep the selective presence skeleton `tsv @@ ts_prox_query('a <~2> b')` (= a & b)
+        // plus the `@~@` positional recheck — index-served and exact. Regression guard for
+        // the within seq-scan pessimization.
+        assert!(b("SELECT plan_has('a <~2> b', '%Bitmap Index Scan%')"), "within must stay index-served via the skeleton");
+        assert!(b("SELECT plan_has('a <~2> b', '%@~@%')"), "within must keep the @~@ recheck (not the native rewrite)");
+        assert!(b("SELECT plan_has('a <~2> b', '%ts_prox_query(%')"), "within must drive the index with the a&b skeleton");
+        // (`ts_prox_query(` + `@~@` present ⇒ index_condition path; the native rewrite
+        // would instead fold to a bare `@@ <const tsquery>` with neither marker.)
         // …and it still returns exactly the recheck's rows (the near docs only).
         let op = Spi::get_one::<i64>("SELECT count(*) FROM nt WHERE tsv @~@ 'a <~2> b'").unwrap().unwrap();
         let re = Spi::get_one::<i64>("SELECT count(*) FROM nt WHERE ts_prox_match(tsv, 'a <~2> b')").unwrap().unwrap();
         assert_eq!(op, 200);
         assert_eq!(op, re);
 
-        // Fallback (Δ > 32): the `@~@` recheck is kept, over the presence skeleton.
+        // Fallback (Δ > 32): identical plan shape to the bounded within above — the `@~@`
+        // recheck is kept over the presence skeleton (within never takes the native rewrite).
         assert!(b("SELECT plan_has('a <~40> b', '%@~@%')"), "fallback must keep the @~@ recheck");
         assert!(b("SELECT plan_has('a <~40> b', '%ts_prox_query(%')"), "fallback uses the presence skeleton");
         let op40 = Spi::get_one::<i64>("SELECT count(*) FROM nt WHERE tsv @~@ 'a <~40> b'").unwrap().unwrap();
