@@ -1,0 +1,106 @@
+# proxquery analyzer operator corpus
+
+Extension-only: exercises the full DSL operator surface under the custom tokenizer.
+Loaded by `corpus::load_analyzer_ops`; run by the `analyzer_operator_corpus` `#[pg_test]`,
+which asserts, for every row, that the `proxquery_match` recheck equals `expected`, and
+for every distinct query that the GIN-indexed `@~@` result equals the bare recheck
+(probe soundness) and that the plan uses the index when the query carries a key.
+
+The parity corpus (`tests/parity_cases.md`) already covers every operator under the
+stock cfg/literal resolvers; this is the analyzer-resolver counterpart — its point is
+the operators that have analyzer-specific resolution (globs/prefix fold through the
+analyzer; regex scans the superimposed lexemes; the index probe lowering for every
+operator) and their interaction with superimposition.
+
+Conventions: each value is backticked; a literal `|` (OR) is escaped `\|`. `expected`
+is `true`/`false`.
+
+## Boolean — AND / OR / NOT / grouping
+
+`prox_icu` superimposes `café` → `café` + `cafe`, so a bare term is accent-insensitive
+and a `'literal'` is exact (these rows pin both inside boolean operators).
+
+| label | analyzer | doc | query | expected |
+| --- | --- | --- | --- | --- |
+| `or_hit` | `prox_icu` | `un café noir` | `cafe \| zzz` | `true` |
+| `or_miss` | `prox_icu` | `un thé noir` | `cafe \| zzz` | `false` |
+| `or_lit` | `prox_icu` | `un cafe noir` | `'café' \| noir` | `true` |
+| `or_lit_miss` | `prox_icu` | `un cafe noir` | `'café' \| zzz` | `false` |
+| `and_hit` | `prox_icu` | `un café noir` | `cafe & noir` | `true` |
+| `and_miss` | `prox_icu` | `un café noir` | `cafe & zzz` | `false` |
+| `not_hit` | `prox_icu` | `un café noir` | `noir & !zzz` | `true` |
+| `not_miss` | `prox_icu` | `un café noir` | `noir & !cafe` | `false` |
+| `not_lit` | `prox_icu` | `un cafe noir` | `noir & !'café'` | `true` |
+| `not_lit2` | `prox_icu` | `un café noir` | `noir & !'café'` | `false` |
+| `group` | `prox_icu` | `un café noir` | `(zzz \| cafe) & noir` | `true` |
+
+## Proximity — distance / within / ordered / not-within
+
+Plain ASCII docs (no superimposition) so the position arithmetic is unambiguous:
+`alpha beta gamma delta` → `alpha`:1 `beta`:2 `gamma`:3 `delta`:4.
+
+| label | analyzer | doc | query | expected |
+| --- | --- | --- | --- | --- |
+| `dist_hit` | `prox_icu` | `alpha beta gamma delta` | `alpha <2> gamma` | `true` |
+| `dist_miss` | `prox_icu` | `alpha beta gamma delta` | `alpha <1> gamma` | `false` |
+| `pre_hit` | `prox_icu` | `alpha beta gamma delta` | `alpha <-2> gamma` | `true` |
+| `pre_rev` | `prox_icu` | `alpha beta gamma delta` | `gamma <-2> alpha` | `false` |
+| `within_hit` | `prox_icu` | `alpha beta gamma delta` | `gamma <~2> alpha` | `true` |
+| `within_miss` | `prox_icu` | `alpha beta gamma delta` | `alpha <~1> gamma` | `false` |
+| `nw_hit` | `prox_icu` | `alpha x x x beta` | `alpha <!~2> beta` | `true` |
+| `nw_miss` | `prox_icu` | `alpha beta` | `alpha <!~2> beta` | `false` |
+| `nwo_hit` | `prox_icu` | `alpha x x x beta` | `alpha <!-2> beta` | `true` |
+| `nwo_miss` | `prox_icu` | `alpha beta` | `alpha <!-2> beta` | `false` |
+
+## Phrases
+
+A bare phrase is accent-insensitive (`"cafe noir"` matches the superimposed `café`).
+
+| label | analyzer | doc | query | expected |
+| --- | --- | --- | --- | --- |
+| `phrase_hit` | `prox_icu` | `un café noir` | `"café noir"` | `true` |
+| `phrase_miss` | `prox_icu` | `café x noir` | `"café noir"` | `false` |
+| `phrase_fold` | `prox_icu` | `un café noir` | `"cafe noir"` | `true` |
+| `phrase_quote_inert` | `prox_icu` | `un cafe noir` | `"'café' noir"` | `true` |
+
+## Globs / prefix — fold through the analyzer
+
+| label | analyzer | doc | query | expected |
+| --- | --- | --- | --- | --- |
+| `prefix_hit` | `prox_icu` | `un café noir` | `caf*` | `true` |
+| `prefix_miss` | `prox_icu` | `un thé noir` | `caf*` | `false` |
+| `prefix_and` | `prox_icu` | `un café noir` | `caf* & noir` | `true` |
+| `suffix` | `prox_icu` | `un café noir` | `*oir` | `true` |
+| `infix` | `prox_icu` | `un café noir` | `n*r` | `true` |
+| `single` | `prox_icu` | `un café noir` | `noi?` | `true` |
+| `single_miss` | `prox_icu` | `un café noir` | `no?` | `false` |
+
+## Regex — scans the (superimposed) lexemes
+
+Paired with a companion term so the probe carries an index key. Patterns are anchored
+to the WHOLE lexeme (`^(?:…)$`), so `caf.*` matches the superimposed `café`/`cafe`.
+
+| label | analyzer | doc | query | expected |
+| --- | --- | --- | --- | --- |
+| `regex_hit` | `prox_icu` | `un café noir` | `noir & ##caf.*##` | `true` |
+| `regex_miss` | `prox_icu` | `un café noir` | `noir & ##zzz.*##` | `false` |
+
+## Accent-sensitive analyzer (`prox_icu_accent`)
+
+No superimposition: `café` ≠ `cafe` on both sides.
+
+| label | analyzer | doc | query | expected |
+| --- | --- | --- | --- | --- |
+| `acc_miss` | `prox_icu_accent` | `un café noir` | `cafe` | `false` |
+| `acc_hit` | `prox_icu_accent` | `un café noir` | `café` | `true` |
+| `acc_prefix` | `prox_icu_accent` | `un café noir` | `caf*` | `true` |
+| `acc_or` | `prox_icu_accent` | `un café noir` | `cafe \| café` | `true` |
+
+## Unicode-segmentation analyzer (`prox_unicode`)
+
+Per-character CJK segmentation.
+
+| label | analyzer | doc | query | expected |
+| --- | --- | --- | --- | --- |
+| `uni_term` | `prox_unicode` | `中文 文档` | `中` | `true` |
+| `uni_and` | `prox_unicode` | `中文 文档` | `中 & 档` | `true` |

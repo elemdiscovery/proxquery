@@ -1,15 +1,15 @@
 -- proxquery — differential parity test (extension vs pure port)
 -- =============================================================
--- Runs every case in the shared corpus (_prox_cases, from proxquery_cases.sql)
--- against BOTH implementations in one session and asserts they agree with each
--- other and with the expected value:
+-- Runs every case in the shared corpus (the temp tables _prox_cases / _prox_match /
+-- _prox_cfg_match) against BOTH implementations in one session and asserts they agree
+-- with each other and with the expected value:
 --     ext == expected  AND  pure == expected  AND  ext == pure
--- so the two implementations cannot silently drift. Unlike the golden self-test
--- (proxquery_pure_test.sql), there is no single oracle — each implementation is
--- also the other's oracle.
+-- so the two implementations cannot silently drift. There is no single oracle — each
+-- implementation is also the other's oracle.
 --
 -- Requires, in the same session:
---   * the shared corpus loaded   (\i proxquery_cases.sql)
+--   * the shared corpus loaded   (the markdown spec tests/parity_cases.md, parsed and
+--                                 loaded by `parity_spec::load_corpus` in the Rust test)
 --   * the native extension       (CREATE EXTENSION proxquery — any schema)
 --   * the pure-SQL port          (\i proxquery_pure.sql — schema `proxquery`)
 
@@ -64,7 +64,7 @@ BEGIN
         END IF;
     END LOOP;
 
-    -- Structured match cases (proxquery_match_cases.sql): derive the recheck expr
+    -- Structured match cases (the `match` table of the spec): derive the recheck expr
     -- from the (doc, query) tuple; `format` quotes both robustly.
     FOR mr IN SELECT label, doc, query, expected FROM pg_temp._prox_match ORDER BY label LOOP
         n := n + 1;
@@ -79,7 +79,7 @@ BEGIN
         END IF;
     END LOOP;
 
-    -- Config-aware cases (proxquery_config_cases.sql, if loaded): the 3-arg recheck
+    -- Config-aware cases (the `config` table of the spec, if loaded): the 3-arg recheck
     -- under each row's config, on both implementations, plus the soundness invariant —
     -- a `true` recheck whose query carries an index key must be selected by the probe
     -- too (recheck ⟹ probe). A bare leading-wildcard glob has no positive key, so

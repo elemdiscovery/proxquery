@@ -206,13 +206,14 @@ ergonomic; same plan).
 
 ## Parity with the extension
 
-[sql/proxquery_pure_test.sql](../sql/proxquery_pure_test.sql) asserts an install
-against 123 known-good values drawn from the extension's own `#[pg_test]` suite
-(boolean predicates, exact skeleton strings, index selection, recheck, compound
-operands, grouping semantics, and malformed-input errors). It uses only the
-portable surface (the `ts_prox_*` functions and the two-clause form), so **the
-same suite passes against either implementation** — the pure port, or the
-extension installed into the same schema.
+The shared parity corpus lives in [tests/parity_cases.md](../tests/parity_cases.md) —
+a human-readable markdown spec of `(input → expected)` cases (boolean predicates,
+exact skeleton strings, index selection, recheck, compound operands, grouping
+semantics, and malformed-input errors). The differential runner
+([sql/proxquery_diff_test.sql](../sql/proxquery_diff_test.sql)) parses it and asserts
+every case agrees three ways — **extension == pure port == expected** — using only the
+portable surface (the `ts_prox_*` functions and the two-clause form), so neither
+implementation can silently drift from the other.
 
 During development the two were also run side-by-side on a live Postgres: the
 full curated battery plus ~15,000 randomized DSL queries and ~4,800 randomized

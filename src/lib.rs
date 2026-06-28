@@ -7,9 +7,12 @@
 
 use pgrx::prelude::*;
 
+#[cfg(any(test, feature = "pg_test"))]
+mod corpus;
 mod dsl;
 mod proximity;
 mod support;
+mod tokenizer;
 mod tsvector;
 
 use pgrx::datum::Internal;
@@ -141,7 +144,7 @@ fn ts_prox_match(v: TsVector, query: &str) -> bool {
         Ok(n) => n,
         Err(e) => error!("ts_prox_match: {e}"),
     };
-    match dsl::eval_match(&node, &v, None) {
+    match dsl::eval_match(&node, &v, dsl::Resolver::Literal) {
         Ok(m) => m,
         Err(e) => error!("ts_prox_match: {e}"),
     }
@@ -160,10 +163,56 @@ fn ts_prox_match_cfg(v: TsVector, query: &str, cfg: pgrx::pg_sys::Oid) -> bool {
         Ok(n) => n,
         Err(e) => error!("ts_prox_match: {e}"),
     };
-    match dsl::eval_match(&node, &v, Some(cfg)) {
+    match dsl::eval_match(&node, &v, dsl::Resolver::Cfg(cfg)) {
         Ok(m) => m,
         Err(e) => error!("ts_prox_match: {e}"),
     }
+}
+
+/// Analyzer-aware recheck: resolve each query atom through the named custom Unicode
+/// tokenizer so a query matches a column built with `proxquery_to_tsvector(body,
+/// analyzer)` — the query side of that symmetry (a query `café` folds to the same
+/// superimposed `café`/`cafe` the indexer stored). Extension-only; the pure-SQL port
+/// can't run the Rust tokenizer.
+#[pg_extern(immutable, parallel_safe)]
+fn proxquery_match(v: TsVector, query: &str, analyzer: &str) -> bool {
+    let kind = match crate::tokenizer::AnalyzerKind::from_name(analyzer) {
+        Some(k) => k,
+        None => error!("proxquery_match: unknown analyzer '{analyzer}'"),
+    };
+    let node = match cached_ast(query) {
+        Ok(n) => n,
+        Err(e) => error!("proxquery_match: {e}"),
+    };
+    match dsl::eval_match(&node, &v, dsl::Resolver::Analyzer(kind)) {
+        Ok(m) => m,
+        Err(e) => error!("proxquery_match: {e}"),
+    }
+}
+
+/// Analyzer-aware index probe: the lexeme-presence tsquery with each term resolved
+/// through the analyzer (symmetric with `proxquery_to_tsvector`). Returns the
+/// tsquery *text*; the SQL `ts_prox_query(proxquery)` wrapper casts it `::tsquery`
+/// (tsqueryin takes the quoted lexemes verbatim — no re-tokenization). The generic
+/// `@~@` support fn then injects `tsv @@ ts_prox_query(proxquery)` as the GIN
+/// index condition.
+#[pg_extern(immutable, parallel_safe, strict)]
+fn proxquery_build_query(query: &str, analyzer: &str) -> String {
+    let kind = match crate::tokenizer::AnalyzerKind::from_name(analyzer) {
+        Some(k) => k,
+        None => error!("proxquery_query: unknown analyzer '{analyzer}'"),
+    };
+    match dsl::analyzer_tsquery_string(query, kind) {
+        Ok(s) => s,
+        Err(e) => error!("proxquery_query: {e}"),
+    }
+}
+
+/// True if `src` names a proxquery analyzer (vs a stock `regconfig`) — the dispatch
+/// key for the unified `proxquery(src, q)` operand.
+#[pg_extern(immutable, parallel_safe, strict)]
+fn proxquery_is_analyzer(src: &str) -> bool {
+    crate::tokenizer::AnalyzerKind::from_name(src).is_some()
 }
 
 // The single-clause surface: `text_tsv @~@ 'a <~5> b'`. For now it is `ts_prox_match`
@@ -204,14 +253,18 @@ pgrx::extension_sql!(
     requires = [ts_prox_match, ts_prox_query_support],
 );
 
-// --- config-aware surface: 3-arg overloads + the @~@ proxquery(cfg, q) operator ---
+// --- the @~@ operand: one `proxquery(src, q)` for both regconfig and analyzer ------
 //
-// The 3-arg `ts_prox_query`/`ts_prox_match` are the explicit-config two-clause form
-// (always index-served, like the 2-arg). The `@~@` operator can't take a third arg,
-// so the config rides in a typed right operand: `tsv @~@ proxquery(cfg, q)`. A second
-// `@~@` over the `proxquery` composite keeps one operator symbol; its support fn
-// (shared with the 2-arg) rewrites it to `tsv @@ ts_prox_query(proxquery)` for the GIN
-// index. `simple`-config callers keep using the plain `text` operator unchanged.
+// The 3-arg `ts_prox_query`/`ts_prox_match(…, regconfig)` are the explicit-config
+// two-clause form (mirrored by the pure-SQL port). The `@~@` operator can't take a
+// third arg, so the normalization SOURCE rides in one typed operand: `proxquery(src, q)`,
+// where `src` names EITHER a stock `regconfig` OR a custom analyzer. The operand's
+// `ts_prox_query`/`ts_prox_match` dispatch on `src` (`proxquery_is_analyzer`): an
+// analyzer resolves through the Rust tokenizer, anything else through
+// `to_tsvector(src::regconfig, …)`. So `tsv @~@ proxquery('english', q)` and
+// `tsv @~@ proxquery('prox_icu', q)` are spelled identically. The generic support fn
+// rewrites `tsv @~@ proxquery(...)` to `tsv @@ ts_prox_query(proxquery)` for the GIN
+// index (`q` is attr 2, where the support fn's keyless guard reads it).
 pgrx::extension_sql!(
     r#"
 -- 3-arg recheck: regconfig cast to oid for the internal (regconfig is an oid alias).
@@ -219,26 +272,35 @@ CREATE FUNCTION ts_prox_match(v tsvector, query text, cfg regconfig) RETURNS boo
     LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
     AS $$ SELECT ts_prox_match_cfg($1, $2, $3::oid) $$;
 
--- The typed right operand for @~@: a (config, query) pair.
-CREATE TYPE proxquery AS (cfg regconfig, q text);
+-- The typed right operand for @~@: a (source, query) pair. `src` is a regconfig name
+-- or a proxquery analyzer name.
+CREATE TYPE proxquery AS (src text, q text);
 
-CREATE FUNCTION proxquery(cfg regconfig, q text) RETURNS proxquery
+CREATE FUNCTION proxquery(src text, q text) RETURNS proxquery
     LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$ SELECT ROW($1, $2)::proxquery $$;
 
--- Skeleton + recheck over the typed operand. The support fn injects
--- `ts_prox_query(proxquery)` as the GIN index condition, deconstructing the pair
--- inside this IMMUTABLE function (so it constant-folds at plan time).
+-- Probe over the operand: an analyzer builds a resolved tsquery (Rust, cast verbatim);
+-- a regconfig lowers through to_tsquery. SQL + CASE so it const-folds at plan time and
+-- only the taken branch runs (no spurious regconfig cast for an analyzer name).
 CREATE FUNCTION ts_prox_query(pq proxquery) RETURNS tsquery
     LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
-    AS $$ SELECT to_tsquery(($1).cfg, ts_prox_query_skeleton(($1).q)) $$;
+    AS $$ SELECT CASE WHEN proxquery_is_analyzer((pq).src)
+                      THEN proxquery_build_query((pq).q, (pq).src)::tsquery
+                      ELSE to_tsquery((pq).src::regconfig, ts_prox_query_skeleton((pq).q))
+                 END $$;
 
--- plpgsql (not sql) so the planner does NOT inline the operator into a bare
--- ts_prox_match_cfg() call — inlining would strip the @~@ OpExpr and bypass the
--- support function, losing the index. (The 2-arg text operator stays indexable for
--- the same reason: its function is a non-inlinable C function.)
+-- Recheck over the operand. plpgsql (not sql) so the planner does NOT inline the
+-- operator into a bare call — inlining would strip the @~@ OpExpr and bypass the
+-- support function, losing the index.
 CREATE FUNCTION ts_prox_match(v tsvector, pq proxquery) RETURNS bool
     LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE STRICT
-    AS $$ BEGIN RETURN ts_prox_match_cfg(v, pq.q, pq.cfg::oid); END $$;
+    AS $$ BEGIN
+        IF proxquery_is_analyzer(pq.src) THEN
+            RETURN proxquery_match(v, pq.q, pq.src);
+        ELSE
+            RETURN ts_prox_match_cfg(v, pq.q, pq.src::regconfig::oid);
+        END IF;
+    END $$;
 
 CREATE OPERATOR @~@ (
     LEFTARG = tsvector,
@@ -249,7 +311,14 @@ CREATE OPERATOR @~@ (
 ALTER FUNCTION ts_prox_match(tsvector, proxquery) SUPPORT ts_prox_query_support;
 "#,
     name = "proxquery_config_aware",
-    requires = [ts_prox_query_skeleton, ts_prox_match_cfg, ts_prox_query_support],
+    requires = [
+        ts_prox_query_skeleton,
+        ts_prox_match_cfg,
+        ts_prox_query_support,
+        proxquery_build_query,
+        proxquery_match,
+        proxquery_is_analyzer
+    ],
 );
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -703,11 +772,12 @@ mod tests {
     fn operator_index_path_matches_recheck_across_query_types() {
         // @~@ IS `ts_prox_match` plus a planner support fn that, under a GIN index,
         // rewrites it to `tsv @@ ts_prox_query(q) AND ts_prox_match(tsv, q)`. Driven by
-        // the SAME structured corpus as the function tests (proxquery_match_cases.sql),
-        // this builds one indexed table from the distinct docs and confirms, for every
-        // distinct query, that @~@ over the index (a) is actually taken when the query
-        // carries an index key and (b) returns exactly the rows the bare recheck does.
-        Spi::run(include_str!("../sql/proxquery_match_cases.sql")).expect("load match corpus");
+        // the SAME structured corpus as the function tests (the `match` table in the
+        // markdown parity spec), this builds one indexed table from the distinct docs and
+        // confirms, for every distinct query, that @~@ over the index (a) is actually
+        // taken when the query carries an index key and (b) returns exactly the rows the
+        // bare recheck does.
+        crate::corpus::load_parity();
         Spi::run("CREATE TEMP TABLE docs(id serial primary key, tsv tsvector)").unwrap();
         // Distinct docs, duplicated so the planner clearly prefers the index.
         Spi::run(
@@ -946,7 +1016,7 @@ mod tests {
              DECLARE line text; hit bool := false; \
              BEGIN \
                FOR line IN EXECUTE 'EXPLAIN SELECT count(*) FROM ptc WHERE tsv @~@ proxquery(' \
-                 || quote_literal(cfg) || '::regconfig, ' || quote_literal(q) || ')' LOOP \
+                 || quote_literal(cfg) || ', ' || quote_literal(q) || ')' LOOP \
                  IF line LIKE '%Index Cond%ts_prox_query%' THEN hit := true; END IF; \
                END LOOP; \
                RETURN hit; \
@@ -1132,22 +1202,491 @@ mod tests {
         }
     }
 
+    #[pg_test]
+    fn superimposed_hyphen_positions_match() {
+        // Boundary check for "superimposed" hyphen handling — NOT the start of a parser
+        // rewrite. Positions are assigned by `to_tsvector` (one per token the parser
+        // emits); the compound and its parts share a position only when a single token
+        // yields all three lexemes — a parser/dictionary, index-time decision. proxquery
+        // only READS positions and can't superimpose post-hoc. This isolates the two
+        // halves of the problem and confirms the MATCHING side is already done: a future
+        // superimposing parser/dictionary would need ZERO proxquery changes. The
+        // tsvectors are hand-built because no stock config will superimpose today.
+
+        // Default tokenization of `a b c-d` → a:1 b:2 c-d:3 c:4 d:5. The COMPOUND is
+        // within <~2> of `a` (distance 2); the bare parts (c@4, d@5) are not — which is
+        // why the OR-of-forms query already works via the compound, with no parser work.
+        let normal = "$$'a':1 'b':2 'c-d':3 'c':4 'd':5$$::tsvector";
+        assert!(b(&format!("SELECT ts_prox_match({normal}, $$a <~2> 'c-d'$$)")));
+        assert!(!b(&format!("SELECT ts_prox_match({normal}, $$a <~2> c$$)")));
+        assert!(!b(&format!("SELECT ts_prox_match({normal}, $$a <~2> d$$)")));
+
+        // Superimposed: c-d, c, d ALL at position 3 → every form is distance 2 from `a`,
+        // so each disjunct hits, not just the compound. This is the only behavior a
+        // custom parser would unlock — and it needs no change here.
+        let sup = "$$'a':1 'b':2 'c-d':3 'c':3 'd':3$$::tsvector";
+        assert!(b(&format!("SELECT ts_prox_match({sup}, $$a <~2> 'c-d'$$)")));
+        assert!(b(&format!("SELECT ts_prox_match({sup}, $$a <~2> c$$)")));
+        assert!(b(&format!("SELECT ts_prox_match({sup}, $$a <~2> d$$)")));
+        assert!(b(&format!("SELECT ts_prox_match({sup}, $$a <~2> (c | d | 'c-d')$$)")));
+    }
+
+    #[pg_test]
+    fn tokenizer_corpus() {
+        // Golden corpus for the extension-only Unicode tokenizer (the contract in
+        // tests/tokenizer_cases.md): proxquery_to_tsvector(input, analyzer) must equal
+        // `expected::tsvector` for each row. DEFERRED holds the categories not yet
+        // implemented (structured tailorings, emoji) or engine-dependent (ICU CJK) — it
+        // shrinks as later phases land. Kept separate from the pure-port diff corpus
+        // (the tokenizer is extension-only).
+        crate::corpus::load_tokenizer();
+        // NFC normalization: a decomposed `é` (e + U+0301) must tokenize like composed
+        // `café`. Its input is a combining codepoint with no readable plain-text form,
+        // so it lives here rather than in the markdown corpus.
+        assert!(
+            b("SELECT proxquery_to_tsvector(U&'cafe\\0301', 'prox_icu') \
+               = $$'café':1 'cafe':1$$::tsvector"),
+            "tf_nfd: decomposed é must fold like composed café",
+        );
+        const DEFERRED: &[&str] = &[];
+        // Every row must at least evaluate without error.
+        let total = Spi::get_one::<i64>(
+            "SELECT count(*) FROM _prox_tok WHERE proxquery_to_tsvector(input, analyzer) IS NOT NULL",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(total > 0, "tokenizer corpus did not load");
+        // Non-deferred rows must match their expected tsvector exactly.
+        let skip = if DEFERRED.is_empty() {
+            String::new()
+        } else {
+            let list = DEFERRED
+                .iter()
+                .map(|l| format!("'{l}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("label NOT IN ({list}) AND ")
+        };
+        let q = format!(
+            "SELECT coalesce(string_agg(\
+                 label || $$  got=$$ || proxquery_to_tsvector(input, analyzer)::text \
+                 || $$  want=$$ || expected, E'\\n' ORDER BY label), '') \
+             FROM _prox_tok \
+             WHERE {skip}proxquery_to_tsvector(input, analyzer) IS DISTINCT FROM expected::tsvector"
+        );
+        let mism = Spi::get_one::<String>(&q).unwrap().unwrap_or_default();
+        assert!(mism.is_empty(), "tokenizer corpus mismatches:\n{mism}");
+    }
+
+    #[pg_test]
+    fn analyzer_recheck_symmetry() {
+        // The query side resolves atoms through the SAME analyzer the column was built
+        // with, so a query folds to the indexer's superimposed lexemes. Recheck only
+        // (seq scan) — the GIN index path is a later phase.
+        let m = |doc: &str, q: &str| -> bool {
+            b(&format!(
+                "SELECT proxquery_match(proxquery_to_tsvector($d${doc}$d$, 'prox_icu'), \
+                 $q${q}$q$, 'prox_icu')"
+            ))
+        };
+        // Headline: `CAFÉ` is stored as superimposed {café, cafe}, so any case/accent
+        // spelling finds it — and a miss stays a miss.
+        assert!(m("un CAFÉ noir", "cafe"));
+        assert!(m("un CAFÉ noir", "café"));
+        assert!(m("un CAFÉ noir", "CAFE"));
+        assert!(!m("un CAFÉ noir", "the"));
+        // Proximity reads through the fold: café@2 <-> noir@3.
+        assert!(m("un café noir", "cafe <-> noir"));
+        // Hyphen superimposition: every form of café-bar sits at ONE position, so a
+        // neighbor is adjacent to any part, and the compound is findable accent-folded.
+        assert!(m("le café-bar ferme", "le <-> cafe"));
+        assert!(m("le café-bar ferme", "bar <-> ferme"));
+        assert!(m("le café-bar ferme", "cafe-bar"));
+        assert!(m("le café-bar ferme", "bar"));
+        // Email split: parts/host are findable, and a neighbor is adjacent to the
+        // whole address (one position).
+        assert!(m("mail a@b.com here", "b.com"));
+        assert!(m("mail a@b.com here", "a"));
+        assert!(m("mail a@b.com here", "mail <-> a"));
+        // The prox_unicode analyzer resolves symmetrically too (per-char CJK).
+        assert!(b(
+            "SELECT proxquery_match(proxquery_to_tsvector('中文 文档', 'prox_unicode'), \
+             '中', 'prox_unicode')"
+        ));
+    }
+
+    #[pg_test]
+    fn analyzer_index_path() {
+        // The analyzer `@~@ proxquery(...)` overload must be GIN-index-served (the
+        // probe folds query atoms the same way the column was built) AND agree with the
+        // bare `proxquery_match` recheck (the recheck⟹probe soundness invariant).
+        Spi::run("CREATE TEMP TABLE adocs(id serial primary key, tsv tsvector)").unwrap();
+        // Distinct docs duplicated + noise, so the planner prefers the index.
+        Spi::run(
+            "INSERT INTO adocs(tsv) SELECT proxquery_to_tsvector(d, 'prox_icu') \
+             FROM unnest(ARRAY['un CAFÉ noir','le café-bar ferme','mail a@b.com here']) d, \
+                  generate_series(1, 20)",
+        )
+        .unwrap();
+        Spi::run(
+            "INSERT INTO adocs(tsv) SELECT proxquery_to_tsvector('thé vert numero '||g, 'prox_icu') \
+             FROM generate_series(1, 500) g",
+        )
+        .unwrap();
+        Spi::run("CREATE INDEX ON adocs USING gin(tsv)").unwrap();
+        Spi::run("ANALYZE adocs").unwrap();
+        Spi::run("SET enable_seqscan = off").unwrap();
+        Spi::run(
+            "CREATE FUNCTION uses_index_a(q text) RETURNS bool AS $$ \
+             DECLARE line text; hit bool := false; \
+             BEGIN \
+               FOR line IN EXECUTE \
+                 'EXPLAIN SELECT count(*) FROM adocs WHERE tsv @~@ proxquery(''prox_icu'', ' \
+                 || quote_literal(q) || ')' LOOP \
+                 IF line LIKE '%Index Cond%ts_prox_query%' THEN hit := true; END IF; \
+               END LOOP; \
+               RETURN hit; \
+             END $$ LANGUAGE plpgsql",
+        )
+        .unwrap();
+
+        for (q, expect_hits) in [
+            ("cafe", true),         // accent-folded term finds CAFÉ (and the café-bar part)
+            ("café", true),         // accented spelling folds the same
+            ("cafe <-> noir", true), // proximity through the fold
+            ("cafe-bar", true),     // hyphen compound, accent-folded
+            ("b.com", true),        // email host
+            ("mail <-> a", true),   // neighbor adjacent to the (one-position) email
+            ("zzz", false),         // genuine miss
+        ] {
+            // The @~@ plan must be index-driven (probe injected as an Index Cond).
+            assert!(
+                b(&format!("SELECT uses_index_a('{q}')")),
+                "@~@ proxquery did not use the GIN index for `{q}`",
+            );
+            // @~@ (probe ∩ recheck) must equal the bare recheck (soundness: the probe
+            // drops no row the recheck accepts).
+            let idx = Spi::get_one::<i64>(&format!(
+                "SELECT count(*) FROM adocs WHERE tsv @~@ proxquery('prox_icu','{q}')"
+            ))
+            .unwrap()
+            .unwrap();
+            let recheck = Spi::get_one::<i64>(&format!(
+                "SELECT count(*) FROM adocs WHERE proxquery_match(tsv, '{q}', 'prox_icu')"
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(idx, recheck, "@~@ index path disagrees with recheck for `{q}`");
+            if expect_hits {
+                assert!(idx > 0, "expected hits for `{q}`");
+            } else {
+                assert_eq!(idx, 0, "expected no hits for `{q}`");
+            }
+        }
+    }
+
+    #[pg_test]
+    fn analyzer_toggles() {
+        // Each named preset selects a (case, accent, emoji) toggle combination, applied
+        // symmetrically on both sides.
+        let m = |doc: &str, an: &str, q: &str| -> bool {
+            b(&format!(
+                "SELECT proxquery_match(proxquery_to_tsvector($d${doc}$d$, '{an}'), \
+                 $q${q}$q$, '{an}')"
+            ))
+        };
+        // prox_icu_accent = accent-SENSITIVE (still case-insensitive).
+        assert!(m("un café noir", "prox_icu_accent", "café")); // exact accent matches
+        assert!(m("un CAFÉ noir", "prox_icu_accent", "café")); // case-insensitive
+        assert!(!m("un café noir", "prox_icu_accent", "cafe")); // accent differs → miss
+        // …whereas the default prox_icu folds accents (contrast): cafe finds café.
+        assert!(m("un café noir", "prox_icu", "cafe"));
+        // emoji toggle: the default keeps 😀 findable; prox_icu_no_emoji drops it.
+        assert!(m("rapport 😀 final", "prox_icu", "😀"));
+        assert!(!m("rapport 😀 final", "prox_icu_no_emoji", "😀"));
+        // with the emoji dropped (no position consumed), the flanking words are adjacent.
+        assert!(m("rapport 😀 final", "prox_icu_no_emoji", "rapport <-> final"));
+    }
+
+    #[pg_test]
+    fn analyzer_stemming() {
+        // A `:dict` suffix routes each lexeme through a text-search dictionary via
+        // ts_lexize — here `english_stem` (stem + English stopwords) — applied
+        // symmetrically on both sides. Bare presets are unaffected (no dict, no cost).
+        let m = |doc: &str, an: &str, q: &str| -> bool {
+            b(&format!(
+                "SELECT proxquery_match(proxquery_to_tsvector($d${doc}$d$, '{an}'), \
+                 $q${q}$q$, '{an}')"
+            ))
+        };
+        // running / runs stem to run, so `run` (and `running`) find them.
+        assert!(m("the running shoes", "prox_icu:english_stem", "run"));
+        assert!(m("she runs daily", "prox_icu:english_stem", "run"));
+        assert!(m("the running shoes", "prox_icu:english_stem", "running")); // query stems too
+        // A literal `'running'` bypasses stemming (exact), so it does NOT match the
+        // index that stemmed `running` → `run`.
+        assert!(!m("the running shoes", "prox_icu:english_stem", "'running'"));
+        // the default prox_icu does NOT stem — `run` ≠ `running`.
+        assert!(!m("the running shoes", "prox_icu", "run"));
+        assert!(m("the running shoes", "prox_icu", "running"));
+    }
+
+    #[pg_test]
+    fn analyzer_readme_accent_example() {
+        // Runs the README "Extension-only tokenizer" example VERBATIM (generated column +
+        // GIN + the @~@ operator) so the doc can't drift: a bare term is accent-
+        // insensitive (cafe finds café and cafe), a single-quoted literal is accent-exact.
+        Spi::run(
+            "CREATE TEMP TABLE docs (\
+               id   bigserial PRIMARY KEY, \
+               body text, \
+               tsv  tsvector GENERATED ALWAYS AS (proxquery_to_tsvector(body, 'prox_icu')) STORED)",
+        )
+        .unwrap();
+        Spi::run("CREATE INDEX docs_tsv_gin ON docs USING gin (tsv)").unwrap();
+        Spi::run(
+            "INSERT INTO docs (body) VALUES \
+               ('un café noir, please'), \
+               ('a plain cafe noir here'), \
+               ('the café is closed')",
+        )
+        .unwrap();
+        let count = |q: &str| -> i64 {
+            Spi::get_one::<i64>(&format!(
+                "SELECT count(*) FROM docs WHERE tsv @~@ proxquery('prox_icu', $q${q}$q$)"
+            ))
+            .unwrap()
+            .unwrap()
+        };
+        let hits = |q: &str, id: i64| -> bool {
+            b(&format!(
+                "SELECT EXISTS(SELECT 1 FROM docs WHERE id = {id} \
+                 AND tsv @~@ proxquery('prox_icu', $q${q}$q$))"
+            ))
+        };
+        // Bare `cafe <-> noir` is accent-insensitive → the accented (1) AND plain (2) docs.
+        assert_eq!(count("cafe <-> noir"), 2);
+        assert!(hits("cafe <-> noir", 1));
+        assert!(hits("cafe <-> noir", 2));
+        // Literal `'café' <-> noir` is exact → only the accented doc (1), not plain cafe (2).
+        assert_eq!(count("'café' <-> noir"), 1);
+        assert!(hits("'café' <-> noir", 1));
+        assert!(!hits("'café' <-> noir", 2));
+    }
+
+    #[pg_test]
+    fn analyzer_generated_column() {
+        // The documented usage pattern: a STORED generated column (which REQUIRES the
+        // builder to be IMMUTABLE) + a plain GIN index + the @~@ operator. This pins
+        // that proxquery_to_tsvector works exactly as the user guide shows.
+        Spi::run(
+            "CREATE TEMP TABLE gdocs(id serial PRIMARY KEY, body text, \
+             tsv tsvector GENERATED ALWAYS AS (proxquery_to_tsvector(body, 'prox_icu')) STORED)",
+        )
+        .unwrap();
+        Spi::run("CREATE INDEX ON gdocs USING gin(tsv)").unwrap();
+        Spi::run(
+            "INSERT INTO gdocs(body) VALUES \
+             ('un CAFÉ noir'), ('le café-bar ferme'), ('mail a@b.com here')",
+        )
+        .unwrap();
+        let hit = |q: &str| -> bool {
+            b(&format!(
+                "SELECT EXISTS(SELECT 1 FROM gdocs WHERE tsv @~@ proxquery('prox_icu', $q${q}$q$))"
+            ))
+        };
+        assert!(hit("cafe")); // accent-folded term finds CAFÉ (and the café-bar part)
+        assert!(hit("b.com")); // email host
+        assert!(hit("le <-> cafe")); // neighbor adjacent to the hyphenated word's part
+        assert!(!hit("zzz")); // genuine miss
+    }
+
+    #[pg_test(error = "proxquery: unknown analyzer 'bogus'")]
+    fn analyzer_unknown_name_errors() {
+        Spi::run("SELECT proxquery_to_tsvector('x', 'bogus')").unwrap();
+    }
+
+    #[pg_test(error = "proxquery: unknown analyzer 'prox_icu:nosuchdict'")]
+    fn analyzer_unknown_dict_errors() {
+        Spi::run("SELECT proxquery_to_tsvector('x', 'prox_icu:nosuchdict')").unwrap();
+    }
+
+    #[pg_test]
+    fn analyzer_accent_specificity() {
+        // The index stores BOTH `café` and `cafe` (superimposed). Bare query terms are
+        // accent-INSENSITIVE (recall-first): they fold to the canonical form, so `cafe`
+        // AND `café` both find accented and plain docs alike. A literal `'café'` is the
+        // precision escape hatch: resolved EXACTLY, it matches only the accented spelling.
+        let m = |doc: &str, q: &str| -> bool {
+            b(&format!(
+                "SELECT proxquery_match(proxquery_to_tsvector($d${doc}$d$, 'prox_icu'), \
+                 $q${q}$q$, 'prox_icu')"
+            ))
+        };
+        // Bare term: accent-insensitive both ways.
+        assert!(m("un café noir", "cafe"));
+        assert!(m("un cafe noir", "cafe"));
+        assert!(m("un café noir", "café"));
+        assert!(m("un cafe noir", "café")); // bare café is broad → matches plain cafe too
+        // Literal `'café'`: EXACT — matches the accented spelling only.
+        assert!(m("un café noir", "'café'"));
+        assert!(!m("un cafe noir", "'café'")); // the headline: exact café must NOT match plain cafe
+        // `'CAFÉ'` still folds case (the DSL lowercases), just not accents.
+        assert!(m("un café noir", "'CAFÉ'"));
+        // The literal also composes in proximity: exact café next to noir.
+        assert!(m("un café noir", "'café' <-> noir"));
+        assert!(!m("un cafe noir", "'café' <-> noir"));
+    }
+
+    #[pg_test]
+    fn analyzer_superimposition_specificity() {
+        // The index stores the compound + parts, but a BARE query resolves to the whole
+        // (folded) compound — it does NOT decompose — so the compound stays specific
+        // while a sub-form (queried directly) finds the superimposed docs. The
+        // apostrophe full-form is reachable as a literal `'…'` (resolved exactly).
+        let m = |doc: &str, q: &str| -> bool {
+            b(&format!(
+                "SELECT proxquery_match(proxquery_to_tsvector($d${doc}$d$, 'prox_icu'), \
+                 $q${q}$q$, 'prox_icu')"
+            ))
+        };
+        // hyphen: the compound query is specific; a part finds the compound.
+        assert!(m("the café-bar", "cafe-bar")); // accent-folded compound → hyphen doc
+        assert!(!m("just a bar", "cafe-bar")); // compound must NOT match a plain part
+        assert!(m("the café-bar", "bar")); // a part finds the compound
+        assert!(m("just a bar", "bar"));
+        // email: the full address is specific; a part finds the address.
+        assert!(m("send a@b.com now", "a@b.com"));
+        assert!(!m("a quick note", "a@b.com")); // full address must NOT match a stray `a`
+        assert!(m("send a@b.com now", "b.com")); // host part finds the address
+        // apostrophe: the literal full form `'it''s'` is specific; the stripped/prefix
+        // parts (valid bare terms) find it too. (A bare `it's` isn't valid query syntax
+        // — `'` is the literal-term delimiter.)
+        assert!(m("it's mine", "'it''s'"));
+        assert!(!m("the it factor", "'it''s'")); // full form must NOT match a bare `it`
+        assert!(m("it's mine", "its")); // stripped form finds the apostrophe doc
+        assert!(m("it's mine", "it")); // prefix finds it
+        // Segmentation is preserved: a token the index splits without compounding (`/`)
+        // still splits on the query side too (would not, if the query skipped segmenting).
+        assert!(m("alpha beta", "alpha/beta"));
+    }
+
+    #[pg_test]
+    fn analyzer_apostrophe_query_forms() {
+        // The supported ways to search text containing an apostrophe (`it's going to be
+        // alright`) against the custom tokenizer, which superimposes `it's` → it's/it/its
+        // at one position. (The shared DSL behavior — a raw `'` is the literal delimiter,
+        // so `it's …` is a parse error, and `''` escaping — is covered in both
+        // implementations by the SQL corpus: litErr1/litErr2 and litq1–litq3.)
+        let m = |doc: &str, q: &str| -> bool {
+            b(&format!(
+                "SELECT proxquery_match(proxquery_to_tsvector($d${doc}$d$, 'prox_icu'), \
+                 $q${q}$q$, 'prox_icu')"
+            ))
+        };
+        let doc = "it's going to be alright";
+        // 1) Phrase form — inside "…" the apostrophe is an ordinary word char, so the
+        //    contraction needs no escaping. Full and partial phrases both match.
+        assert!(m(doc, "\"it's going to be alright\""));
+        assert!(m(doc, "\"it's going\""));
+        assert!(!m(doc, "\"going it's\"")); // order matters in a phrase
+        // 2) Literal form — the contraction with the quote DOUBLED, combined with
+        //    operators. The literal is exact (matches the stored `it's`).
+        assert!(m(doc, "'it''s' & going"));
+        assert!(m(doc, "'it''s' <-> going")); // it's@1 immediately before going@2
+        assert!(m(doc, "'it''s' <~4> alright")); // it's@1 .. alright@5 → distance 4
+        assert!(!m(doc, "'it''s' <~3> alright")); // …so <~3> can't reach
+        // 3) Bare parts — the apostrophe-stripped (`its`) and prefix (`it`) forms are
+        //    superimposed at the same position, so they find the doc without any quoting.
+        assert!(m(doc, "it & going"));
+        assert!(m(doc, "its & alright"));
+        // 4) Exactness — the literal `'it''s'` must NOT match a doc that only has bare
+        //    `it`/`is` (no contraction), while the stripped part still does.
+        assert!(!m("it is going to be alright", "'it''s'"));
+        assert!(m("it is going to be alright", "it & going"));
+        // The curly apostrophe `’` normalizes to `'`, so a literal with a straight quote
+        // finds a doc written with the curly one.
+        assert!(m("it\u{2019}s fine", "'it''s'"));
+    }
+
+    #[pg_test]
+    fn analyzer_operator_corpus() {
+        // The full DSL operator surface under the custom tokenizer (tests/analyzer_cases.md
+        // — OR/NOT/grouping, every distance/proximity op, globs/prefix, regex, phrases),
+        // which the parity corpus only covers under the stock cfg/literal resolvers. Two
+        // phases: (A) the recheck equals `expected` for every row; (B) per distinct query,
+        // the GIN-indexed @~@ returns exactly the rows the bare recheck does (probe
+        // soundness) and the plan uses the index whenever the query carries a key.
+        crate::corpus::load_analyzer_ops();
+
+        // Phase A — recheck correctness.
+        let mism = Spi::get_one::<String>(
+            "SELECT coalesce(string_agg(label || $$: got=$$ || got || $$ want=$$ || expected, E'\\n' \
+                 ORDER BY label), '') \
+             FROM (SELECT label, expected, \
+                      proxquery_match(proxquery_to_tsvector(doc, analyzer), query, analyzer)::text AS got \
+                   FROM _prox_an) s \
+             WHERE got IS DISTINCT FROM expected",
+        )
+        .unwrap()
+        .unwrap_or_default();
+        assert!(mism.is_empty(), "analyzer recheck != expected:\n{mism}");
+
+        // Phase B — per analyzer, build an indexed table from its distinct docs (duplicated
+        // so the planner prefers the index) and, per distinct query, force the index vs a
+        // seqscan recheck and compare; require the index plan for keyed queries.
+        Spi::run(
+            "DO $$ \
+             DECLARE a text; q text; has_key bool; n_idx bigint; n_seq bigint; line text; plan_hit bool; \
+             BEGIN \
+               FOR a IN SELECT DISTINCT analyzer FROM _prox_an ORDER BY 1 LOOP \
+                 DROP TABLE IF EXISTS _ai; \
+                 CREATE TEMP TABLE _ai(tsv tsvector); \
+                 EXECUTE format('INSERT INTO _ai SELECT proxquery_to_tsvector(d.doc, %L) \
+                                 FROM (SELECT DISTINCT doc FROM _prox_an WHERE analyzer=%L) d, \
+                                      generate_series(1,20)', a, a); \
+                 CREATE INDEX ON _ai USING gin(tsv); ANALYZE _ai; \
+                 FOR q IN SELECT DISTINCT query FROM _prox_an WHERE analyzer=a ORDER BY 1 LOOP \
+                   BEGIN PERFORM ts_prox_query(proxquery(a, q)); has_key := true; \
+                   EXCEPTION WHEN OTHERS THEN has_key := false; END; \
+                   SET LOCAL enable_seqscan=off; SET LOCAL enable_indexscan=on; SET LOCAL enable_bitmapscan=on; \
+                   EXECUTE format('SELECT count(*) FROM _ai WHERE tsv @~@ proxquery(%L,%L)', a, q) INTO n_idx; \
+                   IF has_key THEN \
+                     plan_hit := false; \
+                     FOR line IN EXECUTE format('EXPLAIN SELECT * FROM _ai WHERE tsv @~@ proxquery(%L,%L)', a, q) LOOP \
+                       IF line LIKE '%Index Cond%ts_prox_query%' THEN plan_hit := true; END IF; \
+                     END LOOP; \
+                     IF NOT plan_hit THEN RAISE EXCEPTION 'analyzer % query [%] did not use the index', a, q; END IF; \
+                   END IF; \
+                   SET LOCAL enable_seqscan=on; SET LOCAL enable_indexscan=off; SET LOCAL enable_bitmapscan=off; \
+                   EXECUTE format('SELECT count(*) FROM _ai WHERE proxquery_match(tsv, %L, %L)', q, a) INTO n_seq; \
+                   IF n_idx IS DISTINCT FROM n_seq THEN \
+                     RAISE EXCEPTION 'analyzer % query [%]: index=% recheck=% (soundness)', a, q, n_idx, n_seq; \
+                   END IF; \
+                 END LOOP; \
+               END LOOP; \
+               DROP TABLE IF EXISTS _ai; \
+             END $$",
+        )
+        .expect("analyzer @~@ index path must match the recheck for every query");
+    }
+
     // --- pure-SQL port parity ----------------------------------------------
     // The extension-free port (sql/proxquery_pure.sql) must stay behavior-
     // identical to this extension, on every CI Postgres version.
-    // The portable corpus (sql/proxquery_cases.sql) is the single source of truth.
-    // The differential runner executes every case against BOTH the native extension
-    // (schema `public`) and the pure-SQL port (schema `proxquery`) and asserts they
-    // agree with each other and with the expected value — so the two implementations
-    // can't drift. The fuzz runner does the same on randomly generated query/doc
-    // pairs. Both require both implementations in one session (the cargo-pgrx-test
-    // environment); the psql-standalone golden check lives in proxquery_pure_test.sql.
+    // The portable corpus is the markdown spec (tests/parity_cases.md), the single
+    // source of truth, parsed by `parity_spec::load_corpus`. The differential runner
+    // executes every case against BOTH the native extension (schema `public`) and the
+    // pure-SQL port (schema `proxquery`) and asserts they agree with each other and
+    // with the expected value — so the two implementations can't drift. The fuzz runner
+    // does the same on randomly generated query/doc pairs. Both require both
+    // implementations in one session (the cargo-pgrx-test environment).
     #[pg_test]
     fn pure_sql_matches_extension_corpus() {
         Spi::run(include_str!("../sql/proxquery_pure.sql")).expect("load pure-SQL port");
-        Spi::run(include_str!("../sql/proxquery_cases.sql")).expect("load shared corpus");
-        Spi::run(include_str!("../sql/proxquery_match_cases.sql")).expect("load match corpus");
-        Spi::run(include_str!("../sql/proxquery_config_cases.sql")).expect("load config corpus");
+        // The shared corpus is the markdown spec (tests/parity_cases.md), parsed and
+        // loaded into the temp tables the differential runner reads.
+        crate::corpus::load_parity();
         Spi::run(include_str!("../sql/proxquery_diff_test.sql")).expect("differential corpus test");
     }
 
