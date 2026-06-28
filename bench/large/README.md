@@ -25,9 +25,9 @@ large tier shows how the extension alone scales.
 Each tier's report includes a **phase-timing** table (wall seconds for setup /
 corpus generation / searches) so you can see where the run's time actually went,
 and writes **raw per-query timings** to `bench/reports/results_{small,large}.csv`
-(both uploaded as the workflow artifact). `ext_2cl_ms` (≈ identical to `ext_op_ms`)
-is only timed on the small tier, where it is the denominator of the pure
-`slowdown` ratio.
+(both uploaded as the workflow artifact). `ext_search_ms` (the extension via the
+consolidated `ts_prox_search`, ≈ identical to `ext_op_ms`) is only timed on the small
+tier, where it is the denominator of the pure `slowdown` ratio.
 
 ## Repeatability
 
@@ -96,6 +96,15 @@ query list is fully platform-independent.)
 - multi-term proximity chains (`a <~N> b <~N> c`, and 4-term)
 - truncation wildcards (`stem*`, and `term <~N> stem*`) — the COCA head is lemmas
   with no inflected forms, so a truncating wildcard is how a term catches variants
+- a phrase span as a proximity operand (`"a b" <~N> c`)
+- non-indexable / non-native terms — suffix (`*tion`), infix (`f*r`), and a real regex
+  pattern (`##capac.*##`, not a metachar-free `##term##` that just matches one lexeme) —
+  each paired with a plain term that carries the index (`*tion <~N> b`)
+
+The last two are deliberately NON-native: they don't lower to a plain `tsquery`, so
+they exercise the real positional/pattern recheck — the regime where the pure-SQL
+port can't take its native fast-path (and where degenerate user queries get costly
+for *both* implementations).
 
 **Boolean / single / bare-wildcard** terms are drawn over a global frequency-rank
 band (skipping the top stopwords that match everything and the rare tail that

@@ -10,7 +10,7 @@ with no query changes.
 It is a plain migration file: run it once and you have the whole proxquery surface.
 
 ```sh
-psql -d yourdb -f sql/proxquery_pure.sql
+psql -d your_db -f sql/proxquery_pure.sql
 ```
 
 ## Everything lives in a `proxquery` schema
@@ -27,7 +27,7 @@ Call the functions schema-qualified, or add the schema to your `search_path`:
 
 ```sql
 -- qualified
-SELECT proxquery.ts_prox_match(body_tsv, 'quick <~3> fox') FROM docs …;
+SELECT proxquery.ts_prox_recheck(body_tsv, 'quick <~3> fox') FROM docs …;
 
 -- or via search_path (then unqualified works everywhere)
 SET search_path = public, proxquery;     -- session, or ALTER DATABASE … SET …
@@ -46,9 +46,12 @@ extension, and returns **identical results** (verified — see
 | Function | Role |
 | --- | --- |
 | `ts_prox_query(text) -> tsquery` | index-selection skeleton |
-| `ts_prox_match(tsvector, text) -> bool` | positional recheck |
+| `ts_prox_recheck(tsvector, text) -> bool` | positional recheck |
+| `ts_prox_search(tsvector, text) -> bool` | the index-selection + recheck form, in one inlinable call |
+| `ts_prox_query_exact(text) -> tsquery` | exact tsquery when the recheck is droppable, else NULL |
 | `ts_prox_query(text, regconfig) -> tsquery` | config-aware skeleton |
-| `ts_prox_match(tsvector, text, regconfig) -> bool` | config-aware recheck |
+| `ts_prox_recheck(tsvector, text, regconfig) -> bool` | config-aware recheck |
+| `ts_prox_search(tsvector, text, regconfig) -> bool` | config-aware one-call form (index-served; keeps the recheck) |
 | `ts_prox_query_skeleton(text) -> text` | the `to_tsquery` input string |
 | `ts_prox_within / ts_prox_pre / ts_prox_not_within(tsvector, a, b, n)` | positional predicates |
 | `ts_prox_chain(tsvector, text[], int[])` | same-occurrence chain |
@@ -74,11 +77,11 @@ CREATE INDEX ON docs USING gin (body_tsv);
 
 SELECT * FROM docs
 WHERE body_tsv @@ proxquery.ts_prox_query('quick <~3> fox')   -- Bitmap Index Scan
-  AND proxquery.ts_prox_match(body_tsv, 'quick <~3> fox');      -- recheck filter
+  AND proxquery.ts_prox_recheck(body_tsv, 'quick <~3> fox');      -- recheck filter
 ```
 
 The `@@` clause selects candidates on a plain `gin(tsvector)` index (a built-in,
-no custom opclass); `ts_prox_match` rechecks positions on just those candidates.
+no custom opclass); `ts_prox_recheck` rechecks positions on just those candidates.
 That plan is exactly what `@~@` expands to under the extension — same index, same
 recheck, same rows.
 
@@ -88,11 +91,66 @@ scalar filter, the planner `BitmapAnd`s the GIN and btree indexes:
 ```sql
 SELECT * FROM docs
 WHERE body_tsv @@ proxquery.ts_prox_query('quick <~3> fox')
-  AND proxquery.ts_prox_match(body_tsv, 'quick <~3> fox')
+  AND proxquery.ts_prox_recheck(body_tsv, 'quick <~3> fox')
   AND owner_id = 42                                    -- uses its own index, AND-ed in
 ORDER BY ts_rank_cd(body_tsv, proxquery.ts_prox_query('quick <~3> fox')) DESC
 LIMIT 10;
 ```
+
+### Drop the recheck when it does nothing
+
+For a **plain boolean / phrase / prefix** query (no `<~N> <-N> <!~N>` proximity), the
+`@@ ts_prox_query(q)` skeleton is already the *exact* match — the recheck removes
+nothing, yet still runs as a Filter that **re-detoasts the tsvector on every candidate
+row** (expensive once the column TOASTs, i.e. long documents). `ts_prox_query_exact(q)`
+returns a non-NULL tsquery exactly when the recheck is droppable (NULL for proximity /
+not-within / suffix-glob / regex, which genuinely need it), so the recheck can be wrapped
+to fold away when redundant. **`ts_prox_search(tsv, q)` is that whole form in one call:**
+
+```sql
+SELECT * FROM docs WHERE proxquery.ts_prox_search(body_tsv, q);
+```
+
+It is an *inlinable* SQL function, so the planner splices its body back into the query —
+re-exposing `@@ ts_prox_query(q)` for the GIN index, then, for a constant (or custom-plan)
+`q`, const-folding `ts_prox_query_exact(q)`: a recheck-droppable query collapses to a single
+index clause (no Filter, no re-detoast — on par with the extension), everything else reduces
+to the ordinary two-clause form. (A generic-plan bind parameter keeps the recheck — still
+correct, just not folded.) The native extension exposes the same `ts_prox_search`, so the
+query is drop-in portable. It expands to exactly:
+
+```sql
+WHERE body_tsv @@ proxquery.ts_prox_query(q)
+  AND (proxquery.ts_prox_query_exact(q) IS NOT NULL OR proxquery.ts_prox_recheck(body_tsv, q));
+```
+
+**Caveat — index use rides on inlining, so verify it.** The index scan and the recheck
+fold both depend on the planner inlining `ts_prox_search` and const-folding the query —
+which it does for a **literal or custom-plan** query, but *not*, say, a generic-plan
+prepared statement, or a call wrapped where the planner can't see the `@@`. When inlining
+is defeated it degrades **silently to a sequential scan** — no error, just slow. So
+`EXPLAIN` your real query and confirm the plan is what you think: a `Bitmap Index Scan`
+(never a `Seq Scan`), and for a boolean/phrase query no recheck `Filter`.
+
+If it isn't, don't lean on the function — **reproduce its logic in your application.** Ask
+once (when you build the query, or cached per distinct query) whether the recheck is
+droppable, and emit the matching SQL explicitly so the index is driven by an `@@` clause
+that is literally in the query text:
+
+```sql
+-- one metadata query decides the form:
+SELECT proxquery.ts_prox_query_exact(:q) IS NOT NULL AS recheck_droppable;
+
+-- droppable  → one clause, recheck dropped:
+WHERE tsv @@ proxquery.ts_prox_query(:q)
+-- otherwise  → the two-clause form:
+WHERE tsv @@ proxquery.ts_prox_query(:q) AND proxquery.ts_prox_recheck(tsv, :q)
+```
+
+That is exactly what `ts_prox_search` does internally; doing it yourself just moves the
+decision to a place the planner can't undo. (The explicit two-clause form alone is always
+safe too — it keeps `@@` visible so it can never lose the index — it just leaves the boolean
+recheck running.)
 
 ## Performance
 
@@ -138,7 +196,7 @@ PL/pgSQL doesn't get in the way:
   the `SET search_path` on the public functions blocks function *inlining*, not
   *constant-folding*.) For a runtime parameter it is evaluated once per execution
   — still index-usable.
-- **`ts_prox_match(tsv, q)` is a residual filter.** It references only the
+- **`ts_prox_recheck(tsv, q)` is a residual filter.** It references only the
   `tsvector` and a constant, so the planner applies it at the text table's scan,
   after the index narrows candidates. It is recursive, so it would not be inlined
   even as `LANGUAGE sql` — there is nothing inside it to "collapse" into a join,
@@ -153,7 +211,7 @@ Hash Join  (documents.id = text_documents.id)
   ->  Seq Scan on documents          Filter: status = 'active'     -- outer filter, independent
   ->  Hash
         ->  Bitmap Heap Scan on text_documents
-              Filter: ts_prox_match(text_tsv, 'a <~2> b')           -- residual recheck
+              Filter: ts_prox_recheck(text_tsv, 'a <~2> b')           -- residual recheck
               ->  Bitmap Index Scan on text_documents_text_tsv_idx
                     Index Cond: (text_tsv @@ 'a & b')               -- folded + GIN
 ```
@@ -163,7 +221,7 @@ once (no multiplication), and the proximity scan stays self-contained on the
 table whose GIN index serves it.
 
 **Selectivity caveat.** The planner has no selectivity estimator for
-`ts_prox_match`, so it uses a default guess — but the `@@ ts_prox_query(const)`
+`ts_prox_recheck`, so it uses a default guess — but the `@@ ts_prox_query(const)`
 clause carries real `tsvector` statistics, so the row estimate (and therefore the
 join strategy) is anchored by the indexable clause. The join then adapts: a
 selective proximity query yields few ids and nested-loop PK lookups on the outer
@@ -188,7 +246,7 @@ DROP SCHEMA proxquery CASCADE;             -- remove the pure functions
 CREATE EXTENSION proxquery SCHEMA proxquery;   -- same names, same schema
 ```
 
-Every two-clause `… @@ proxquery.ts_prox_query(q) AND proxquery.ts_prox_match(…)`
+Every two-clause `… @@ proxquery.ts_prox_query(q) AND proxquery.ts_prox_recheck(…)`
 query keeps working **verbatim** — identical plan, now with the faster C position
 access. The extension additionally brings the single `@~@` operator, so you may
 optionally rewrite those sites to `body_tsv @~@ 'q'` once it's present (purely
@@ -198,11 +256,14 @@ ergonomic; same plan).
 
 - **`@~@`** and its planner support function (C-only) — see above. This includes
   the config-carrying `@~@ proxquery(cfg, q)` overload; under the pure port you use
-  the 3-arg two-clause form instead (next bullet).
-- Config-aware lexing **is** here: the 3-arg `ts_prox_query(text, regconfig)` and
-  `ts_prox_match(tsvector, text, regconfig)` overloads match a column built with any
-  text-search config (stemmed, unaccented, …), identical to the extension (see
-  [CONFIG_AWARE.md](CONFIG_AWARE.md)). Only the single operator is missing.
+  `ts_prox_search(tsv, q, cfg)` (or the explicit two clauses) instead (next bullet).
+- Config-aware lexing **is** here: the 3-arg `ts_prox_query(text, regconfig)`,
+  `ts_prox_recheck(tsvector, text, regconfig)`, and `ts_prox_search(tsvector, text,
+  regconfig)` overloads match a column built with any text-search config (stemmed,
+  unaccented, …), identical to the extension (see [CONFIG_AWARE.md](CONFIG_AWARE.md)).
+  The 3-arg `ts_prox_search` is index-served but keeps the recheck — config term
+  resolution can fan out, so it doesn't fold the way the `simple` 2-arg form does.
+  Only the single operator is missing.
 
 ## Parity with the extension
 

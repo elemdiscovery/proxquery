@@ -6,6 +6,10 @@
 -- Proximity shapes draw their terms from a single shared TOPIC, so they line up
 -- with the corpus's topic segments and short-radius windows actually match.
 -- Boolean / single / bare-wildcard shapes draw globally by frequency rank.
+-- `phraseprox` (a phrase span inside a proximity) and `hardwild` (a suffix/infix/
+-- regex term that can't pre-filter the index) are deliberately NON-native: they
+-- don't lower to a plain tsquery, so they exercise the real positional/pattern
+-- recheck — the regime where the pure port can't use its native fast-path.
 --
 -- Machine independence: PostgreSQL's setseed()/random() use PG's built-in PRNG
 -- (since PG 15), not libc, and the samplers use only multiply/floor (no exp/ln/
@@ -98,6 +102,25 @@ LANGUAGE sql AS $$ SELECT lo + floor(random() * (hi - lo + 1))::int FROM (SELECT
 CREATE OR REPLACE FUNCTION wild(w text) RETURNS text
 LANGUAGE sql AS $$ SELECT substr(w, 1, GREATEST(3, length(w) - (1 + floor(random()*3))::int)) || '*' $$;
 
+-- A NON-indexable / non-native wildcard built from a term, to exercise the recheck's
+-- pattern path. Suffix (`*tion`) and regex (`##capac.*##`) can't pre-filter the GIN
+-- index at all, infix (`ap*n`) only via its short prefix, and none of the three lower
+-- to a native tsquery -- so the pure port can't take its fast-path and runs the full
+-- positional/pattern scan. Callers pair it with a plain term that carries the index
+-- (e.g. `*tion <~3> study`), per the README's "you need a second term" guidance.
+-- The regex is a real `.*` PATTERN, not a metachar-free `##term##` (which would just
+-- match the one lexeme `term` -- a term search done the expensive way -- and never
+-- exercise the regex engine over multiple forms).
+CREATE OR REPLACE FUNCTION hard_wild(w text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE r float8 := random(); k int := LEAST(4, GREATEST(2, length(w) - 2));
+BEGIN
+  IF    r < 0.34 THEN RETURN '*' || right(w, k);                            -- suffix: application -> *tion
+  ELSIF r < 0.67 THEN RETURN left(w, 2) || '*' || right(w, 1);             -- infix:  application -> ap*n
+  ELSE  RETURN '##' || substr(w, 1, GREATEST(3, length(w) - 3)) || '.*##'; -- regex:  capacity -> ##capac.*##
+  END IF;
+END $$;
+
 DROP TABLE IF EXISTS queries;
 CREATE TABLE queries(id serial PRIMARY KEY, shape text, q text);
 
@@ -126,26 +149,32 @@ BEGIN
   FOR i IN 1..nq LOOP
     rr := random();
     tk := pick_topic(kt);                 -- a shared topic for proximity shapes
-    IF    rr < 0.07 THEN shape := 'single';    q := pick_term(tl,th);
-    ELSIF rr < 0.20 THEN shape := 'and2';      g := pick_global_terms(tl,th,2); q := g[1]||' & '||g[2];
-    ELSIF rr < 0.27 THEN shape := 'and3';      g := pick_global_terms(tl,th,3); q := g[1]||' & '||g[2]||' & '||g[3];
-    ELSIF rr < 0.34 THEN shape := 'or2';       g := pick_global_terms(tl,th,2); q := g[1]||' | '||g[2];
-    ELSIF rr < 0.50 THEN shape := 'within';    t := pick_topic_terms(tk,tn,2); n := pick_dist(dlo,dhi);
+    IF    rr < 0.06 THEN shape := 'single';    q := pick_term(tl,th);
+    ELSIF rr < 0.16 THEN shape := 'and2';      g := pick_global_terms(tl,th,2); q := g[1]||' & '||g[2];
+    ELSIF rr < 0.22 THEN shape := 'and3';      g := pick_global_terms(tl,th,3); q := g[1]||' & '||g[2]||' & '||g[3];
+    ELSIF rr < 0.28 THEN shape := 'or2';       g := pick_global_terms(tl,th,2); q := g[1]||' | '||g[2];
+    ELSIF rr < 0.40 THEN shape := 'within';    t := pick_topic_terms(tk,tn,2); n := pick_dist(dlo,dhi);
                                                q := t[1]||' <~'||n||'> '||t[2];
-    ELSIF rr < 0.57 THEN shape := 'ordered';   t := pick_topic_terms(tk,tn,2); n := pick_dist(dlo,dhi);
+    ELSIF rr < 0.46 THEN shape := 'ordered';   t := pick_topic_terms(tk,tn,2); n := pick_dist(dlo,dhi);
                                                q := t[1]||' <-'||n||'> '||t[2];
-    ELSIF rr < 0.65 THEN shape := 'phrase';    -- adjacent-word phrase, 2 or 3 distinct words from one topic
+    ELSIF rr < 0.52 THEN shape := 'phrase';    -- adjacent-word phrase, 2 or 3 distinct words from one topic
                          IF random() < 0.5 THEN t := pick_topic_terms(tk,tn,2); q := '"'||t[1]||' '||t[2]||'"';
                          ELSE t := pick_topic_terms(tk,tn,3); q := '"'||t[1]||' '||t[2]||' '||t[3]||'"'; END IF;
-    ELSIF rr < 0.75 THEN shape := 'chain3';    t := pick_topic_terms(tk,tn,3); n := pick_dist(dlo,dhi); n2 := pick_dist(dlo,dhi);
+    ELSIF rr < 0.60 THEN shape := 'phraseprox';-- a phrase span as a proximity operand (non-native: no fast-path)
+                         t := pick_topic_terms(tk,tn,3); n := pick_dist(dlo,dhi);
+                         q := '"'||t[1]||' '||t[2]||'" <~'||n||'> '||t[3];
+    ELSIF rr < 0.68 THEN shape := 'chain3';    t := pick_topic_terms(tk,tn,3); n := pick_dist(dlo,dhi); n2 := pick_dist(dlo,dhi);
                                                q := t[1]||' <~'||n||'> '||t[2]||' <~'||n2||'> '||t[3];
-    ELSIF rr < 0.82 THEN shape := 'chain4';    t := pick_topic_terms(tk,tn,4); n := pick_dist(dlo,dhi); n2 := pick_dist(dlo,dhi); n3 := pick_dist(dlo,dhi);
+    ELSIF rr < 0.74 THEN shape := 'chain4';    t := pick_topic_terms(tk,tn,4); n := pick_dist(dlo,dhi); n2 := pick_dist(dlo,dhi); n3 := pick_dist(dlo,dhi);
                                                q := t[1]||' <~'||n||'> '||t[2]||' <~'||n2||'> '||t[3]||' <~'||n3||'> '||t[4];
-    ELSIF rr < 0.87 THEN shape := 'notwithin'; t := pick_topic_terms(tk,tn,2); n := pick_dist(dlo,dhi);
+    ELSIF rr < 0.80 THEN shape := 'notwithin'; t := pick_topic_terms(tk,tn,2); n := pick_dist(dlo,dhi);
                                                q := t[1]||' <!~'||n||'> '||t[2];
-    ELSIF rr < 0.94 THEN shape := 'wildcard';  q := wild(pick_term(tl,th));
-    ELSE                 shape := 'wildprox';  t := pick_topic_terms(tk,tn,2); n := pick_dist(dlo,dhi);
+    ELSIF rr < 0.86 THEN shape := 'wildcard';  q := wild(pick_term(tl,th));
+    ELSIF rr < 0.92 THEN shape := 'wildprox';  t := pick_topic_terms(tk,tn,2); n := pick_dist(dlo,dhi);
                                                q := t[1]||' <~'||n||'> '||wild(t[2]);
+    ELSE                 shape := 'hardwild';  -- non-indexable/non-native term (suffix/infix/regex) on the LEFT;
+                         t := pick_topic_terms(tk,tn,2); n := pick_dist(dlo,dhi);  -- t[2] carries the GIN scan
+                         q := hard_wild(t[1])||' <~'||n||'> '||t[2];
     END IF;
     INSERT INTO queries(shape, q) VALUES (shape, q);
   END LOOP;

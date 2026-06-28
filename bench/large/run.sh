@@ -72,7 +72,7 @@ raw_small="$(psqlq -d "$DB_S" \
   -v nqueries="$SMALL_QUERIES" -v iters="$SMALL_ITERS" -v with_pure=1 -f "$SQL")"
 s_wall=$(( $(date +%s) - s_start ))
 # raw per-query timings, for an easy reference point (gitignored)
-psqlq -d "$DB_S" -c "\copy (SELECT id, shape, q, candidates, matches, ext_op_ms, ext_2cl_ms, pure_2cl_ms FROM results ORDER BY id) TO 'bench/reports/results_small.csv' WITH (FORMAT csv, HEADER true)"
+psqlq -d "$DB_S" -c "\copy (SELECT id, shape, q, candidates, matches, ext_op_ms, ext_search_ms, pure_search_ms FROM results ORDER BY id) TO 'bench/reports/results_small.csv' WITH (FORMAT csv, HEADER true)"
 
 raw_large=""; l_wall=0
 if [ "$RUN_LARGE" = "1" ]; then
@@ -135,13 +135,19 @@ git_dirty=""; { git -C "$ROOT" diff --quiet 2>/dev/null && git -C "$ROOT" diff -
   echo
   section "$raw_small" "corpus shape"
   echo
-  echo "Overall (avg ms/query; \`slowdown\` = pure_2cl / ext_2cl)"
+  echo "Overall (avg ms/query; \`slowdown\` = pure_search / ext_search)"
   echo
   section "$raw_small" "results: overall"
   echo
   echo "By query shape"
   echo
   section "$raw_small" "results: by query shape"
+  echo
+  echo "<details><summary>Per-query breakdown — all ${SMALL_QUERIES} queries (counts + timings)</summary>"
+  echo
+  section "$raw_small" "results: per query"
+  echo
+  echo "</details>"
   echo
   echo "Parity (extension vs pure match counts; mismatches must be 0)"
   echo
@@ -165,11 +171,17 @@ git_dirty=""; { git -C "$ROOT" diff --quiet 2>/dev/null && git -C "$ROOT" diff -
     echo "By query shape"
     echo
     section "$raw_large" "results: by query shape"
+    echo
+    echo "<details><summary>Per-query breakdown — all ${LARGE_QUERIES} queries (counts)</summary>"
+    echo
+    section "$raw_large" "results: per query"
+    echo
+    echo "</details>"
   fi
   echo
   echo "- \`ext_op_ms\` — extension single operator \`tsv @~@ q\` (real-world usage)"
-  echo "- \`ext_2cl_ms\` — extension, written as the portable two-clause form (small tier only)"
-  echo "- \`pure_2cl_ms\` — pure-SQL port, the same two clauses (small tier only)"
+  echo "- \`ext_search_ms\` — extension via the consolidated \`ts_prox_search(tsv, q)\` (small tier only)"
+  echo "- \`pure_search_ms\` — pure-SQL port via the same \`ts_prox_search\` (small tier only)"
   echo
   echo "Raw per-query timings: \`bench/reports/results_small.csv\`$( [ "$RUN_LARGE" = "1" ] && echo ", \`bench/reports/results_large.csv\`")."
 } > "$REPORT"

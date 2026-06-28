@@ -68,7 +68,7 @@ BEGIN
     -- from the (doc, query) tuple; `format` quotes both robustly.
     FOR mr IN SELECT label, doc, query, expected FROM pg_temp._prox_match ORDER BY label LOOP
         n := n + 1;
-        mexpr := format('ts_prox_match(to_tsvector(%L, %L), %L)', 'simple', mr.doc, mr.query);
+        mexpr := format('ts_prox_recheck(to_tsvector(%L, %L), %L)', 'simple', mr.doc, mr.query);
         got_ext  := pg_temp._prox_eval(ext_sch, mexpr);
         got_pure := pg_temp._prox_eval('proxquery', mexpr);
         IF got_ext IS DISTINCT FROM mr.expected
@@ -95,6 +95,40 @@ BEGIN
             RAISE WARNING 'FAIL native:%  ext=[%] pure=[%] expected=[%]', mr.label, got_probe_ext, got_probe_pure, mr.expected;
             fails := fails + 1;
         END IF;
+
+        -- Recheck-droppable parity: `ts_prox_query_exact` is the gated native form (NULL for
+        -- within/pre/not-within, whose native @@ is exact but non-selective). When non-NULL,
+        -- the single `@@ ts_prox_query_exact` clause — the one-clause branch of the recommended
+        -- self-folding form — must equal the recheck, on both implementations, and the two must
+        -- agree on whether it is droppable (both NULL or both not).
+        mexpr := format('CASE WHEN ts_prox_query_exact(%L) IS NULL THEN NULL'
+                     || ' ELSE (to_tsvector(%L, %L) @@ ts_prox_query_exact(%L)) END',
+                        mr.query, 'simple', mr.doc, mr.query);
+        got_probe_ext  := pg_temp._prox_eval(ext_sch, mexpr);
+        got_probe_pure := pg_temp._prox_eval('proxquery', mexpr);
+        IF (got_probe_ext = '<null>') IS DISTINCT FROM (got_probe_pure = '<null>') THEN
+            RAISE WARNING 'FAIL exact-droppability:%  ext=[%] pure=[%]', mr.label, got_probe_ext, got_probe_pure;
+            fails := fails + 1;
+        ELSIF got_probe_ext <> '<null>'
+              AND (got_probe_ext IS DISTINCT FROM mr.expected OR got_probe_pure IS DISTINCT FROM mr.expected) THEN
+            RAISE WARNING 'FAIL exact:%  ext=[%] pure=[%] expected=[%]', mr.label, got_probe_ext, got_probe_pure, mr.expected;
+            fails := fails + 1;
+        END IF;
+
+        -- Consolidated one-call form: `ts_prox_search` (= `@@ ts_prox_query(q)` plus the
+        -- recheck-droppable fold) must agree across ports and, for a query with an index key,
+        -- equal the recheck. A keyless query makes `ts_prox_query` raise, so both collapse to
+        -- 'ERR' — still equal, and the value check is skipped for that row.
+        mexpr := format('ts_prox_search(to_tsvector(%L, %L), %L)', 'simple', mr.doc, mr.query);
+        got_probe_ext  := pg_temp._prox_eval(ext_sch, mexpr);
+        got_probe_pure := pg_temp._prox_eval('proxquery', mexpr);
+        IF got_probe_ext IS DISTINCT FROM got_probe_pure THEN
+            RAISE WARNING 'FAIL search:%  ext=[%] pure=[%]', mr.label, got_probe_ext, got_probe_pure;
+            fails := fails + 1;
+        ELSIF got_probe_ext <> 'ERR' AND got_probe_ext IS DISTINCT FROM mr.expected THEN
+            RAISE WARNING 'FAIL search-value:%  got=[%] expected=[%]', mr.label, got_probe_ext, mr.expected;
+            fails := fails + 1;
+        END IF;
     END LOOP;
 
     -- Config-aware cases (the `config` table of the spec, if loaded): the 3-arg recheck
@@ -106,7 +140,7 @@ BEGIN
     IF to_regclass('pg_temp._prox_cfg_match') IS NOT NULL THEN
         FOR mr IN SELECT label, cfg, doc, query, expected FROM pg_temp._prox_cfg_match ORDER BY label LOOP
             n := n + 1;
-            mexpr := format('ts_prox_match(to_tsvector(%L::regconfig, %L), %L, %L::regconfig)',
+            mexpr := format('ts_prox_recheck(to_tsvector(%L::regconfig, %L), %L, %L::regconfig)',
                             mr.cfg, mr.doc, mr.query, mr.cfg);
             got_ext  := pg_temp._prox_eval(ext_sch, mexpr);
             got_pure := pg_temp._prox_eval('proxquery', mexpr);
@@ -126,6 +160,21 @@ BEGIN
                                   mr.label, got_probe_ext, got_probe_pure;
                     fails := fails + 1;
                 END IF;
+            END IF;
+
+            -- 3-arg consolidated `ts_prox_search(tsv, q, cfg)` must agree across ports (it
+            -- composes the cfg skeleton + cfg recheck) and, for a keyed query, equal the
+            -- recheck. Keyless ⇒ ts_prox_query raises ⇒ both collapse to 'ERR' (still equal).
+            mexpr := format('ts_prox_search(to_tsvector(%L::regconfig, %L), %L, %L::regconfig)',
+                            mr.cfg, mr.doc, mr.query, mr.cfg);
+            got_probe_ext  := pg_temp._prox_eval(ext_sch, mexpr);
+            got_probe_pure := pg_temp._prox_eval('proxquery', mexpr);
+            IF got_probe_ext IS DISTINCT FROM got_probe_pure THEN
+                RAISE WARNING 'FAIL cfg-search:%  ext=[%] pure=[%]', mr.label, got_probe_ext, got_probe_pure;
+                fails := fails + 1;
+            ELSIF got_probe_ext <> 'ERR' AND got_probe_ext IS DISTINCT FROM mr.expected THEN
+                RAISE WARNING 'FAIL cfg-search-value:%  got=[%] expected=[%]', mr.label, got_probe_ext, mr.expected;
+                fails := fails + 1;
             END IF;
         END LOOP;
     END IF;

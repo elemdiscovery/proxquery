@@ -165,29 +165,29 @@ UNION ALL SELECT 'proxquery',
 \echo ''
 \echo '== D. suffix wildcard, STANDALONE: any *ology word =='
 \echo '-- native: vocab LIKE %ology -> OR-group (index-served)'
-\echo '-- proxquery: ts_prox_match(*ology) -- no index key, SEQ SCAN (its weak spot)'
-WITH p AS (SELECT id FROM text_record WHERE ts_prox_match(text_tsv, '*ology')),
+\echo '-- proxquery: ts_prox_recheck(*ology) -- no index key, SEQ SCAN (its weak spot)'
+WITH p AS (SELECT id FROM text_record WHERE ts_prox_recheck(text_tsv, '*ology')),
      n AS (SELECT id FROM text_record WHERE text_tsv @@ like_q('%ology'))
 SELECT (SELECT count(*) FROM (SELECT * FROM p EXCEPT SELECT * FROM n) a)
      + (SELECT count(*) FROM (SELECT * FROM n EXCEPT SELECT * FROM p) b) AS disagreements;
 SELECT 'native (vocab OR-group)' AS impl,
        bench_ms($q$SELECT count(*) FROM text_record WHERE text_tsv @@ like_q('%ology')$q$, 20) AS avg_ms
 UNION ALL SELECT 'proxquery (seq scan)',
-       bench_ms($q$SELECT count(*) FROM text_record WHERE ts_prox_match(text_tsv, '*ology')$q$, 5);
+       bench_ms($q$SELECT count(*) FROM text_record WHERE ts_prox_recheck(text_tsv, '*ology')$q$, 5);
 
 -- ===========================================================================
 \echo ''
 \echo '== E. single-token regex, STANDALONE: a 9-digit number =='
 \echo '-- native: vocab ~ ^[0-9]{9}$ -> OR-group (index-served)'
-\echo '-- proxquery: ts_prox_match(##[0-9]{9}##) -- SEQ SCAN'
-WITH p AS (SELECT id FROM text_record WHERE ts_prox_match(text_tsv, '##[0-9]{9}##')),
+\echo '-- proxquery: ts_prox_recheck(##[0-9]{9}##) -- SEQ SCAN'
+WITH p AS (SELECT id FROM text_record WHERE ts_prox_recheck(text_tsv, '##[0-9]{9}##')),
      n AS (SELECT id FROM text_record WHERE text_tsv @@ regex_q('^[0-9]{9}$'))
 SELECT (SELECT count(*) FROM (SELECT * FROM p EXCEPT SELECT * FROM n) a)
      + (SELECT count(*) FROM (SELECT * FROM n EXCEPT SELECT * FROM p) b) AS disagreements;
 SELECT 'native (vocab OR-group)' AS impl,
        bench_ms($q$SELECT count(*) FROM text_record WHERE text_tsv @@ regex_q('^[0-9]{9}$')$q$, 5) AS avg_ms
 UNION ALL SELECT 'proxquery (seq scan)',
-       bench_ms($q$SELECT count(*) FROM text_record WHERE ts_prox_match(text_tsv, '##[0-9]{9}##')$q$, 5);
+       bench_ms($q$SELECT count(*) FROM text_record WHERE ts_prox_recheck(text_tsv, '##[0-9]{9}##')$q$, 5);
 
 -- ===========================================================================
 \echo ''

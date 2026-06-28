@@ -82,17 +82,26 @@ jobs:
     name: benchmark (pg17)
     runs-on: ubuntu-latest
     # On a PR this posts/updates a sticky benchmark comment; on main pushes and
-    # manual runs it just uploads the report artifact. Parity is also gated
-    # independently on every PR by the matrix job's pure_sql_port_matches_extension
-    # test. The benchmark needs a full Postgres build and its timings are runner-
-    # noise, so read the comment as a smoke + parity check, not a perf baseline.
+    # manual runs it just uploads the report artifact. The main by-shape table is
+    # the large-bench small tier (a deterministic COCA-frequency corpus + generated
+    # query mix), so every shape is exercised across a real spread of term
+    # frequencies and selectivities — not a fixed handful of terms. Parity is also
+    # gated independently on every PR by the matrix job's
+    # pure_sql_port_matches_extension test. The benchmark needs a full Postgres build
+    # and its timings are runner-noise, so read the comment as a smoke + parity
+    # check, not a perf baseline.
     permissions:
       contents: read
       pull-requests: write     # post / update the PR comment
     env:
       PGRX_VERSION: 0.19.1
-      # Propagated to the shell, read by bench/report.sh. A small corpus and few
-      # iterations — CI just needs correctness + a smoke run, not stable timings.
+      # Read by bench/report.sh. Main by-shape table: small large-bench tier (varied,
+      # frequency-skewed query mix). NDOCS/ITERS feed the supplementary tokenizer +
+      # scaling sections. Small corpus + few iters — correctness + smoke, not stable
+      # timings.
+      SMALL_MB: 64
+      NQUERIES: 160
+      LB_ITERS: 2
       NDOCS: 10000
       ITERS: 3
 

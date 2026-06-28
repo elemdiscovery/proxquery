@@ -3,7 +3,7 @@
 -- Generates random documents and random DSL queries (seeded, so a failure is
 -- reproducible) and, for each pair, checks two things in one session:
 --
---   A. recheck parity     — ext ts_prox_match == pure ts_prox_match
+--   A. recheck parity     — ext ts_prox_recheck == pure ts_prox_recheck
 --   B. superset invariant — for EACH implementation, a recheck match implies the
 --      index skeleton selects it: NOT (match AND NOT (doc @@ ts_prox_query(q))).
 --      When ts_prox_query has no index key it raises (→ 'ERR'); that is the
@@ -98,7 +98,7 @@ BEGIN
     FOR i IN 1..N LOOP
         doc := pg_temp._fz_doc();
         q   := pg_temp._fz_query(3);
-        match_expr := format('ts_prox_match(to_tsvector(%L, %L), %L)', 'simple', doc, q);
+        match_expr := format('ts_prox_recheck(to_tsvector(%L, %L), %L)', 'simple', doc, q);
         sel_expr   := format('to_tsvector(%L, %L) @@ ts_prox_query(%L)', 'simple', doc, q);
 
         m_ext  := pg_temp._prox_eval(ext_sch, match_expr);
@@ -137,6 +137,23 @@ BEGIN
         ELSIF nat_ext <> '<null>'
               AND (nat_ext IS DISTINCT FROM m_ext OR nat_pure IS DISTINCT FROM m_ext) THEN
             RAISE WARNING 'NATIVE DIVERGENCE  doc=[%] q=[%]  native ext=[%] pure=[%] recheck=[%]', doc, q, nat_ext, nat_pure, m_ext;
+            fails := fails + 1;
+        END IF;
+
+        -- D. recheck-droppable parity: `ts_prox_query_exact` (the gated native form — NULL
+        --    for within/pre/not-within) must, when non-NULL, equal the recheck on both
+        --    implementations, and the two must agree on whether it is droppable.
+        nat_expr := format('CASE WHEN ts_prox_query_exact(%L) IS NULL THEN NULL'
+                        || ' ELSE (to_tsvector(%L, %L) @@ ts_prox_query_exact(%L)) END',
+                           q, 'simple', doc, q);
+        nat_ext  := pg_temp._prox_eval(ext_sch, nat_expr);
+        nat_pure := pg_temp._prox_eval('proxquery', nat_expr);
+        IF (nat_ext = '<null>') IS DISTINCT FROM (nat_pure = '<null>') THEN
+            RAISE WARNING 'EXACT DROPPABILITY DIVERGENCE  doc=[%] q=[%]  ext=[%] pure=[%]', doc, q, nat_ext, nat_pure;
+            fails := fails + 1;
+        ELSIF nat_ext <> '<null>'
+              AND (nat_ext IS DISTINCT FROM m_ext OR nat_pure IS DISTINCT FROM m_ext) THEN
+            RAISE WARNING 'EXACT DIVERGENCE  doc=[%] q=[%]  exact ext=[%] pure=[%] recheck=[%]', doc, q, nat_ext, nat_pure, m_ext;
             fails := fails + 1;
         END IF;
     END LOOP;

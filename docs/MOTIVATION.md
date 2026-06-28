@@ -59,7 +59,7 @@ Two things genuinely need compiled code; everything else is a speed/concision wi
    ts_prox_query('q')` plus a recheck. Planner support functions **cannot be written
    in SQL or PL/pgSQL** — they must be compiled. Without the binary you can still
    get the same *result*, but only as the hand-written two-clause form
-   (`text_tsv @@ ts_prox_query(q) AND ts_prox_match(text_tsv, q)`), never one
+   (`text_tsv @@ ts_prox_query(q) AND ts_prox_recheck(text_tsv, q)`), never one
    operator.
 
 2. **Fast position access.** Reading "the positions of lexeme X" in SQL means

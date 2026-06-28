@@ -128,12 +128,12 @@ SELECT 'enumeration',
 -- proxquery DSL compiler path: one query string drives both clauses.
 -- ---------------------------------------------------------------------------
 \echo ''
-\echo '== compiler path: ts_prox_query + ts_prox_match via the proxsearch() wrapper =='
+\echo '== compiler path: ts_prox_query + ts_prox_recheck via the proxsearch() wrapper =='
 -- An inlinable SQL wrapper so the planner still uses the GIN index. NOT shipped
 -- in the extension; generated per searchable table.
 CREATE OR REPLACE FUNCTION proxsearch(q text) RETURNS SETOF text_record AS $$
   SELECT * FROM text_record
-  WHERE text_tsv @@ ts_prox_query(q) AND ts_prox_match(text_tsv, q)
+  WHERE text_tsv @@ ts_prox_query(q) AND ts_prox_recheck(text_tsv, q)
 $$ LANGUAGE sql STABLE;
 
 \echo '-- parity: proxsearch(compiler) vs hand-written ts_prox_not_within (disagreements must be 0)'
@@ -160,7 +160,7 @@ SELECT 'unnest',
                            WHERE wb.lexeme='email' AND abs(ap-bp)<=5))$q$, 20) AS avg_ms;
 
 \echo ''
-\echo '== plan: proxsearch() compiler path (expect Bitmap Index Scan + ts_prox_match Filter) =='
+\echo '== plan: proxsearch() compiler path (expect Bitmap Index Scan + ts_prox_recheck Filter) =='
 EXPLAIN (COSTS off, TIMING off, SUMMARY off)
 SELECT count(*) FROM proxsearch('confidential <!~5> email');
 
@@ -191,6 +191,6 @@ SELECT bench_ms($q$SELECT count(*) FROM text_record
                    WHERE text_tsv @~@ 'confidential <!~5> email'$q$, 20) AS op_ms;
 
 \echo ''
-\echo '== plan: text_tsv @~@ q (expect Bitmap Index Scan + ts_prox_match recheck) =='
+\echo '== plan: text_tsv @~@ q (expect Bitmap Index Scan + ts_prox_recheck recheck) =='
 EXPLAIN (ANALYZE, BUFFERS, COSTS off, TIMING off, SUMMARY off)
 SELECT count(*) FROM text_record WHERE text_tsv @~@ 'confidential <!~5> email';

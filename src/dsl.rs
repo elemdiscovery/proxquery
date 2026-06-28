@@ -612,7 +612,7 @@ pub fn to_tsquery_string(input: &str) -> Result<String, String> {
 //
 // For the common bounded-proximity shapes the positional test can be expressed as
 // a native `tsquery` and evaluated by Postgres's own (fast, C) phrase engine in the
-// GIN `@@` heap recheck — so the custom `ts_prox_match` recheck is dropped entirely
+// GIN `@@` heap recheck — so the custom `ts_prox_recheck` recheck is dropped entirely
 // (the planner support fn marks the index condition non-lossy). within/pre lower to
 // an OR over exact gaps, which is exactly the proximity predicate:
 //   a <~n> b  ≡  OR_{k=0..n} (a <k> b | b <k> a)   (either order, |Δ| ≤ n)
@@ -640,6 +640,40 @@ pub const NATIVE_MAX_DISTANCE: i32 = 32;
 /// presence + recheck path).
 pub fn native_tsquery_string(input: &str) -> Option<String> {
     native(&normalize(parse(input).ok()?))
+}
+
+/// The native tsquery string for the `@~@` operator's `simplify` rewrite: like
+/// [`native_tsquery_string`], but `None` for any query containing a `within`/`pre`
+/// (`<~N>` / `<-N>`) node. Those ARE native-expressible — and the pure-SQL port and the
+/// `@@ ts_prox_query_native` recheck still use that expansion — but `simplify` must NOT
+/// rewrite the whole `@~@` clause to it. The expansion is an OR over exact gaps
+/// (`2·(n+1)` / `n` phrase clauses); as the *sole* index driver it replaces the
+/// selective `a & b` presence skeleton, and the planner mis-estimates the OR-of-phrases
+/// into a sequential scan over the whole table. Declining here keeps within/pre on the
+/// [`crate::support::index_condition`] path — the `a & b` skeleton drives the GIN index
+/// and a cheap positional recheck filters it, the same fast plan as the portable
+/// two-clause form. The rewrite is kept only where it is an unambiguous win: phrase,
+/// exact `<N>`, and boolean, whose native form IS the selective skeleton (just with the
+/// recheck dropped, since its `@@` is the index probe).
+pub fn simplify_tsquery_string(input: &str) -> Option<String> {
+    let node = normalize(parse(input).ok()?);
+    if contains_within(&node) {
+        return None;
+    }
+    native(&node)
+}
+
+/// Whether the normalized AST contains a `within`/`pre` (`Node::Within`) node anywhere —
+/// the gate for [`simplify_tsquery_string`]. `not within` already lowers to `None` in
+/// [`native`], so it needs no separate guard here.
+fn contains_within(node: &Node) -> bool {
+    match node {
+        Node::Within { .. } => true,
+        Node::NotWithin { a, b, .. } => contains_within(a) || contains_within(b),
+        Node::And(v) | Node::Or(v) => v.iter().any(contains_within),
+        Node::Not(x) => contains_within(x),
+        _ => false,
+    }
 }
 
 /// A lexeme quoted for the native tsquery, or `None` if it can't survive `tsqueryin`

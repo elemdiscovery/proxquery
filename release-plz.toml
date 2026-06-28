@@ -56,7 +56,9 @@ commit_parsers = [
 
     # Also kept, in their own sections.
     { message = "^docs",   group = "documentation" },
-    { message = "^test",   group = "testing" },
+
+    # Mark as breaking if you want to mention it
+    { message = "^test",   group = "testing", skip = true },
 
     # Development noise — dropped.
     { message = "^refactor", skip = true },

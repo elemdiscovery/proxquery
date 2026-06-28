@@ -2,10 +2,12 @@
 //! `gin(tsvector)` index, with no custom operator class. Two requests:
 //!
 //! * **simplify** ([`pg_sys::SupportRequestSimplify`], [`simplify`]) — when the query
-//!   is a constant that maps EXACTLY onto a native `tsquery` (bounded within/pre/
-//!   phrase), rewrite the whole clause to a plain `tsvector @@ ts_prox_query_native('q')`.
-//!   Postgres's own (C) phrase engine then evaluates it in the GIN `@@` heap recheck,
-//!   so the custom positional recheck is dropped entirely (one detoast, not two).
+//!   is a constant that maps EXACTLY onto a native `tsquery` AND that native form is the
+//!   selective index probe (phrase, exact `<N>`, boolean — NOT `within`/`pre`, whose
+//!   OR-expansion would seq-scan; see [`crate::dsl::simplify_tsquery_string`]), rewrite
+//!   the whole clause to a plain `tsvector @@ ts_prox_query_native('q')`. Postgres's own
+//!   (C) phrase engine then evaluates it in the GIN `@@` heap recheck, so the custom
+//!   positional recheck is dropped entirely (one detoast, not two).
 //! * **index condition** ([`pg_sys::SupportRequestIndexCondition`], [`index_condition`])
 //!   — for everything else, hand back `tsvector @@ ts_prox_query('q')` (the lexeme-
 //!   presence skeleton) marked **lossy**, so the original `@~@` stays as the positional
@@ -29,7 +31,7 @@ pub unsafe fn index_condition(node: *mut pg_sys::Node) -> Option<Internal> {
     }
     let req = node.cast::<pg_sys::SupportRequestIndexCondition>();
 
-    // The clause is `tsvector @~@ text` (OpExpr) or `ts_prox_match(tsvector, text)`
+    // The clause is `tsvector @~@ text` (OpExpr) or `ts_prox_recheck(tsvector, text)`
     // (FuncExpr) — both carry the two operands in `args`.
     let clause = (*req).node;
     if clause.is_null() {
@@ -55,7 +57,7 @@ pub unsafe fn index_condition(node: *mut pg_sys::Node) -> Option<Internal> {
     // If the query is a constant with no positive index term — a bare wildcard,
     // regex, or pure negation — offer no index condition. Otherwise we'd inject
     // `@@ ts_prox_query(const)`, which the planner folds and which *errors* for such
-    // queries; instead let the `@~@` / `ts_prox_match` filter handle it (seq scan).
+    // queries; instead let the `@~@` / `ts_prox_recheck` filter handle it (seq scan).
     // The DSL string comes from the `text` operand or the `proxquery` composite's `q`.
     if let Some(s) = const_dsl(query) {
         if crate::dsl::to_tsquery_string(&s).is_err() {
@@ -110,14 +112,16 @@ pub unsafe fn index_condition(node: *mut pg_sys::Node) -> Option<Internal> {
     Some(Internal::from(Some(pg_sys::Datum::from(result))))
 }
 
-/// `SupportRequestSimplify` for `@~@` / `ts_prox_match`: when the (constant, plain-
-/// `text`) query maps EXACTLY onto a native `tsquery` (bounded within/pre/phrase —
-/// see [`crate::dsl::native_tsquery_string`]), rewrite the whole clause to a plain
+/// `SupportRequestSimplify` for `@~@` / `ts_prox_recheck`: when the (constant, plain-
+/// `text`) query maps EXACTLY onto a native `tsquery` whose `@@` is ALSO the selective
+/// index probe (phrase / exact `<N>` / boolean — see
+/// [`crate::dsl::simplify_tsquery_string`]), rewrite the whole clause to a plain
 /// `tsvector @@ ts_prox_query_native(query)`. That `@@` is GIN-indexable and carries
 /// its own (AM-level) exact recheck, so the custom positional recheck is gone
 /// entirely — and the rewrite is equivalent everywhere, seq scan included. Returns
 /// `None` (no rewrite) otherwise: runtime parameters, the `proxquery` (cfg/analyzer)
-/// operand, and queries that aren't fully native-expressible keep the presence
+/// operand, `within`/`pre` (whose OR-expansion would lose the `a & b` index driver and
+/// seq-scan), and queries that aren't fully native-expressible — all keep the presence
 /// skeleton + recheck via [`index_condition`].
 ///
 /// # Safety
@@ -130,7 +134,7 @@ pub unsafe fn simplify(node: *mut pg_sys::Node) -> Option<Internal> {
     if fcall.is_null() {
         return None;
     }
-    // `@~@` / `ts_prox_match(tsvector, text)`: arg 0 is the tsvector, arg 1 the query.
+    // `@~@` / `ts_prox_recheck(tsvector, text)`: arg 0 is the tsvector, arg 1 the query.
     let args = (*fcall).args;
     if args.is_null() || (*args).length != 2 {
         return None;
@@ -145,7 +149,10 @@ pub unsafe fn simplify(node: *mut pg_sys::Node) -> Option<Internal> {
         return None;
     }
     let s = const_dsl(query)?;
-    let native_str = crate::dsl::native_tsquery_string(&s)?; // bail unless native-expressible
+    // Bail unless the query is safely rewritable: native-expressible AND free of
+    // within/pre (whose OR-expansion, as the sole index driver, would seq-scan — see
+    // `simplify_tsquery_string`). Those fall through to `index_condition` instead.
+    let native_str = crate::dsl::simplify_tsquery_string(&s)?;
 
     let at_at = pg_sys::OpernameGetOprid(
         pg_sys::stringToQualifiedNameList(c"@@".as_ptr(), ptr::null_mut()),

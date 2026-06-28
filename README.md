@@ -41,19 +41,19 @@ docker run --rm -e POSTGRES_PASSWORD=pw ghcr.io/elemdiscovery/proxquery:pg17
 
 For managed Postgres, [sql/proxquery_pure.sql](sql/proxquery_pure.sql) is a re-implementation of the DSL using plain SQL with the same function names and identical results, installed into a dedicated `proxquery` schema.
 
-The usage difference is that the `@~@` operator needs a compiled planner support function, so the pure port does **not** implement it and you need to call two functions for each query to properly use the index. The custom `tsvector` building is also not supported.
+The usage difference is that the `@~@` operator needs a compiled planner support function, so the pure port does **not** implement it and you instead use a plain sql function.
 
 ```sql
-SELECT * FROM docs
-WHERE body_tsv @@ proxquery.ts_prox_query('quick <~3> fox')   -- GIN index selects
-  AND proxquery.ts_prox_match(body_tsv, 'quick <~3> fox');      -- recheck refines
+SELECT * FROM docs WHERE proxquery.ts_prox_search(body_tsv, 'quick <~3> fox');
 ```
 
-The practical difference is that the pure SQL implementation is much, much slower. Based on some [unnecessarily complex benchmarks](https://github.com/elemdiscovery/proxquery/actions/workflows/benchmark.yml) it is more than 20x slower.
+The `ts_prox_search` function relies on the query planner inlining the underlying function. I recommend testing your actual application usage with `EXPLAIN` to ensure it works as expected, and move the function logic into your application if necessary.
+
+The practical difference is that the pure SQL implementation is much, much slower for the scenarios that require parsing the stored `ts_vector`. There are some [unnecessarily complex benchmarks](https://github.com/elemdiscovery/proxquery/actions/workflows/benchmark.yml) breaking down performance differences by query type.
 
 The intended usage of the `.sql` file is that you can install it using your usual migration process. Updates (if desired) would be done by full replacement in another migration.
 
-If you somehow get the real extension installed later, the migration from the pure SQL implementation to the extension is `DROP SCHEMA proxquery CASCADE; CREATE EXTENSION proxquery SCHEMA proxquery;`. The two-clause queries keep working as-is. See [docs/PURE_SQL.md](docs/PURE_SQL.md) for some AI-babble details.
+If you somehow get the real extension installed later, the migration from the pure SQL implementation to the extension is `DROP SCHEMA proxquery CASCADE; CREATE EXTENSION proxquery SCHEMA proxquery;`. The queries keep working as-is. See [docs/PURE_SQL.md](docs/PURE_SQL.md) for some AI-babble details.
 
 ## Usage
 
@@ -70,7 +70,7 @@ SELECT * FROM docs WHERE body_tsv @~@ 'quick <~3> fox';
 SELECT * FROM docs WHERE body_tsv @~@ 'confidential <!~5> email';
 ```
 
-The operator `@~@` is syntax sugar for the compound usage of `ts_prox_query` and `ts_prox_match`. The `ts_prox_query` portion acts on the plain `gin(tsvector)` index and selects candidate rows by lexeme. The `ts_prox_match` then rechecks word positions in order to refine the result when necessary.
+The operator `@~@` is syntax sugar for the compound usage of `ts_prox_query` and `ts_prox_recheck`. The `ts_prox_query` portion acts on the plain `gin(tsvector)` index and selects candidate rows by lexeme. The `ts_prox_recheck` then rechecks word positions in order to refine the result when necessary.
 
 Ranking results isn't a goal of this extension, but `ts_prox_query(q)` returns a real `tsquery`, so `ts_rank_cd` can be used to get a result. It won't be particularly meaningful for complex queries.
 
@@ -118,9 +118,7 @@ By default the `@~@` operator assumes the `simple` config on the `tsvector`. To 
 SELECT * FROM docs WHERE body_tsv @~@ proxquery('english', 'running <~3> shoes');
 
 -- or in the pure SQL port
-SELECT * FROM docs
-WHERE body_tsv @@ proxquery.ts_prox_query('running <~3> shoes', 'english')
-  AND proxquery.ts_prox_match(body_tsv, 'running <~3> shoes', 'english');
+SELECT * FROM docs WHERE proxquery.ts_prox_search(body_tsv, 'running <~3> shoes', 'english');
 ```
 
 ### Custom text search configuration
@@ -185,20 +183,21 @@ You can combine the custom analyzers with built-in dictionaries, with `:dict`, e
 
 The `@~@` operator is built on functions that can also be used directly:
 
-- `ts_prox_query(text [, regconfig]) -> tsquery` -- uses the gin index.
-- `ts_prox_match(tsvector, text [, regconfig]) -> bool` -- rechecks the match based on positions.
+- `ts_prox_query(text [, regconfig]) -> tsquery` -- the index-selection skeleton (drives the GIN index).
+- `ts_prox_recheck(tsvector, text [, regconfig]) -> bool` -- rechecks word positions.
+- `ts_prox_search(tsvector, text [, regconfig]) -> bool` -- `ts_prox_query` + `ts_prox_recheck` in one call; the standard form for the pure-SQL port (the extension has `@~@`).
 
-The custom tokenizer relies on `proxquery_to_tsvector` and `proxquery_match` which includes a parameter for which analyzer to use.
+The custom tokenizer relies on `proxquery_to_tsvector` and `proxquery_recheck` which includes a parameter for which analyzer to use.
 
 - `proxquery_to_tsvector(body: text, analyzer: text) -> tsvector` -- builds a `tsvector` with a given analyzer.
-- `proxquery_match(tsvector, query: text, analyzer: text) -> bool` -- positional recheck for a given analyzer.
+- `proxquery_recheck(tsvector, query: text, analyzer: text) -> bool` -- positional recheck for a given analyzer.
 
 These then use lower level functions that you probably don't need:
 
-- `ts_prox_within(tsvector, a, b, n)`, `ts_prox_pre(...)`, `ts_prox_not_within(...)`,
-  `ts_prox_chain(tsvector, text[], int[])` -- positional predicates.
-- `ts_prox_positions(tsvector, lexeme)` / `ts_prox_positions_prefix(tsvector, prefix)` --
-  sorted positions of a lexeme.
+- `ts_prox_query_skeleton(text) -> text` -- the `to_tsquery` input behind `ts_prox_query`.
+- `ts_prox_within(tsvector, a, b, n)`, `ts_prox_pre(...)`, `ts_prox_not_within(...)` -- positional predicates.
+- `ts_prox_positions(tsvector, lexeme)` / `ts_prox_positions_prefix(tsvector, prefix)` -- sorted positions of a lexeme.
+- `ts_prox_chain(tsvector, text[], int[])` -- occurrence chain
 
 Notice `ts_prox_chain` isn't the same as using the proximity operators in an associative way and is not available via DSL syntax.
 

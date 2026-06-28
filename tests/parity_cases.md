@@ -20,20 +20,20 @@ literal-tsvector cases).
 | label | expression | expected |
 | --- | --- | --- |
 | `err1` | ` ts_prox_query('*ology') ` | `ERR` |
-| `err2` | ` ts_prox_match(to_tsvector('simple','a b'),'(a <~5> b') ` | `ERR` |
-| `err3` | ` ts_prox_match(to_tsvector('simple','a b'),'a <!5> b') ` | `ERR` |
-| `err4` | ` ts_prox_match(to_tsvector('simple','a b'),'a &') ` | `ERR` |
-| `err5` | ` ts_prox_match(to_tsvector('simple','alpha beta'),'##[##') ` | `ERR` |
-| `err6` | ` ts_prox_match(to_tsvector('simple','alpha beta'),'alpha \| ##[##') ` | `ERR` |
+| `err2` | ` ts_prox_recheck(to_tsvector('simple','a b'),'(a <~5> b') ` | `ERR` |
+| `err3` | ` ts_prox_recheck(to_tsvector('simple','a b'),'a <!5> b') ` | `ERR` |
+| `err4` | ` ts_prox_recheck(to_tsvector('simple','a b'),'a &') ` | `ERR` |
+| `err5` | ` ts_prox_recheck(to_tsvector('simple','alpha beta'),'##[##') ` | `ERR` |
+| `err6` | ` ts_prox_recheck(to_tsvector('simple','alpha beta'),'alpha \| ##[##') ` | `ERR` |
 | `err7` | ` ts_prox_query('!foo') ` | `ERR` |
-| `err8` | ` ts_prox_match(to_tsvector('simple','a b'),'') ` | `ERR` |
-| `bst1` | ` ts_prox_match(to_tsvector('simple','something here'),'something *') ` | `ERR` |
+| `err8` | ` ts_prox_recheck(to_tsvector('simple','a b'),'') ` | `ERR` |
+| `bst1` | ` ts_prox_recheck(to_tsvector('simple','something here'),'something *') ` | `ERR` |
 
 single quote is the literal-term delimiter: a raw apostrophe (`it's`) opens a literal that never closes, and `''` is an empty literal — both must raise.
 
 | label | expression | expected |
 | --- | --- | --- |
-| `litErr1` | ` ts_prox_match(to_tsvector('simple','a b'), $$it's here$$) ` | `ERR` |
+| `litErr1` | ` ts_prox_recheck(to_tsvector('simple','a b'), $$it's here$$) ` | `ERR` |
 | `litErr2` | ` ts_prox_query($$''$$) ` | `ERR` |
 
 a distance must be a non-empty run of digits. Anything else — embedded space, trailing junk, a sign, or empty — raises on BOTH implementations (no silent coercion to a default distance). `<-N>` stays the legitimate ordered operator; only a malformed body errors.
@@ -50,15 +50,15 @@ full pipeline: index selection AND recheck (the decomposed two-clause form)
 
 | label | expression | expected |
 | --- | --- | --- |
-| `f1` | ` to_tsvector('simple','a x b') @@ ts_prox_query('a <~2> b') AND ts_prox_match(to_tsvector('simple','a x b'),'a <~2> b') ` | `true` |
-| `f2` | ` to_tsvector('simple','a x y z b') @@ ts_prox_query('a <~2> b') AND ts_prox_match(to_tsvector('simple','a x y z b'),'a <~2> b') ` | `false` |
-| `f3` | ` to_tsvector('simple','a alone') @@ ts_prox_query('a <~2> b') AND ts_prox_match(to_tsvector('simple','a alone'),'a <~2> b') ` | `false` |
-| `f4` | ` to_tsvector('simple','the study of biology') @@ ts_prox_query('study <~3> *ology') AND ts_prox_match(to_tsvector('simple','the study of biology'),'study <~3> *ology') ` | `true` |
-| `f5` | ` to_tsvector('simple','the study of cats') @@ ts_prox_query('study <~3> *ology') AND ts_prox_match(to_tsvector('simple','the study of cats'),'study <~3> *ology') ` | `false` |
-| `f6` | ` to_tsvector('simple','ssn 123456789 here') @@ ts_prox_query('ssn <~3> ##[0-9]{9}##') AND ts_prox_match(to_tsvector('simple','ssn 123456789 here'),'ssn <~3> ##[0-9]{9}##') ` | `true` |
-| `f7` | ` to_tsvector('simple','ssn abc here') @@ ts_prox_query('ssn <~3> ##[0-9]{9}##') AND ts_prox_match(to_tsvector('simple','ssn abc here'),'ssn <~3> ##[0-9]{9}##') ` | `false` |
-| `op1` | ` to_tsvector('simple','a x b') @@ ts_prox_query('a <~2> b') AND ts_prox_match(to_tsvector('simple','a x b'),'a <~2> b') ` | `true` |
-| `op2` | ` to_tsvector('simple','a x y z b') @@ ts_prox_query('a <~2> b') AND ts_prox_match(to_tsvector('simple','a x y z b'),'a <~2> b') ` | `false` |
+| `f1` | ` to_tsvector('simple','a x b') @@ ts_prox_query('a <~2> b') AND ts_prox_recheck(to_tsvector('simple','a x b'),'a <~2> b') ` | `true` |
+| `f2` | ` to_tsvector('simple','a x y z b') @@ ts_prox_query('a <~2> b') AND ts_prox_recheck(to_tsvector('simple','a x y z b'),'a <~2> b') ` | `false` |
+| `f3` | ` to_tsvector('simple','a alone') @@ ts_prox_query('a <~2> b') AND ts_prox_recheck(to_tsvector('simple','a alone'),'a <~2> b') ` | `false` |
+| `f4` | ` to_tsvector('simple','the study of biology') @@ ts_prox_query('study <~3> *ology') AND ts_prox_recheck(to_tsvector('simple','the study of biology'),'study <~3> *ology') ` | `true` |
+| `f5` | ` to_tsvector('simple','the study of cats') @@ ts_prox_query('study <~3> *ology') AND ts_prox_recheck(to_tsvector('simple','the study of cats'),'study <~3> *ology') ` | `false` |
+| `f6` | ` to_tsvector('simple','ssn 123456789 here') @@ ts_prox_query('ssn <~3> ##[0-9]{9}##') AND ts_prox_recheck(to_tsvector('simple','ssn 123456789 here'),'ssn <~3> ##[0-9]{9}##') ` | `true` |
+| `f7` | ` to_tsvector('simple','ssn abc here') @@ ts_prox_query('ssn <~3> ##[0-9]{9}##') AND ts_prox_recheck(to_tsvector('simple','ssn abc here'),'ssn <~3> ##[0-9]{9}##') ` | `false` |
+| `op1` | ` to_tsvector('simple','a x b') @@ ts_prox_query('a <~2> b') AND ts_prox_recheck(to_tsvector('simple','a x b'),'a <~2> b') ` | `true` |
+| `op2` | ` to_tsvector('simple','a x y z b') @@ ts_prox_query('a <~2> b') AND ts_prox_recheck(to_tsvector('simple','a x y z b'),'a <~2> b') ` | `false` |
 
 positional predicate functions
 
@@ -135,9 +135,9 @@ distance clamp `<0>` = same position, on a literal co-located tsvector
 
 | label | expression | expected |
 | --- | --- | --- |
-| `z0b` | ` ts_prox_match($$'a':1 'b':1$$::tsvector,'a <~0> b') ` | `true` |
-| `z0c` | ` ts_prox_match($$'a':1 'b':1$$::tsvector,'a <0> b') ` | `true` |
-| `z0e` | ` ts_prox_match($$'a':1 'b':1$$::tsvector,'a <-0> b') ` | `false` |
+| `z0b` | ` ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <~0> b') ` | `true` |
+| `z0c` | ` ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <0> b') ` | `true` |
+| `z0e` | ` ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <-0> b') ` | `false` |
 | `z0f` | ` ts_prox_query_skeleton('a <0> b') ` | `('a' <0> 'b')` |
 
 distance saturation: a large or overflowing distance clamps to MAX (16383) — it does NOT error. The clamp is observable through the phrase-distance skeleton (within/pre lower to `&`, hiding N); `<16384>` (just over), an 8-digit value, and a value past i32 all collapse to the same `<16383>`, and a huge `<~N>` still matches (saturates, not errors).
@@ -148,15 +148,15 @@ distance saturation: a large or overflowing distance clamps to MAX (16383) — i
 | `dsat2` | ` ts_prox_query_skeleton('a <16384> b') ` | `('a' <16383> 'b')` |
 | `dsat3` | ` ts_prox_query_skeleton('a <99999999> b') ` | `('a' <16383> 'b')` |
 | `dsat4` | ` ts_prox_query_skeleton('a <999999999999> b') ` | `('a' <16383> 'b')` |
-| `dsat5` | ` ts_prox_match(to_tsvector('simple','a x b'),'a <~999999> b') ` | `true` |
+| `dsat5` | ` ts_prox_recheck(to_tsvector('simple','a x b'),'a <~999999> b') ` | `true` |
 
 single-quoted literal terms (the `''` escape; no operator/glob meaning) matched verbatim against a literal tsvector — shared DSL behavior on both implementations. `'it''s'` resolves to the lexeme it's; an apostrophe-stripped/prefix tsvector misses.
 
 | label | expression | expected |
 | --- | --- | --- |
-| `litq1` | ` ts_prox_match($$'it''s':1$$::tsvector, $$'it''s'$$) ` | `true` |
-| `litq2` | ` ts_prox_match($$'its':1 'it':2$$::tsvector, $$'it''s'$$) ` | `false` |
-| `litq3` | ` ts_prox_match($$'a*b':1$$::tsvector, $$'a*b'$$) ` | `true` |
+| `litq1` | ` ts_prox_recheck($$'it''s':1$$::tsvector, $$'it''s'$$) ` | `true` |
+| `litq2` | ` ts_prox_recheck($$'its':1 'it':2$$::tsvector, $$'it''s'$$) ` | `false` |
+| `litq3` | ` ts_prox_recheck($$'a*b':1$$::tsvector, $$'a*b'$$) ` | `true` |
 
 non-ASCII surface coverage: position accessor, prefix scan, skeleton lowering. Locale-robust (no uppercase accents); see docs/CONFIG_AWARE.md for the uppercase-accent / config-aware lexing discussion.
 
@@ -171,19 +171,19 @@ config-aware (3-arg): query terms resolved through the column's text-search conf
 
 | label | expression | expected |
 | --- | --- | --- |
-| `cfg1` | ` ts_prox_match(to_tsvector('english','the running shoes'),'running <~2> shoes','english') ` | `true` |
-| `cfg2` | ` ts_prox_match(to_tsvector('english','the running shoes'),'run <~2> shoe','english') ` | `true` |
-| `cfg3` | ` ts_prox_match(to_tsvector('english','the walking shoes'),'running <~2> shoes','english') ` | `false` |
+| `cfg1` | ` ts_prox_recheck(to_tsvector('english','the running shoes'),'running <~2> shoes','english') ` | `true` |
+| `cfg2` | ` ts_prox_recheck(to_tsvector('english','the running shoes'),'run <~2> shoe','english') ` | `true` |
+| `cfg3` | ` ts_prox_recheck(to_tsvector('english','the walking shoes'),'running <~2> shoes','english') ` | `false` |
 | `cfg4` | ` ts_prox_query('running <~2> shoes','english')::text ` | `'run' & 'shoe'` |
 | `cfg5` | ` to_tsvector('english','the running shoes') @@ ts_prox_query('running <~2> shoes','english') ` | `true` |
-| `cfg6` | ` to_tsvector('english','the running shoes') @@ ts_prox_query('running <~2> shoes','english') AND ts_prox_match(to_tsvector('english','the running shoes'),'running <~2> shoes','english') ` | `true` |
-| `cfg7` | ` ts_prox_match(to_tsvector('english','quick brown foxes jumped'),'fox <~2> jump','english') ` | `true` |
-| `cfg8` | ` ts_prox_match(to_tsvector('english','the running shoes'),'"running shoes"','english') ` | `true` |
-| `cfg9` | ` ts_prox_match(to_tsvector('english','the running shoes'),'walking <~2> shoes','english') ` | `false` |
+| `cfg6` | ` to_tsvector('english','the running shoes') @@ ts_prox_query('running <~2> shoes','english') AND ts_prox_recheck(to_tsvector('english','the running shoes'),'running <~2> shoes','english') ` | `true` |
+| `cfg7` | ` ts_prox_recheck(to_tsvector('english','quick brown foxes jumped'),'fox <~2> jump','english') ` | `true` |
+| `cfg8` | ` ts_prox_recheck(to_tsvector('english','the running shoes'),'"running shoes"','english') ` | `true` |
+| `cfg9` | ` ts_prox_recheck(to_tsvector('english','the running shoes'),'walking <~2> shoes','english') ` | `false` |
 
 ## Match cases
 
-Recheck pairs run as `ts_prox_match(to_tsvector('simple', doc), query)`.
+Recheck pairs run as `ts_prox_recheck(to_tsvector('simple', doc), query)`.
 
 | label | doc | query | expected |
 | --- | --- | --- | --- |
@@ -291,7 +291,7 @@ non-ASCII: accented Latin and CJK. Locale-INDEPENDENT (no uppercase to case-fold
 
 ## Config cases
 
-The 3-arg config-aware recheck `ts_prox_match(to_tsvector(cfg, doc), query, cfg)`.
+The 3-arg config-aware recheck `ts_prox_recheck(to_tsvector(cfg, doc), query, cfg)`.
 Rows whose `config` is `public.simple_unaccent` need the contrib `unaccent`
 extension; the runner builds it best-effort and skips those rows if it is absent.
 
