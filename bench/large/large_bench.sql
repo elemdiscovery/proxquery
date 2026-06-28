@@ -161,6 +161,26 @@ FROM results
 GROUP BY shape
 ORDER BY ext_op_ms DESC;
 
+-- Per-query (term-by-term) breakdown with candidate/match counts, for the collapsed
+-- section of the report. `query` is HTML-escaped (&, <, >, |, *) so the OR `|` and the
+-- `<~N>` operators survive both the `| `-aligned -> Markdown table parser and GitHub's
+-- HTML sanitizer; raw psql shows the entities.
+\echo ''
+\echo '== results: per query (counts + timings; query HTML-escaped) =='
+\if :with_pure
+SELECT id, shape,
+       replace(replace(replace(replace(replace(q,'&','&amp;'),'<','&lt;'),'>','&gt;'),'|','&#124;'),'*','&#42;') AS query,
+       candidates, matches, ext_op_ms, ext_search_ms, pure_search_ms,
+       round(pure_search_ms / nullif(ext_search_ms, 0), 1) AS slowdown
+FROM results ORDER BY id;
+\else
+SELECT id, shape,
+       replace(replace(replace(replace(replace(q,'&','&amp;'),'<','&lt;'),'>','&gt;'),'|','&#124;'),'*','&#42;') AS query,
+       candidates, matches, ext_op_ms
+FROM results ORDER BY id;
+\endif
+\echo ''
+
 -- ------------------------------------------------------------- pushdown plans
 -- Plan-shape guards, surfaced in the PR comment, using real queries from the generated
 -- mix. (1) A within/pre query via the `@~@` operator must stay GIN-index-served via the

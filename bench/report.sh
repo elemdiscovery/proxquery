@@ -17,7 +17,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Main results table: the frequency-skewed large-bench query generator at a small
-# corpus (varied terms across all 12 shapes + a real selectivity spread).
+# corpus (varied terms across all 14 shapes + a real selectivity spread).
 SMALL_MB="${SMALL_MB:-32}"; NQUERIES="${NQUERIES:-120}"; LB_ITERS="${LB_ITERS:-2}"
 SEED="${SEED:-0.42}"; QSEED="${QSEED:-0.137}"
 # Supplementary sections (tokenizer overhead, length scaling) keep their own corpora.
@@ -89,6 +89,7 @@ to_md_table() {
 # Main results: the large-bench by-shape table + its parity / corpus / vocabulary
 # sections and the two pushdown-plan guards.
 results_md="$(printf '%s\n' "$raw" | sed -n '/== results: by query shape ==/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
+perquery_md="$(printf '%s\n' "$raw" | sed -n '/== results: per query/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
 parity_md="$(printf '%s\n' "$raw" | sed -n '/== parity (pure port vs extension/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
 vocab_md="$(printf '%s\n' "$raw" | sed -n '/== vocabulary ==/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
 corpus_block="$(printf '%s\n' "$raw" | sed -n '/== corpus shape ==/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
@@ -135,6 +136,12 @@ scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs s
   echo "- \`pure_search_ms\` — pure-SQL port via the same \`ts_prox_search\`"
   echo "- \`slowdown\` — \`pure_search_ms / ext_search_ms\`"
   echo
+  echo "<details><summary>Per-query breakdown — all ${NQUERIES} queries (counts + timings)</summary>"
+  echo
+  printf '%s\n' "$perquery_md"
+  echo
+  echo "</details>"
+  echo
   echo "Parity (extension vs pure match counts on the same corpus — \`mismatches\` must be 0;"
   echo "it is also gated independently, so a nonzero count fails this job):"
   echo
@@ -146,7 +153,7 @@ scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs s
   echo "hyphen / email lexemes) vs \`to_tsvector('simple', …)\` on one overlap-heavy corpus."
   echo "term/AND rows have identical selectivity (clean per-op cost ratio); proximity rows"
   echo "match more on prox (superimposition packs forms onto one position). \`ratio\` ="
-  echo "\`prox_ms / simple_ms\` — a smoke check that superimposition doesn't blow up matching."
+  echo "\`prox_ms / simple_ms\`."
   echo
   printf '%s\n' "$tok_corpus_md"
   echo
@@ -154,19 +161,18 @@ scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs s
   echo
   echo "## Scaling by text length"
   echo
-  echo "One query (\`a <~3> b\`) rechecked over every doc as document length grows. To"
-  echo "compare the recheck *implementations* and not the storage layer, each length's"
-  echo "tsvectors are loaded into memory once (so the O(L) TOAST detoast — paid equally"
-  echo "by both ports, and the dominant cost on a cold/contended runner — is excluded);"
-  echo "the timed loop is just the recheck. The pure port reads positions with"
-  echo "\`unnest(tsvector)\` (O(L) in lexemes/doc) plus a per-call AST re-parse, while the"
-  echo "extension binary-searches (O(log L)). \`slowdown\` = \`pure_ms / ext_ms\`;"
-  echo "\`disagree\` is the per-length recheck parity check over all docs (must be 0)."
+  echo "One chained query (\`a <~3> b <~3> c\`) rechecked over every doc, swept over four"
+  echo "document lengths (32–2048 tokens). The query is chained so it stays non-native and"
+  echo "both ports run their positional recheck. Each length's tsvectors are loaded into memory"
+  echo "once with the TOAST detoast excluded, so the timed loop is just the recheck: the pure"
+  echo "port reads positions with \`unnest(tsvector)\`, the extension binary-searches the sorted"
+  echo "lexemes. \`slowdown\` = \`pure_ms / ext_ms\`; \`disagree\` is the per-length recheck parity"
+  echo "check over all docs (must be 0)."
   echo
   printf '%s\n' "$scale_results_md"
   echo
-  echo "Each column normalized to its shortest-length value — \`ext_growth\` stays near"
-  echo "flat, \`pure_growth\` rises with length (the pure port scales at a worse rate)."
+  echo "Each column normalized to its shortest-length value, so the per-column growth rate is"
+  echo "explicit."
   echo
   printf '%s\n' "$scale_growth_md"
   echo

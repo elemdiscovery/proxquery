@@ -143,6 +143,12 @@ git_dirty=""; { git -C "$ROOT" diff --quiet 2>/dev/null && git -C "$ROOT" diff -
   echo
   section "$raw_small" "results: by query shape"
   echo
+  echo "<details><summary>Per-query breakdown — all ${SMALL_QUERIES} queries (counts + timings)</summary>"
+  echo
+  section "$raw_small" "results: per query"
+  echo
+  echo "</details>"
+  echo
   echo "Parity (extension vs pure match counts; mismatches must be 0)"
   echo
   section "$raw_small" "parity"
@@ -165,6 +171,12 @@ git_dirty=""; { git -C "$ROOT" diff --quiet 2>/dev/null && git -C "$ROOT" diff -
     echo "By query shape"
     echo
     section "$raw_large" "results: by query shape"
+    echo
+    echo "<details><summary>Per-query breakdown — all ${LARGE_QUERIES} queries (counts)</summary>"
+    echo
+    section "$raw_large" "results: per query"
+    echo
+    echo "</details>"
   fi
   echo
   echo "- \`ext_op_ms\` — extension single operator \`tsv @~@ q\` (real-world usage)"
