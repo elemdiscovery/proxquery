@@ -5,17 +5,20 @@
 # CHANGELOG.md. Merging that PR is the deliberate, human gate: it tags `v<X.Y.Z>`
 # and cuts the GitHub Release, which in turn drives the binary build.
 #
-# This is a cdylib Postgres extension, not a crates.io library, so every
-# crates.io-facing feature is turned off here. `git_only` is the key switch: it
-# makes release-plz read versions from git tags (not crates.io) and skip
-# `cargo publish` entirely.
+# This is a cdylib Postgres extension shipped as binaries + GitHub Releases, not
+# a crates.io library, so it must never be published there. That takes TWO
+# settings working together — they are complementary, not interchangeable, and
+# both must stay:
+#   * `git_only` (below)             — read versions from git tags, not crates.io.
+#   * `publish = false` (Cargo.toml) — skip `cargo publish`.
+# Drop `git_only` and release-plz can't compute version bumps for an unpublished
+# crate, so it stops opening Release PRs. Drop `publish = false` and release-plz
+# runs `cargo publish`, which fails with no crates.io token.
 
 [workspace]
-# Unpublished crate: derive versions from git tags, not crates.io, and skip
-# `cargo publish`. This supersedes `publish = false` (the two can't both be
-# true). Without it, release-plz queries crates.io for the "last release";
-# since proxquery isn't published there, it can't compute version bumps after
-# the first tag and stops opening Release PRs.
+# Read versions from git tags, not crates.io. Without this, release-plz queries
+# crates.io for the "last release"; proxquery isn't published there, so it can't
+# compute version bumps after the first tag and stops opening Release PRs.
 git_only = true
 
 # cargo-semver-checks diffs a crate's public API against its last crates.io

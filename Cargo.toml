@@ -6,6 +6,8 @@ description = "Positional proximity predicates for tsvector full-text search"
 license = "MIT"
 repository = "https://github.com/elemdiscovery/proxquery"
 
+publish = false
+
 [lib]
 crate-type = ["cdylib"]
 
