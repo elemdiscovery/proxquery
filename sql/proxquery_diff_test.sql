@@ -9,7 +9,7 @@
 --
 -- Requires, in the same session:
 --   * the shared corpus loaded   (the markdown spec tests/parity_cases.md, parsed and
---                                 loaded by `parity_spec::load_corpus` in the Rust test)
+--                                 loaded by `corpus::load_parity` in the Rust test)
 --   * the native extension       (CREATE EXTENSION proxquery — any schema)
 --   * the pure-SQL port          (\i proxquery_pure.sql — schema `proxquery`)
 

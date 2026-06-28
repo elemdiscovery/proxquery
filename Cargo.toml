@@ -33,7 +33,7 @@ pulldown-cmark = { version = "0.13", default-features = false, optional = true }
 [dev-dependencies]
 pgrx-tests = "=0.19.1"
 # Also a dev-dependency (not just the optional `pg_test` entry above): the test target
-# compiles `parity_spec` via `cfg(test)` even when the `pg_test` feature is off (e.g.
+# compiles `src/corpus.rs` via `cfg(test)` even when the `pg_test` feature is off (e.g.
 # `cargo clippy --all-targets`), so the parser must be linkable there too.
 pulldown-cmark = { version = "0.13.4", default-features = false }
 
