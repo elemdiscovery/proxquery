@@ -1,33 +1,36 @@
--- How the pure-SQL port and the native extension scale with document length.
+-- How the pure-SQL port and the native extension recheck scale with document length.
 --
 -- This is the focused companion to pure_vs_extension.sql: instead of one corpus
 -- and several query shapes, it fixes ONE query (`a <~3> b`) and sweeps the
 -- document length, so the only thing that changes between rows is how many
--- lexemes the recheck has to wade through per candidate.
+-- lexemes the recheck has to wade through per document.
 --
--- Why the two implementations diverge with length:
---   * native extension : positions are read with an O(log L) binary search over
---     the tsvector, and the parsed query AST is cached once per scan.
---   * pure-SQL port     : positions are read with `unnest(tsvector)` — O(L) in
---     the number of lexemes per call (sql/proxquery_pure.sql `ts_prox_positions`),
---     and the AST is re-parsed per row. So the per-candidate recheck cost grows
---     ~linearly with document length while the extension's stays ~flat.
---
--- To isolate that effect the corpus holds the CANDIDATE COUNT constant: every doc
--- gets exactly one `a` and one `b` (so `a & b` — the index skeleton — selects all
--- :sdocs docs at every length), with `b` placed 1..8 positions after `a` (so ~3/8
--- of docs actually satisfy `<~3>`, a non-trivial match set for the parity check).
--- The remaining slots are filler drawn from a large vocab, so the distinct-lexeme
--- count per doc tracks the target length. Same candidates, longer text → the only
--- moving part is the per-candidate position lookup.
+-- What it measures, and why it measures it THIS way:
+--   The thing we want to compare is the per-document *recheck* — the positional
+--   evaluation each implementation runs on a candidate row:
+--     * native extension : positions read with an O(log L) binary search over the
+--       tsvector, no per-row query re-parse.
+--     * pure-SQL port     : positions read with `unnest(tsvector)` — O(L) in the
+--       lexemes per doc (sql/proxquery_pure.sql `ts_prox_positions`) — and the
+--       query AST re-parsed (jsonb) on every call.
+--   Run as a normal indexed query, that signal is swamped by something both
+--   implementations pay equally: once a tsvector grows past ~2 KB it is stored
+--   out-of-line in TOAST, so every recheck first pays an O(L) detoast. That
+--   detoast floor is large, machine-dependent (a cold/contended runner pays far
+--   more for an out-of-line fetch), and identical for both ports — so on a shared
+--   CI runner it can dominate the extension's tiny real cost and even invert the
+--   comparison. To compare the implementations and not the storage layer, we load
+--   each length's tsvectors into memory ONCE (detoast once) and time the recheck
+--   functions directly over them. Same inputs, same call count; the only variable
+--   left is the recheck algorithm.
 --
 -- `slowdown` (pure_ms / ext_ms) should climb with length; the growth table that
 -- follows normalizes each column to its shortest-length value so the *rate* is
 -- explicit — ext_growth stays near flat, pure_growth rises with length.
 --
--- A per-length `disagree` column (extension vs pure row-set EXCEPT) must be 0 —
--- this is what makes the sweep a real CI test (timings on a shared runner are
--- noise; correctness is not). Numbers vary by machine; the SHAPE is the point.
+-- A per-length `disagree` column (extension vs pure recheck, over every doc) must
+-- be 0 — this is what makes the sweep a real CI test (timings are a smoke signal,
+-- correctness is not). Numbers vary by machine; the SHAPE is the point.
 --
 -- Run from the repo root (so the \i path resolves):
 --   cargo pgrx run pg17 proxquery < bench/scaling_by_length.sql
@@ -57,27 +60,50 @@ SELECT set_config('sb.docs',  :'sdocs',  false),
        set_config('sb.vocab', :'svocab', false),
        set_config('sb.iters', :'iters',  false);
 
--- avg server-side ms over `iters` runs, after a warmup (same harness as the siblings).
-CREATE OR REPLACE FUNCTION bench_ms(q text, iters int) RETURNS numeric
+-- Recheck timer: load the current `scorpus` tsvectors into memory ONCE (so the
+-- O(L) detoast is paid once, not per call), then time `iters` full passes of each
+-- implementation's recheck over them. `floor_ms` is the same pass doing only a
+-- trivial in-memory touch (length()) — the loop/overhead baseline the rechecks
+-- sit on top of. Inputs and call counts are identical across the two ports.
+CREATE OR REPLACE FUNCTION scale_recheck(
+    iters int, q text,
+    OUT floor_ms numeric, OUT ext_ms numeric, OUT pure_ms numeric)
 LANGUAGE plpgsql AS $$
-DECLARE t0 timestamptz; t1 timestamptz; i int; sink bigint;
+DECLARE vs tsvector[]; v tsvector; t0 timestamptz; t1 timestamptz; i int; s bigint;
 BEGIN
-  EXECUTE q INTO sink;                        -- warmup (and prime caches)
-  t0 := clock_timestamp();
-  FOR i IN 1..iters LOOP EXECUTE q INTO sink; END LOOP;
-  t1 := clock_timestamp();
-  RETURN round(extract(epoch FROM (t1 - t0)) * 1000.0 / iters, 1);
+    EXECUTE 'SELECT array_agg(body_tsv) FROM scorpus' INTO vs;   -- detoast ONCE, into memory
+    -- warm both rechecks (compile cached plans) before timing anything.
+    FOREACH v IN ARRAY vs LOOP
+        PERFORM public.ts_prox_match(v, q);
+        PERFORM proxquery.ts_prox_match(v, q);
+    END LOOP;
+
+    t0 := clock_timestamp();
+    FOR i IN 1..iters LOOP s := 0; FOREACH v IN ARRAY vs LOOP s := s + length(v); END LOOP; END LOOP;
+    t1 := clock_timestamp();
+    floor_ms := round(extract(epoch FROM (t1 - t0)) * 1000.0 / iters, 2);
+
+    t0 := clock_timestamp();
+    FOR i IN 1..iters LOOP FOREACH v IN ARRAY vs LOOP PERFORM public.ts_prox_match(v, q); END LOOP; END LOOP;
+    t1 := clock_timestamp();
+    ext_ms := round(extract(epoch FROM (t1 - t0)) * 1000.0 / iters, 1);
+
+    t0 := clock_timestamp();
+    FOR i IN 1..iters LOOP FOREACH v IN ARRAY vs LOOP PERFORM proxquery.ts_prox_match(v, q); END LOOP; END LOOP;
+    t1 := clock_timestamp();
+    pure_ms := round(extract(epoch FROM (t1 - t0)) * 1000.0 / iters, 1);
 END $$;
 
 DROP TABLE IF EXISTS scale_results;
 CREATE TEMP TABLE scale_results(
-  wlen int, lex numeric, candidates bigint, matches bigint,
-  ext_ms numeric, pure_ms numeric, slowdown numeric, disagree bigint);
+  wlen int, lex numeric, docs bigint, matches bigint,
+  floor_ms numeric, ext_ms numeric, pure_ms numeric, slowdown numeric, disagree bigint);
 
--- Sweep the lengths. For each, build a fresh corpus, time the same query against
--- both implementations, and record the row. The DSL is a constant (`a <~3> b`),
--- so the recheck does the same two position lookups every time — only the lexeme
--- count they scan changes.
+-- Sweep the lengths. For each, build a fresh corpus, then time the recheck of the
+-- same query (`a <~3> b`) against both implementations over the same in-memory
+-- tsvectors. No index / ANALYZE: the recheck runs on every doc (that IS the
+-- per-candidate cost we are isolating), so an index scan would add nothing but the
+-- detoast noise we are deliberately excluding.
 DO $run$
 DECLARE
   sizes int[] := ARRAY[32, 128, 512, 2048];   -- tokens per doc (64x span)
@@ -86,16 +112,17 @@ DECLARE
   it    int   := current_setting('sb.iters')::int;
   q     text  := 'a <~3> b';
   wl    int;
-  lex   numeric; cand bigint; matc bigint; dis bigint;
-  ex    numeric; pu numeric;
+  lex   numeric; ndoc bigint; matc bigint; dis bigint;
+  tm    record;
 BEGIN
   FOREACH wl IN ARRAY sizes LOOP
     EXECUTE 'DROP TABLE IF EXISTS scorpus';
     EXECUTE 'CREATE TABLE scorpus(id serial PRIMARY KEY, body_tsv tsvector)';
     -- One `a` at a random slot, one `b` 1..8 slots later, the rest filler from a
-    -- `vocab`-word vocabulary (so distinct lexemes per doc track the length). The
-    -- random draws live in a fenced (OFFSET 0) subquery so they are evaluated per
-    -- row, not hoisted to a run-once InitPlan that would make every doc identical.
+    -- `vocab`-word vocabulary (so distinct lexemes per doc track the length, which
+    -- is what drives the pure port's unnest cost). The random draws live in a
+    -- fenced (OFFSET 0) subquery so they are evaluated per row, not hoisted to a
+    -- run-once InitPlan that would make every doc identical.
     PERFORM setseed(0.42);
     EXECUTE format($q$
       INSERT INTO scorpus(body_tsv)
@@ -113,40 +140,33 @@ BEGIN
       ) s
       GROUP BY d
     $q$, vocab, wl, ndocs, wl);
-    EXECUTE 'CREATE INDEX scorpus_gin ON scorpus USING gin(body_tsv)';
-    EXECUTE 'ANALYZE scorpus';
 
-    SELECT round(avg(length(body_tsv)), 1) INTO lex FROM scorpus;
-    EXECUTE format('SELECT count(*) FROM scorpus WHERE body_tsv @@ public.ts_prox_query(%L)', q) INTO cand;
-    EXECUTE format('SELECT count(*) FROM scorpus WHERE body_tsv @~@ %L', q) INTO matc;
+    SELECT round(avg(length(body_tsv)), 1), count(*) INTO lex, ndoc FROM scorpus;
+    -- matches and parity are correctness checks (untimed): the two rechecks must
+    -- return the same boolean for every doc.
+    EXECUTE format('SELECT count(*) FILTER (WHERE public.ts_prox_match(body_tsv, %L)),'
+                || ' count(*) FILTER (WHERE public.ts_prox_match(body_tsv, %L)'
+                || ' IS DISTINCT FROM proxquery.ts_prox_match(body_tsv, %L)) FROM scorpus',
+                   q, q, q)
+      INTO matc, dis;
 
-    ex := bench_ms(format('SELECT count(*) FROM scorpus WHERE body_tsv @@ public.ts_prox_query(%L) AND public.ts_prox_match(body_tsv, %L)', q, q), it);
-    pu := bench_ms(format('SELECT count(*) FROM scorpus WHERE body_tsv @@ proxquery.ts_prox_query(%L) AND proxquery.ts_prox_match(body_tsv, %L)', q, q), it);
+    SELECT * INTO tm FROM scale_recheck(it, q);
 
-    EXECUTE format($p$
-      SELECT count(*) FROM (
-        (SELECT id FROM scorpus WHERE body_tsv @~@ %L
-         EXCEPT SELECT id FROM scorpus WHERE body_tsv @@ proxquery.ts_prox_query(%L) AND proxquery.ts_prox_match(body_tsv, %L))
-        UNION ALL
-        (SELECT id FROM scorpus WHERE body_tsv @@ proxquery.ts_prox_query(%L) AND proxquery.ts_prox_match(body_tsv, %L)
-         EXCEPT SELECT id FROM scorpus WHERE body_tsv @~@ %L)
-      ) d $p$, q, q, q, q, q, q)
-      INTO dis;
-
-    INSERT INTO scale_results(wlen, lex, candidates, matches, ext_ms, pure_ms, slowdown, disagree)
-    VALUES (wl, lex, cand, matc, ex, pu, round(pu / nullif(ex, 0), 1), dis);
+    INSERT INTO scale_results(wlen, lex, docs, matches, floor_ms, ext_ms, pure_ms, slowdown, disagree)
+    VALUES (wl, lex, ndoc, matc, tm.floor_ms, tm.ext_ms, tm.pure_ms,
+            round(tm.pure_ms / nullif(tm.ext_ms, 0), 1), dis);
   END LOOP;
   EXECUTE 'DROP TABLE IF EXISTS scorpus';
 END
 $run$;
 
 \echo ''
-\echo '== scaling: pure vs extension by text length (avg ms/query; disagree must be 0) =='
-\echo '-- candidates is held constant; only lexemes_per_doc grows, so the timing'
-\echo '-- delta is purely the per-candidate recheck cost (pure unnest O(L) vs ext O(log L)).'
+\echo '== scaling: pure vs extension recheck by text length (avg ms over all docs; disagree must be 0) =='
+\echo '-- recheck timed on in-memory tsvectors (detoast excluded), so the only variable'
+\echo '-- is the algorithm: pure unnest O(L) + AST re-parse vs ext O(log L) binary search.'
 SELECT wlen          AS tokens_per_doc,
        round(lex)    AS lexemes_per_doc,
-       candidates,
+       docs,
        matches,
        ext_ms,
        pure_ms,
@@ -164,8 +184,8 @@ SELECT r.wlen                                AS tokens_per_doc,
        round(r.pure_ms / nullif(b.p0, 0), 1) AS pure_growth_x
 FROM scale_results r, base b ORDER BY r.wlen;
 
--- Parity gate: at every length the pure port and the extension must select the
--- identical row set. This is what makes the sweep a CI test, not just a timing.
+-- Parity gate: at every length the two rechecks must agree on every doc. This is
+-- what makes the sweep a CI test, not just a timing.
 DO $$
 DECLARE n int;
 BEGIN

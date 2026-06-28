@@ -606,6 +606,123 @@ pub fn to_tsquery_string(input: &str) -> Result<String, String> {
     })
 }
 
+// ===========================================================================
+// Native pushdown  ->  a tsquery whose `@@` is EXACTLY the recheck (drops it)
+// ===========================================================================
+//
+// For the common bounded-proximity shapes the positional test can be expressed as
+// a native `tsquery` and evaluated by Postgres's own (fast, C) phrase engine in the
+// GIN `@@` heap recheck — so the custom `ts_prox_match` recheck is dropped entirely
+// (the planner support fn marks the index condition non-lossy). within/pre lower to
+// an OR over exact gaps, which is exactly the proximity predicate:
+//   a <~n> b  ≡  OR_{k=0..n} (a <k> b | b <k> a)   (either order, |Δ| ≤ n)
+//   a <-n> b  ≡  OR_{k=1..n} (a <k> b)             (ordered, 0 < Δ ≤ n)
+// Only shapes that map EXACTLY are accepted; everything else (glob, regex,
+// not-within, document NOT, nested/phrase proximity operands, or a distance past
+// `NATIVE_MAX_DISTANCE`) returns None and keeps the presence-skeleton + recheck.
+//
+// This is `simple`-only (the literal 2-arg path): the cfg/analyzer operands resolve
+// terms through dictionaries and stay on the skeleton+recheck path.
+
+/// Distance past which `within`/`pre` are NOT pushed down. The OR-expansion is
+/// `2·(n+1)` (either order) / `n` (ordered) phrase clauses, so this caps the query
+/// size; past it the expansion's per-row cost outweighs the detoast it saves (the
+/// recheck cost is flat in `n`). Benchmarked crossover is ~60 even on long TOASTed
+/// docs, so 32 keeps a clear margin while covering realistic proximity distances.
+/// Must be a compile-time constant (not a GUC): the wrapper functions stay IMMUTABLE
+/// so the planner can const-fold them into the index condition.
+pub const NATIVE_MAX_DISTANCE: i32 = 32;
+
+/// A `tsquery` input string (for `tsqueryin` / `::tsquery`, *not* `to_tsquery` — the
+/// lexemes are verbatim, matching the recheck's exact byte lookup) whose `@@` is
+/// exactly equivalent to the positional recheck, or `None` when the query isn't fully
+/// native-expressible within [`NATIVE_MAX_DISTANCE`] (the caller then keeps the
+/// presence + recheck path).
+pub fn native_tsquery_string(input: &str) -> Option<String> {
+    native(&normalize(parse(input).ok()?))
+}
+
+/// A lexeme quoted for the native tsquery, or `None` if it can't survive `tsqueryin`
+/// verbatim. The native tsquery is built with `tsqueryin` (not `to_tsquery`) so the
+/// lexemes match the recheck's exact byte lookup with no re-tokenizing or dictionary
+/// re-lowercasing. The one exception is a backslash: `tsqueryin` escapes it away
+/// (`'a\b'` → lexeme `ab`), so such a term would no longer match the recheck — refuse
+/// it (it falls back to the presence skeleton + recheck, which is correct).
+fn native_lexeme(t: &str) -> Option<String> {
+    (!t.contains('\\')).then(|| quote_lexeme(t))
+}
+
+/// A proximity operand expressible as a native phrase operand: a single keyed atom
+/// (term/exact/prefix) or an OR of them. `None` for phrase / glob / regex / nested
+/// proximity operands (whose `@@` is not exactly the recheck).
+fn native_operand(node: &Node) -> Option<String> {
+    match node {
+        Node::Term(t) | Node::Exact(t) => native_lexeme(t),
+        Node::Prefix(p) => Some(format!("{}:*", native_lexeme(p)?)),
+        Node::Or(children) => {
+            let parts = children.iter().map(native_operand).collect::<Option<Vec<_>>>()?;
+            Some(format!("({})", parts.join(" | ")))
+        }
+        _ => None,
+    }
+}
+
+/// A phrase atom's exact native key (term/exact/prefix). A glob is *not* exact (the
+/// index prefix over-matches), so a phrase containing one can't be pushed down.
+fn native_phrase_atom_exact(atom: &Atom) -> Option<String> {
+    match atom {
+        Atom::Term(t) | Atom::Exact(t) => native_lexeme(t),
+        Atom::Prefix(p) => Some(format!("{}:*", native_lexeme(p)?)),
+        Atom::Glob { .. } => None,
+    }
+}
+
+fn native(node: &Node) -> Option<String> {
+    match node {
+        Node::Term(t) | Node::Exact(t) => native_lexeme(t),
+        Node::Prefix(p) => Some(format!("{}:*", native_lexeme(p)?)),
+        // Not exactly index-expressible — keep the recheck.
+        Node::Glob { .. } | Node::Regex(_) | Node::Not(_) | Node::NotWithin { .. } => None,
+        Node::Phrase { atoms, gaps } => {
+            let keyed = atoms.iter().map(native_phrase_atom_exact).collect::<Option<Vec<_>>>()?;
+            let mut s = keyed[0].clone();
+            for (atom, &g) in keyed[1..].iter().zip(gaps) {
+                let op = if g == 1 { "<->".to_string() } else { format!("<{g}>") };
+                s = format!("{s} {op} {atom}");
+            }
+            Some(format!("({s})"))
+        }
+        Node::Within { a, b, n, ordered } => {
+            let n = *n;
+            // Ordered <-0> is unsatisfiable (0 < Δ ≤ 0); let the recheck return false.
+            if n > NATIVE_MAX_DISTANCE || (*ordered && n < 1) {
+                return None;
+            }
+            let (a, b) = (native_operand(a)?, native_operand(b)?);
+            let mut clauses = Vec::new();
+            if *ordered {
+                for k in 1..=n {
+                    clauses.push(format!("{a} <{k}> {b}"));
+                }
+            } else {
+                for k in 0..=n {
+                    clauses.push(format!("{a} <{k}> {b}"));
+                    clauses.push(format!("{b} <{k}> {a}"));
+                }
+            }
+            Some(format!("({})", clauses.join(" | ")))
+        }
+        Node::And(v) => {
+            let parts = v.iter().map(native).collect::<Option<Vec<_>>>()?;
+            Some(format!("({})", parts.join(" & ")))
+        }
+        Node::Or(v) => {
+            let parts = v.iter().map(native).collect::<Option<Vec<_>>>()?;
+            Some(format!("({})", parts.join(" | ")))
+        }
+    }
+}
+
 // --- analyzer probe: a skeleton with leaves resolved through the analyzer --------
 //
 // The cfg path lets `to_tsquery(cfg, skeleton)` resolve raw terms, but there is no

@@ -21,10 +21,11 @@ use pgrx::datum::IntoDatum;
 use pgrx::direct_function_call;
 use pgrx::pg_sys::Oid;
 use pgrx::prelude::*;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use unicode_normalization::char::is_combining_mark;
-use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::{is_nfkc_quick, IsNormalized, UnicodeNormalization};
 use unicode_properties::UnicodeEmoji;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -129,7 +130,11 @@ impl AnalyzerKind {
     /// precision escape hatch over the accent/stem-insensitive bare default.
     pub fn lexemes_exact(self, term: &str) -> Vec<Vec<u8>> {
         let a = self.config();
-        let normalized: String = term.nfc().collect::<String>().replace('\u{2019}', "'");
+        let normalized: String = term
+            .nfc()
+            .filter(|&c| !is_ignorable_control(c))
+            .collect::<String>()
+            .replace(&APOSTROPHES[..], "'");
         let cased = if a.fold_case {
             default_case_fold_str(&normalized)
         } else {
@@ -191,6 +196,19 @@ fn atomic_fold(c: char) -> Option<&'static str> {
     })
 }
 
+/// Compatibility-fold (NFKC) a lexeme so fullwidth / half-width / Roman-numeral / etc.
+/// spellings collapse to their canonical equivalent (`ＡＢＣ`→`abc`, `Ⅻ`→`xii`). Quick-check
+/// gated: a lexeme already in NFKC — all ASCII, ordinary letters, CJK — does no
+/// decomposition work, so the cost falls only on tokens that actually carry a
+/// compatibility character. Does NOT fold non-ASCII digits or confusables (not
+/// compatibility-equivalent under Unicode).
+fn compat_fold(s: &str) -> Cow<'_, str> {
+    match is_nfkc_quick(s.chars()) {
+        IsNormalized::Yes => Cow::Borrowed(s), // common case: no allocation
+        _ => Cow::Owned(s.nfkc().collect()),
+    }
+}
+
 /// Strip diacritics: NFD-decompose, drop combining marks, fold remaining atomics.
 /// Latin-scoped by construction — combining marks essential to Arabic/Indic are
 /// the only thing dropped, and only base letters that have an ASCII fold change.
@@ -208,6 +226,33 @@ fn accent_fold(s: &str) -> String {
     out
 }
 
+/// Invisible formatting / bidi controls that carry no textual meaning — stripped
+/// during normalization so they neither split a word nor hide it from a clean-spelling
+/// query (a soft-hyphenated `con­fidential`, a bidi-wrapped word, a zero-width-split
+/// word). Deliberately EXCLUDES the semantic joiners ZWJ (U+200D) / ZWNJ (U+200C),
+/// which bind emoji clusters and drive Indic/Arabic shaping, and the emoji variation
+/// selectors (U+FE00–FE0F), so emoji and shaped scripts are untouched.
+fn is_ignorable_control(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}'                  // soft hyphen
+        | '\u{200B}'                // zero width space
+        | '\u{200E}' | '\u{200F}'   // LRM, RLM
+        | '\u{202A}'..='\u{202E}'   // LRE, RLE, PDF, LRO, RLO
+        | '\u{2060}'                // word joiner
+        | '\u{2066}'..='\u{2069}'   // LRI, RLI, FSI, PDI
+        | '\u{FEFF}'                // ZWNBSP / BOM
+    )
+}
+
+/// Apostrophe-like code points folded to a straight `'` before tokenization, so a curly or
+/// modifier-letter apostrophe shares the straight form's tailoring (`it's`→`it`,`its`):
+/// right/left single quote and the modifier-letter apostrophe.
+const APOSTROPHES: [char; 3] = ['\u{2019}', '\u{2018}', '\u{02BC}'];
+
+/// Postgres caps a tsvector lexeme at 2046 bytes (`tsvectorin` raises beyond it). Over-long
+/// tokens are dropped rather than allowed to abort the whole document.
+const MAX_LEXEME_BYTES: usize = 2046;
+
 /// A segment is emitted iff it carries at least one alphanumeric char (words,
 /// numbers, alnum IDs, CJK ideographs). Pure punctuation/whitespace is dropped
 /// and consumes no position. (Emoji preservation is a later phase.)
@@ -215,11 +260,24 @@ fn is_word_like(seg: &str) -> bool {
     seg.chars().any(char::is_alphanumeric)
 }
 
-/// An emoji segment (a UAX#29 word-bound cluster carrying a non-ASCII emoji char —
-/// ZWJ sequences, flags, and skin-tone modifiers come grouped). Excludes ASCII
-/// emoji-component code points (`#`, `*`, digits) so bare punctuation isn't kept.
+/// A real emoji cluster (kept as its own lexeme): a UAX#29 word-bound segment carrying a
+/// char that DEFAULTS to emoji presentation (`Emoji_Presentation=Yes` — 🎂, 👍, flag
+/// regional indicators, skin-tone bases; ZWJ sequences come grouped) or an explicit emoji
+/// variation selector (VS16, U+FE0F). EXCLUDES text-default symbols that merely have
+/// `Emoji=Yes` (™ © ® ▪ ◼): those fall through to punctuation, so they drop and take NO
+/// position — a `Foo™ Bar` phrase stays adjacent.
 fn is_emoji(seg: &str) -> bool {
-    seg.chars().any(|c| !c.is_ascii() && c.is_emoji_char())
+    use unicode_properties::EmojiStatus::*;
+    seg.chars().any(|c| {
+        c == '\u{FE0F}'
+            || matches!(
+                c.emoji_status(),
+                EmojiPresentation
+                    | EmojiPresentationAndModifierBase
+                    | EmojiPresentationAndEmojiComponent
+                    | EmojiPresentationAndModifierAndEmojiComponent
+            )
+    })
 }
 
 /// Emit one normalized lexeme at `pos`, routed through the analyzer's dictionary when
@@ -227,6 +285,11 @@ fn is_emoji(seg: &str) -> bool {
 /// stem/synonym output (all superimposed at `pos`). With no dict (the default) this is
 /// a single `Option` check — zero added cost.
 fn emit_lexeme(out: &mut Vec<(String, i32)>, lex: &str, pos: i32, a: &Analyzer) {
+    // An over-long lexeme would make the `::tsvector` cast raise and abort the whole
+    // document; drop it instead (stock `to_tsvector` likewise ignores over-long words).
+    if lex.len() > MAX_LEXEME_BYTES {
+        return;
+    }
     match a.stem_dict {
         None => out.push((lex.to_string(), pos)),
         Some(dict) => match ts_lexize(dict, lex) {
@@ -252,25 +315,49 @@ fn emit_sub(out: &mut Vec<(String, i32)>, raw: &str, pos: i32, a: &Analyzer, que
     } else {
         raw.to_string()
     };
+    // The canonical form both sides reduce to: accent-fold (when folding) THEN
+    // compatibility-fold (NFKC). The query emits ONLY this canonical; the index
+    // superimposes it alongside the less-folded forms, so an ASCII spelling and its
+    // fullwidth/Roman-numeral/ligature equivalent collapse to one matchable lexeme.
+    let accented = if a.fold_accents { accent_fold(&cased) } else { cased.clone() };
+    let canonical = compat_fold(&accented);
     if query {
-        // Bare query: the canonical (accent-folded, when folding) form only.
-        let canonical = if a.fold_accents { accent_fold(&cased) } else { cased };
         emit_lexeme(out, &canonical, pos, a);
     } else {
-        // Index: superimpose the accent-folded variant alongside the cased form.
-        if a.fold_accents {
-            let folded = accent_fold(&cased);
-            if folded != cased {
-                emit_lexeme(out, &folded, pos, a);
-            }
-        }
         emit_lexeme(out, &cased, pos, a);
+        if accented != cased {
+            emit_lexeme(out, &accented, pos, a);
+        }
+        if canonical.as_ref() != accented && canonical.as_ref() != cased {
+            emit_lexeme(out, &canonical, pos, a);
+        }
     }
 }
 
 /// A host-shaped segment (dotted, e.g. `b.com`) — the RHS of an email.
 fn is_host_like(seg: &str) -> bool {
     seg.contains('.') && is_word_like(seg)
+}
+
+/// A bare (scheme-less) hostname token like `google.com` / `www.example.com`: dotted, ≥2
+/// labels of hostname chars (alnum or `-`), last label a 2–24 letter TLD. Decomposed like
+/// an email host (labels except the TLD superimposed) so `google` finds `google.com`.
+/// Excludes non-host dotted tokens — `a.b.c` (1-char last label), `version2.0` (digit last
+/// label), `it's.going` (apostrophe), `3.14` (digit last label).
+fn is_bare_host(seg: &str) -> bool {
+    if !seg.contains('.') {
+        return false; // fast path: the vast majority of word tokens, no allocation
+    }
+    let (mut count, mut last) = (0usize, "");
+    for label in seg.split('.') {
+        if label.is_empty() || !label.chars().all(|c| c.is_alphanumeric() || c == '-') {
+            return false;
+        }
+        count += 1;
+        last = label;
+    }
+    let n = last.chars().count();
+    count >= 2 && (2..=24).contains(&n) && last.chars().all(char::is_alphabetic)
 }
 
 /// A host's labels except the final TLD: `b.com` → [`b`]; `mail.example.com` →
@@ -359,25 +446,36 @@ fn tokenize_region(region: &str, a: &Analyzer, out: &mut Vec<(String, i32)>, pos
             *pos += 1;
             emit_sub(out, &whole, *pos, a, query);
             if !query {
-                for part in parts {
+                for part in &parts {
                     emit_sub(out, part, *pos, a, query);
                 }
+                // Also the hyphens-removed concatenation, so the closed-compound spelling
+                // matches: `co-operate`→`cooperate`, `e-mail`→`email`, `123-45-6789`→
+                // `123456789`. (The hyphen branch always has ≥2 parts.)
+                emit_sub(out, &whole.replace('-', ""), *pos, a, query);
             }
             i = j;
             continue;
         }
-        // Plain word. On the index side an apostrophe-bearing word also emits the part
-        // before the apostrophe and the apostrophe-stripped form (`Paul's` → paul,
-        // pauls); the query keeps just the word.
+        // Plain word. On the index side a scheme-less host superimposes its labels except
+        // the TLD (`google.com`→`google`), and an apostrophe-bearing word emits the part
+        // before the apostrophe and the apostrophe-stripped form (`Paul's`→`paul`,`pauls`);
+        // the query keeps just the word.
         *pos += 1;
         emit_sub(out, seg, *pos, a, query);
-        if !query && seg.contains('\'') {
-            if let Some(idx) = seg.find('\'') {
-                if idx > 0 {
-                    emit_sub(out, &seg[..idx], *pos, a, query);
+        if !query {
+            if is_bare_host(seg) {
+                for label in host_labels_except_tld(seg) {
+                    emit_sub(out, label, *pos, a, query);
                 }
+            } else if seg.contains('\'') {
+                if let Some(idx) = seg.find('\'') {
+                    if idx > 0 {
+                        emit_sub(out, &seg[..idx], *pos, a, query);
+                    }
+                }
+                emit_sub(out, &seg.replace('\'', ""), *pos, a, query);
             }
-            emit_sub(out, &seg.replace('\'', ""), *pos, a, query);
         }
         i += 1;
     }
@@ -429,8 +527,13 @@ fn emit_url(url: &str, a: &Analyzer, out: &mut Vec<(String, i32)>, pos: &mut i32
 /// INDEX side (superimpose compound/parts/accent variants) vs the QUERY side (segment
 /// + canonicalize the same way, but emit only each token's exact form).
 fn tokenize(input: &str, a: &Analyzer, query: bool) -> Vec<(String, i32)> {
-    // NFC so composed/decomposed accents agree; fold curly apostrophe to straight.
-    let normalized: String = input.nfc().collect::<String>().replace('\u{2019}', "'");
+    // NFC so composed/decomposed accents agree; drop invisible formatting/bidi controls
+    // (so they don't split or hide a word); fold apostrophe variants to straight.
+    let normalized: String = input
+        .nfc()
+        .filter(|&c| !is_ignorable_control(c))
+        .collect::<String>()
+        .replace(&APOSTROPHES[..], "'");
     let mut out: Vec<(String, i32)> = Vec::new();
     let mut pos: i32 = 0;
     let mut rest = normalized.as_str();

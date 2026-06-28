@@ -76,7 +76,7 @@ corpus_block="$(printf '%s\n' "$raw" | sed -n '/== corpus shape ==/,/^$/p' | sed
 plan_block="$(printf '%s\n' "$raw" | sed -n '/== plan:/,/([0-9]* rows)/p' | sed '1d' || true)"
 tok_corpus_md="$(printf '%s\n' "$raw_tok" | sed -n '/== corpus shape (lexeme/,/^$/p' | grep '|' | to_md_table || true)"
 tok_results_md="$(printf '%s\n' "$raw_tok" | sed -n '/== tokenizer vs simple/,/([0-9]* rows)/p' | grep '|' | to_md_table || true)"
-scale_results_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: pure vs extension by text length/,/([0-9]* rows)/p' | grep '|' | to_md_table || true)"
+scale_results_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: pure vs extension recheck by text length/,/([0-9]* rows)/p' | grep '|' | to_md_table || true)"
 scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs shortest length/,/([0-9]* rows)/p' | grep '|' | to_md_table || true)"
 
 # ---- write the report ----
@@ -127,12 +127,14 @@ scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs s
   echo
   echo "## Scaling by text length"
   echo
-  echo "One query (\`a <~3> b\`) over corpora of growing document length. The candidate"
-  echo "count is held constant (every doc contains both terms), so the only moving part"
-  echo "is the per-candidate recheck cost: the pure port reads positions with"
-  echo "\`unnest(tsvector)\` (O(L) in lexemes/doc) while the extension binary-searches"
-  echo "(O(log L)). \`slowdown\` = \`pure_ms / ext_ms\`; \`disagree\` is the per-length"
-  echo "row-set parity check between the two implementations (must be 0)."
+  echo "One query (\`a <~3> b\`) rechecked over every doc as document length grows. To"
+  echo "compare the recheck *implementations* and not the storage layer, each length's"
+  echo "tsvectors are loaded into memory once (so the O(L) TOAST detoast — paid equally"
+  echo "by both ports, and the dominant cost on a cold/contended runner — is excluded);"
+  echo "the timed loop is just the recheck. The pure port reads positions with"
+  echo "\`unnest(tsvector)\` (O(L) in lexemes/doc) plus a per-call AST re-parse, while the"
+  echo "extension binary-searches (O(log L)). \`slowdown\` = \`pure_ms / ext_ms\`;"
+  echo "\`disagree\` is the per-length recheck parity check over all docs (must be 0)."
   echo
   printf '%s\n' "$scale_results_md"
   echo

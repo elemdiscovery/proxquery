@@ -23,14 +23,18 @@ already made (see below).
 ## Pipeline
 
 1. **NFC-normalize** the whole input (composed form), so `é` (U+00E9) and `e`+U+0301
-   tokenize identically.
+   tokenize identically, and **strip invisible formatting / bidi controls** (soft hyphen,
+   zero-width space, BOM, bidi marks) so they neither split nor hide a word — keeping the
+   semantic joiners ZWJ/ZWNJ and emoji variation selectors.
 2. **Segment** into logical tokens via UAX #29 word boundaries, through a `Segmenter`
    trait with two backends: `unicode-segmentation` (tiny, per-char CJK) and
    `icu_segmenter` (ICU4X, dictionary CJK/Thai). Chosen per analyzer.
 3. **Classify** each segment: word / number / alphanumeric / emoji / structured
    (email, URL/host) / punctuation.
 4. **Decompose** structured + compound tokens into sub-lexemes (hyphen, email, URL).
-5. **Normalize** each lexeme: always Unicode case-fold; accent-fold per analyzer.
+5. **Normalize** each lexeme: always Unicode case-fold; accent-fold per analyzer; then
+   superimpose an **NFKC** compatibility-folded variant (quick-check gated) so fullwidth /
+   half-width / Roman-numeral / fraction spellings match their canonical equivalent.
 6. **Emit** the tsvector with the position model below.
 
 ## Position model (the core idea)
@@ -52,17 +56,33 @@ consistent with how proximity should read across dropped punctuation).
 
 | Category | Rule |
 |---|---|
-| **Words / alphanumeric** | UAX#29 word run → one lexeme. Mixed letter+digit runs (`abc123`, `h2o`) stay whole (WB9/WB10). Underscores treated as word chars (kept). |
+| **Words / alphanumeric** | UAX#29 word run → one lexeme. Mixed letter+digit runs (`abc123`, `h2o`) stay whole (WB9/WB10). Underscores treated as word chars (kept). A lexeme over the tsvector byte cap (2046 bytes) is **dropped** (like stock `to_tsvector`), never allowed to abort the whole document. |
 | **Numbers / IDs** | Kept **as-is** per UAX#29 (`1,000`, `3.14` whole); **no** variant superimposition (`1000`/`3`/`14` not emitted — common tokens, tiny benefit, real bloat). Digits are word chars so Bates-style IDs (`ABC0001234`) stay one token. |
-| **Emoji** | **Preserved** as their own lexemes. ZWJ sequences (family/profession), skin-tone modifiers, and regional-indicator flag pairs are kept **intact** as a single lexeme each. |
+| **Emoji** | **Preserved** as their own lexemes, but only chars that **default to emoji presentation** (`Emoji_Presentation=Yes`) or carry an explicit VS16. ZWJ sequences (family/profession), skin-tone modifiers, and regional-indicator flag pairs are kept **intact** as a single lexeme each. Text-default symbols (`™ © ® ▪`, merely `Emoji=Yes`) are **not** emoji — they drop like punctuation. |
 | **Case** | **Always Unicode case-folded** (`caseless`), e.g. `Straße`/`STRASSE`→`strasse`. Original case is not preserved as a separate lexeme. |
 | **Accents** | Superimpose **both** the case-folded original and the accent-folded form at one position (`Café` → `café` + `cafe`), so one index serves accent-sensitive *and* -insensitive search — the accent analog of hyphen superimposition. Accent-fold is **Latin-scoped** (NFD-strip combining marks + small unaccent-style table for atomics like `ø→o`, `æ→ae`); never strip Arabic/Indic marks. |
-| **Hyphenated** | Superimpose compound + parts at one position: `c-d` → `c-d`, `c`, `d`. Each part is then case/accent-normalized like any word. |
+| **Compatibility (NFKC)** | Superimpose an **NFKC**-folded variant at the token's position so fullwidth / half-width / Roman-numeral / fraction spellings collapse to their canonical equivalent (`ＡＢＣ` → `abc`, `Ⅻ` → `xii`, `½` → `1⁄2`); the original is preserved. Quick-check gated (ASCII / letters / CJK pays nothing). Does **not** fold non-ASCII digits (`١٢٣`) or confusables (Cyrillic `а` vs Latin `a`) — not compatibility-equivalent. |
+| **Invisible controls** | Formatting / bidi controls (soft hyphen, ZWSP, BOM, LRM/RLM/LRE…PDI) are **stripped** in step 1 so they don't split or hide a word, and a bidi control can't ride into a lexeme. ZWJ/ZWNJ and emoji variation selectors are **kept** (semantic). |
+| **Hyphenated** | Superimpose compound + parts **+ the hyphens-removed concatenation** at one position: `c-d` → `c-d`, `c`, `d`, `cd`; `co-operate` → … `cooperate`; `123-45-6789` → … `123456789` (so the closed-compound / un-punctuated spelling matches). Each part is then case/accent-normalized like any word. |
 | **Emails** | Decompose + superimpose at one position: full address, local part, full host, and host labels **except the TLD**. `a@b.com` → `a@b.com`, `a`, `b.com`, `b`. `john@mail.example.com` → `john@mail.example.com`, `john`, `mail.example.com`, `mail`, `example`. (No bare TLD.) |
-| **URLs / hosts** | Superimpose the **full URL + host** only, host decomposed like an email host (labels except TLD). **No** path/query-segment splitting. `https://x.com/p?q=1` → `https://x.com/p?q=1`, `x.com`, `x`. |
-| **Apostrophes** | Curly `’` (U+2019) normalized to `'`. Superimpose full token + part-before-apostrophe + apostrophe-removed form: `it's` → `it's`, `it`, `its`; `Paul's` → `paul's`, `paul`, `pauls`. Cheap (apostrophe tokens are rare). Contraction prefixes are mild noise (`don't` → `don`); drop the prefix if undesired. |
+| **URLs / hosts** | Superimpose the **full URL + host** only, host decomposed like an email host (labels except TLD). **No** path/query-segment splitting. `https://x.com/p?q=1` → `https://x.com/p?q=1`, `x.com`, `x`. A **scheme-less host** (dotted token whose last label is a 2–24 letter TLD: `google.com`, `www.example.com`) is decomposed the same way, so `google` finds `google.com`; non-host dotted tokens (`a.b.c`, `version2.0`) stay whole. |
+| **Apostrophes** | Curly `’`/`‘` (U+2019/U+2018) and the modifier-letter apostrophe `ʼ` (U+02BC) normalized to `'`. Superimpose full token + part-before-apostrophe + apostrophe-removed form: `it's` → `it's`, `it`, `its`; `Paul's` → `paul's`, `paul`, `pauls`. Cheap (apostrophe tokens are rare). Contraction prefixes are mild noise (`don't` → `don`); drop the prefix if undesired. |
 | **CJK / Thai** | Engine-dependent: `icu_segmenter` does dictionary word segmentation; `unicode-segmentation` falls to per-character. Selected per analyzer. |
-| **Punctuation / symbols** | Dropped; no lexeme, no position. |
+| **Punctuation / symbols** | Dropped; no lexeme, no position — including text-default symbols (`™ © ®`) that carry `Emoji=Yes` but text presentation. |
+
+## Limits (Postgres `tsvector` storage, not the tokenizer)
+
+These are hard limits of the on-disk `tsvector` format, so they apply equally to stock
+`to_tsvector` and there is no in-tokenizer fix:
+
+- **Positions cap at 16383** (`MAXENTRYPOS`): tokens past the 16383rd collapse onto
+  position 16383, so proximity degrades near the end of a very long document.
+- **256 positions per lexeme** (`MAXNUMPOS`): a term occurring more than 256 times keeps
+  only its first 256 positions; later occurrences are invisible to proximity.
+
+For documents large enough to hit these, **chunk** the text into multiple rows (per page /
+paragraph) and index each chunk's `tsvector` separately — proximity is then exact within a
+chunk. (A lexeme over **2046 bytes** is dropped, per the Words rule above.)
 
 ## Analyzer config (fields)
 
