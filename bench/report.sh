@@ -8,11 +8,11 @@
 #   bench/report.sh                                   # local default psql
 #   PGHOST=$HOME/.pgrx PGPORT=28817 bench/report.sh   # a cargo-pgrx instance
 #
-# Tunables (env): NDOCS (20000), WLEN (40), ITERS (5), MAINT_DB (postgres).
+# Tunables (env): NDOCS (20000), WLEN (40), ITERS (5), SDOCS (2000), MAINT_DB (postgres).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NDOCS="${NDOCS:-20000}"; WLEN="${WLEN:-40}"; ITERS="${ITERS:-5}"
+NDOCS="${NDOCS:-20000}"; WLEN="${WLEN:-40}"; ITERS="${ITERS:-5}"; SDOCS="${SDOCS:-2000}"
 MAINT_DB="${MAINT_DB:-postgres}"
 BENCH_DB="${BENCH_DB:-proxquery_bench_$$}"
 OUT_DIR="$ROOT/bench/reports"; mkdir -p "$OUT_DIR"
@@ -33,6 +33,9 @@ raw="$(psqlq -d "$BENCH_DB" -v ndocs="$NDOCS" -v wlen="$WLEN" -v iters="$ITERS" 
 # Custom Unicode tokenizer vs stock `simple` on an overlap-heavy corpus — a smoke
 # regression check that superimposition doesn't blow up matching cost.
 raw_tok="$(psqlq -d "$BENCH_DB" -v ndocs="$NDOCS" -v wlen="$WLEN" -v iters="$ITERS" -f bench/tokenizer_vs_simple.sql)"
+# Pure port vs extension as document length grows — demonstrates the pure port's
+# O(L)-per-recheck position lookup scaling at a worse rate than the binary's O(log L).
+raw_scale="$(psqlq -d "$BENCH_DB" -v sdocs="$SDOCS" -v iters="$ITERS" -f bench/scaling_by_length.sql)"
 wall=$(( $(date +%s) - start ))
 
 # ---- context ----
@@ -73,6 +76,8 @@ corpus_block="$(printf '%s\n' "$raw" | sed -n '/== corpus shape ==/,/^$/p' | sed
 plan_block="$(printf '%s\n' "$raw" | sed -n '/== plan:/,/([0-9]* rows)/p' | sed '1d' || true)"
 tok_corpus_md="$(printf '%s\n' "$raw_tok" | sed -n '/== corpus shape (lexeme/,/^$/p' | grep '|' | to_md_table || true)"
 tok_results_md="$(printf '%s\n' "$raw_tok" | sed -n '/== tokenizer vs simple/,/([0-9]* rows)/p' | grep '|' | to_md_table || true)"
+scale_results_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: pure vs extension by text length/,/([0-9]* rows)/p' | grep '|' | to_md_table || true)"
+scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs shortest length/,/([0-9]* rows)/p' | grep '|' | to_md_table || true)"
 
 # ---- write the report ----
 {
@@ -91,6 +96,7 @@ tok_results_md="$(printf '%s\n' "$raw_tok" | sed -n '/== tokenizer vs simple/,/(
   echo "| postgres | ${pg_version} |"
   echo "| proxquery extension | ${ext_version:-n/a} |"
   echo "| corpus | ${NDOCS} docs × ${WLEN} tokens |"
+  echo "| scaling sweep | ${SDOCS} docs × {32,128,512,2048} tokens |"
   echo "| iterations / query | ${ITERS} |"
   echo "| total wall time | ${wall}s |"
   echo
@@ -118,6 +124,22 @@ tok_results_md="$(printf '%s\n' "$raw_tok" | sed -n '/== tokenizer vs simple/,/(
   printf '%s\n' "$tok_corpus_md"
   echo
   printf '%s\n' "$tok_results_md"
+  echo
+  echo "## Scaling by text length"
+  echo
+  echo "One query (\`a <~3> b\`) over corpora of growing document length. The candidate"
+  echo "count is held constant (every doc contains both terms), so the only moving part"
+  echo "is the per-candidate recheck cost: the pure port reads positions with"
+  echo "\`unnest(tsvector)\` (O(L) in lexemes/doc) while the extension binary-searches"
+  echo "(O(log L)). \`slowdown\` = \`pure_ms / ext_ms\`; \`disagree\` is the per-length"
+  echo "row-set parity check between the two implementations (must be 0)."
+  echo
+  printf '%s\n' "$scale_results_md"
+  echo
+  echo "Each column normalized to its shortest-length value — \`ext_growth\` stays near"
+  echo "flat, \`pure_growth\` rises with length (the pure port scales at a worse rate)."
+  echo
+  printf '%s\n' "$scale_growth_md"
   echo
   echo "<details><summary>Corpus</summary>"
   echo

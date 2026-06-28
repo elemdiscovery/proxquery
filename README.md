@@ -6,7 +6,7 @@
 
 The motivation is to implement query syntax similar to dtSearch and Lucene without also implementing an actual custom index. All the usual [tsvector limitations](https://www.postgresql.org/docs/current/textsearch-limitations.html) apply.
 
-Additionally the extension implements a `proxquery_to_tsvector` function that calculates `tsvector` with (debatably) more intuitive positions through lexeme superimposition, with adjustments for accents, emoji, hyphenated words, and CJK.
+Additionally the extension implements a `proxquery_to_tsvector` alternative to `to_tsvector` that calculates `tsvector` with (debatably) more intuitive positions through lexeme superimposition, with adjustments for accents, emoji, hyphenated words, and CJK.
 
 There is also a [plain SQL implementation](#pure-sql-port) for when compiled extensions can't be used. The port supports the DSL syntax but not the custom `tsvector` builder function.
 
@@ -50,6 +50,8 @@ WHERE body_tsv @@ proxquery.ts_prox_query('quick <~3> fox')   -- GIN index selec
 ```
 
 The practical difference is that the pure SQL implementation is much, much slower. Based on some [unnecessarily complex benchmarks](https://github.com/elemdiscovery/proxquery/actions/workflows/benchmark.yml) it is more than 20x slower.
+
+The intended usage of the `.sql` file is that you can install it using your usual migration process. Updates (if desired) would be done by full replacement in another migration.
 
 If you somehow get the real extension installed later, the migration from the pure SQL implementation to the extension is `DROP SCHEMA proxquery CASCADE; CREATE EXTENSION proxquery SCHEMA proxquery;`. The two-clause queries keep working as-is. See [docs/PURE_SQL.md](docs/PURE_SQL.md) for some AI-babble details.
 
@@ -106,6 +108,8 @@ A few comments:
 - Regex terms match whole lexemes in the tsvector after splitting and normalization. If you are trying to do complex regex you probably need to do it before indexing on the raw text.
 - Real world queries written by users can become really degenerate in this syntax. I suggest discouraging complexity on the application side.
 
+For additional examples look at the [markdown test files](tests/).
+
 ## Text search configuration
 
 By default the `@~@` operator assumes the `simple` config on the `tsvector`. To match another configuration use the `proxquery` function overload of the operator.
@@ -121,7 +125,7 @@ WHERE body_tsv @@ proxquery.ts_prox_query('running <~3> shoes', 'english')
 
 ### Custom text search configuration
 
-This kind of custom configuration also works.
+This kind of custom configuration also works. Use this to remove accents without using the custom extension parser.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS unaccent;
@@ -138,7 +142,7 @@ ALTER TEXT SEARCH CONFIGURATION simple_unaccent
     WITH unaccent, simple;
 ```
 
-## Extension-only tokenizer
+## Extension-only `proxquery_to_tsvector`
 
 `proxquery_to_tsvector(body, analyzer)` builds the `tsvector` with a custom tokenizer instead of a stock config.
 
