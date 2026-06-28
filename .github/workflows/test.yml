@@ -11,6 +11,11 @@ concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege default for GITHUB_TOKEN; jobs that need more (e.g. bench
+# posting a PR comment) widen it in their own permissions block.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: test (pg${{ matrix.pg }})
