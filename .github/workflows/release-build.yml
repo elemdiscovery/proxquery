@@ -137,9 +137,8 @@ jobs:
           set -euo pipefail
           VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
           TAG="v${VERSION}"
-          # release-plz normally created the Release already; create it for the
-          # standalone tag-push / manual paths if it's missing. `|| true` swallows
-          # a harmless race if two steps ever create concurrently.
-          gh release view "$TAG" >/dev/null 2>&1 || \
-            gh release create "$TAG" --title "$TAG" --notes "Automated release." || true
+          # release.yml's gate creates the Release (with the CHANGELOG as notes);
+          # this job only attaches the built tarballs. When run manually to
+          # rebuild assets, pick the release's tag as the ref — the Release must
+          # already exist.
           gh release upload "$TAG" dist/* --clobber

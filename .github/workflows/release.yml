@@ -1,8 +1,8 @@
 # Orchestrates everything that happens on a push to main (see docs/RELEASING.md).
 #
-# release-plz tells us authoritatively whether THIS push landed a release (it
-# compares Cargo.toml's version to the git tags — independent of how the Release
-# PR was merged: squash, merge commit, or rebase all work). We branch on that:
+# We detect whether THIS push landed a release by comparing Cargo.toml's version
+# to the git tags — independent of how the Release PR was merged (squash, merge
+# commit, or rebase all work). We branch on that:
 #
 #   release commit  -> build the full binary matrix, attach to the v<x.y.z> tag
 #   any other commit -> build + publish the rolling `edge` pre-release
@@ -52,37 +52,46 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
-  # The gate. `released` is 'true' only on the commit that merged the Release PR.
+  # The gate. We no longer run release-plz's `release` command here — it tried to
+  # `cargo publish`, which this unpublished cdylib extension can't do. Instead we
+  # cut the release straight from Cargo.toml: merging the Release PR bumps the
+  # version on `main`, and `released` is 'true' only on the push where that
+  # version has no matching `v<x.y.z>` tag yet.
   release:
-    name: release-plz release
+    name: tag + GitHub Release
     runs-on: ubuntu-latest
-    # See release-pr above: DOCS_RS=1 lets release-plz's `cargo package` step
-    # build pgrx without a Postgres toolchain when determining the next version.
-    env:
-      DOCS_RS: "1"
     outputs:
-      released: ${{ steps.release-plz.outputs.releases_created }}
+      released: ${{ steps.gate.outputs.released }}
     steps:
-      - name: Generate a token from the deployer GitHub App
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.ELEMENTAL_DEPLOYER_CLIENT_ID }}
-          private-key: ${{ secrets.ELEMENTAL_DEPLOYER_APP_PK }}
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          fetch-depth: 0
-          token: ${{ steps.app-token.outputs.token }}
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - id: release-plz
-        uses: release-plz/action@e8792575c7f2366cf6ff3ccc33ead9ace5b691c7 # v0.5.130
-        with:
-          command: release
+      - id: gate
         env:
-          # Acting as the App so the release tag/release events are attributed to
-          # it and can trigger downstream workflows. The binary build below runs
-          # as a needs: job in THIS run, so it doesn't depend on the token.
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          TAG="v${VERSION}"
+
+          # Tag already exists → this push didn't bump the version (ordinary
+          # commit). Fall through to the edge build instead.
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "${TAG} already released; nothing to do."
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # New version → cut the release, reusing the CHANGELOG section the
+          # Release PR already wrote (git-cliff) as the notes; stub if absent.
+          awk -v h="## [${VERSION}]" '
+            index($0, h) == 1 { cap = 1; next }
+            cap && index($0, "## [") == 1 { exit }
+            cap { print }
+          ' CHANGELOG.md > notes.md || true
+          [ -s notes.md ] || printf 'Release %s\n' "$TAG" > notes.md
+
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md
+          echo "Released ${TAG}."
+          echo "released=true" >> "$GITHUB_OUTPUT"
 
   # Release commit: full PG 16/17/18 x amd64/arm64 matrix, attached to the Release.
   build-release:
