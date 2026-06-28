@@ -154,6 +154,26 @@ FROM results
 GROUP BY shape
 ORDER BY ext_op_ms DESC;
 
+-- ------------------------------------------------------------- pushdown plans
+-- Plan-shape guard, surfaced in the PR comment. A representative within/pre query
+-- (taken from the generated mix, so it uses real corpus terms) must stay GIN-index-
+-- served via the selective `a & b` presence skeleton + a positional recheck — the
+-- `@~@` operator must NOT rewrite it to the native `<~>` OR-expansion, which is
+-- non-selective and the planner mis-estimates into a sequential scan. Both the operator
+-- and the portable two-clause form should show a Bitmap Index Scan on the skeleton.
+SELECT coalesce((SELECT q FROM queries WHERE shape = 'within' ORDER BY id LIMIT 1),
+                'a <~5> b') AS within_q \gset
+\echo ''
+\echo '== plan: @~@ within is index-served via the a&b skeleton (not a seq scan) =='
+EXPLAIN (COSTS off, TIMING off, SUMMARY off)
+SELECT count(*) FROM corpus WHERE body_tsv @~@ :'within_q';
+\echo ''
+\echo '== plan: pure two-clause is GIN-index-served (Bitmap Index Scan + recheck Filter) =='
+EXPLAIN (COSTS off, TIMING off, SUMMARY off)
+SELECT count(*) FROM corpus
+WHERE body_tsv @@ proxquery.ts_prox_query(:'within_q')
+  AND proxquery.ts_prox_match(body_tsv, :'within_q');
+
 -- Parity: with the pure port enabled, every query's extension and pure match
 -- counts must agree. Reported as a visible row, then gated (timings on a shared
 -- runner are noise; correctness is not).

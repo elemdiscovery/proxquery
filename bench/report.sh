@@ -8,10 +8,19 @@
 #   bench/report.sh                                   # local default psql
 #   PGHOST=$HOME/.pgrx PGPORT=28817 bench/report.sh   # a cargo-pgrx instance
 #
-# Tunables (env): NDOCS (20000), WLEN (40), ITERS (5), SDOCS (2000), MAINT_DB (postgres).
+# Tunables (env):
+#   main by-shape table (large-bench small tier): SMALL_MB (32), NQUERIES (120),
+#     LB_ITERS (2), SEED (0.42), QSEED (0.137)
+#   supplementary sections: NDOCS (20000), WLEN (40), ITERS (5), SDOCS (2000)
+#   MAINT_DB (postgres)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Main results table: the frequency-skewed large-bench query generator at a small
+# corpus (varied terms across all 12 shapes + a real selectivity spread).
+SMALL_MB="${SMALL_MB:-32}"; NQUERIES="${NQUERIES:-120}"; LB_ITERS="${LB_ITERS:-2}"
+SEED="${SEED:-0.42}"; QSEED="${QSEED:-0.137}"
+# Supplementary sections (tokenizer overhead, length scaling) keep their own corpora.
 NDOCS="${NDOCS:-20000}"; WLEN="${WLEN:-40}"; ITERS="${ITERS:-5}"; SDOCS="${SDOCS:-2000}"
 MAINT_DB="${MAINT_DB:-postgres}"
 BENCH_DB="${BENCH_DB:-proxquery_bench_$$}"
@@ -27,9 +36,15 @@ trap cleanup EXIT
 
 psqlq -d "$MAINT_DB" -c "CREATE DATABASE \"$BENCH_DB\""
 
-cd "$ROOT"   # so the bench's `\i sql/proxquery_pure.sql` resolves
+cd "$ROOT"   # so the bench's repo-relative `\i` / `\copy` paths resolve
 start=$(date +%s)
-raw="$(psqlq -d "$BENCH_DB" -v ndocs="$NDOCS" -v wlen="$WLEN" -v iters="$ITERS" -f bench/pure_vs_extension.sql)"
+# Main table: the large-bench small tier (deterministic COCA-frequency corpus +
+# generated query mix), parity-gated. Far more term/selectivity variation than a
+# fixed query list — the same generator behind the manual large benchmark, just
+# small. RUN_LARGE is irrelevant here; we invoke large_bench.sql directly.
+raw="$(psqlq -d "$BENCH_DB" -v seed="$SEED" -v qseed="$QSEED" \
+        -v target_mb="$SMALL_MB" -v nqueries="$NQUERIES" -v iters="$LB_ITERS" \
+        -v with_pure=1 -f bench/large/large_bench.sql)"
 # Custom Unicode tokenizer vs stock `simple` on an overlap-heavy corpus — a smoke
 # regression check that superimposition doesn't blow up matching cost.
 raw_tok="$(psqlq -d "$BENCH_DB" -v ndocs="$NDOCS" -v wlen="$WLEN" -v iters="$ITERS" -f bench/tokenizer_vs_simple.sql)"
@@ -71,13 +86,18 @@ to_md_table() {
     }'
 }
 
-results_md="$(printf '%s\n' "$raw" | sed -n '/== pure-SQL port vs native extension/,/([0-9]* rows)/p' | grep '|' | to_md_table || true)"
-corpus_block="$(printf '%s\n' "$raw" | sed -n '/== corpus shape ==/,/^$/p' | sed '1d;/^$/d' || true)"
-plan_block="$(printf '%s\n' "$raw" | sed -n '/== plan:/,/([0-9]* rows)/p' | sed '1d' || true)"
+# Main results: the large-bench by-shape table + its parity / corpus / vocabulary
+# sections and the two pushdown-plan guards.
+results_md="$(printf '%s\n' "$raw" | sed -n '/== results: by query shape ==/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
+parity_md="$(printf '%s\n' "$raw" | sed -n '/== parity (pure port vs extension/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
+vocab_md="$(printf '%s\n' "$raw" | sed -n '/== vocabulary ==/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
+corpus_block="$(printf '%s\n' "$raw" | sed -n '/== corpus shape ==/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
+plan_op_block="$(printf '%s\n' "$raw" | sed -n '/== plan: @~@ within/,/([0-9]* row/p' | sed '1d' || true)"
+plan_pure_block="$(printf '%s\n' "$raw" | sed -n '/== plan: pure two-clause/,/([0-9]* row/p' | sed '1d' || true)"
 tok_corpus_md="$(printf '%s\n' "$raw_tok" | sed -n '/== corpus shape (lexeme/,/^$/p' | grep '|' | to_md_table || true)"
-tok_results_md="$(printf '%s\n' "$raw_tok" | sed -n '/== tokenizer vs simple/,/([0-9]* rows)/p' | grep '|' | to_md_table || true)"
-scale_results_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: pure vs extension recheck by text length/,/([0-9]* rows)/p' | grep '|' | to_md_table || true)"
-scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs shortest length/,/([0-9]* rows)/p' | grep '|' | to_md_table || true)"
+tok_results_md="$(printf '%s\n' "$raw_tok" | sed -n '/== tokenizer vs simple/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
+scale_results_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: pure vs extension recheck by text length/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
+scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs shortest length/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
 
 # ---- write the report ----
 {
@@ -95,16 +115,18 @@ scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs s
   echo "| load avg (1/5/15m) | ${loadavg} |"
   echo "| postgres | ${pg_version} |"
   echo "| proxquery extension | ${ext_version:-n/a} |"
-  echo "| corpus | ${NDOCS} docs × ${WLEN} tokens |"
-  echo "| scaling sweep | ${SDOCS} docs × {32,128,512,2048} tokens |"
-  echo "| iterations / query | ${ITERS} |"
+  echo "| main corpus | ${SMALL_MB} MiB · ${NQUERIES} generated queries · ${LB_ITERS} iters |"
+  echo "| tokenizer corpus | ${NDOCS} docs × ${WLEN} tokens · ${ITERS} iters |"
+  echo "| scaling sweep | ${SDOCS} docs × {32,128,512,2048} tokens · ${ITERS} iters |"
   echo "| total wall time | ${wall}s |"
   echo
-  echo "## Results"
+  echo "## Results — by query shape"
   echo
-  echo "Average server-side ms/query over ${ITERS} runs (after a warmup). Timings are"
-  echo "load-sensitive — check the load average in Context before comparing runs."
-  echo "\`disagree\` is a row-set parity check between the two implementations (must be 0)."
+  echo "Average server-side ms/query over ${LB_ITERS} runs (after a warmup), over a"
+  echo "deterministic COCA-frequency corpus and a generated query mix — so each shape is"
+  echo "exercised across a real spread of term frequencies and selectivities (\`avg_cand\`"
+  echo "= rows the \`@@\` skeleton selects, \`avg_match\` = rows that actually match)."
+  echo "Timings are load-sensitive — check the load average in Context before comparing runs."
   echo
   printf '%s\n' "$results_md"
   echo
@@ -112,6 +134,11 @@ scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs s
   echo "- \`ext_2cl_ms\` — extension, written as the two-clause form"
   echo "- \`pure_2cl_ms\` — pure-SQL port, the same two clauses"
   echo "- \`slowdown\` — \`pure_2cl_ms / ext_2cl_ms\`"
+  echo
+  echo "Parity (extension vs pure match counts on the same corpus — \`mismatches\` must be 0;"
+  echo "it is also gated independently, so a nonzero count fails this job):"
+  echo
+  printf '%s\n' "$parity_md"
   echo
   echo "## Tokenizer vs simple (overlap overhead)"
   echo
@@ -143,10 +170,18 @@ scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs s
   echo
   printf '%s\n' "$scale_growth_md"
   echo
-  echo "<details><summary>Corpus</summary>"
+  echo "<details><summary>Corpus &amp; vocabulary</summary>"
+  echo
+  printf '%s\n' "$vocab_md"
+  echo
+  printf '%s\n' "$corpus_block"
+  echo
+  echo "</details>"
+  echo
+  echo "<details><summary>Plan — @~@ operator on a within shape (index-served via the a&amp;b skeleton, not a seq scan)</summary>"
   echo
   echo '```'
-  printf '%s\n' "$corpus_block"
+  printf '%s\n' "$plan_op_block"
   echo '```'
   echo
   echo "</details>"
@@ -154,7 +189,7 @@ scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs s
   echo "<details><summary>Plan — pure two-clause (GIN-index-served)</summary>"
   echo
   echo '```'
-  printf '%s\n' "$plan_block"
+  printf '%s\n' "$plan_pure_block"
   echo '```'
   echo
   echo "</details>"
