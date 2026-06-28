@@ -9,6 +9,10 @@ surface query term finds the normalized lexemes the column actually stores.
 The headline: against an `english` column, `running <~3> shoes` matches a document
 stored as `run … shoe`. Against a `simple_unaccent` column, `CAFÉ` matches `café`.
 
+> For the **custom Unicode tokenizer** (emoji, superimposed accents/hyphens/emails,
+> ICU CJK, `:dict` stemming) — an ediscovery-oriented alternative to a stock
+> `regconfig` — see the [tokenizer user guide](TOKENIZER.md).
+
 ## The idea: proxquery *consumes* a config, it doesn't author one
 
 proxquery matches by **lexeme**. Under a non-`simple` config the stored lexemes
@@ -49,6 +53,12 @@ The existing 2-arg `ts_prox_query(text)` / `ts_prox_match(tsvector, text)` and t
 plain `tsvector @~@ text` operator are unchanged — still `simple`, still literal.
 This is purely additive.
 
+These `ts_prox_*` functions are the **stock / regconfig** family and are mirrored by
+the pure-SQL port. The custom Unicode tokenizer has a parallel **`proxquery_*`**
+family (`proxquery_to_tsvector`, `proxquery_match`) that is **extension-only** — see
+the [tokenizer guide](TOKENIZER.md). A function's family tells you whether it works
+under the pure port.
+
 ### As the two-clause form (works everywhere, incl. the pure-SQL port)
 
 ```sql
@@ -66,8 +76,9 @@ SELECT * FROM docs
 WHERE body_tsv @~@ proxquery('english', 'running <~3> shoes');
 ```
 
-`proxquery(cfg, q)` builds a typed `(regconfig, text)` pair; a second `@~@` over
-that type keeps one operator symbol. Its planner support function rewrites it to
+`proxquery(src, q)` builds a typed `(text, text)` pair, where `src` names a config
+(or a custom analyzer — see the [tokenizer guide](TOKENIZER.md)); the single `@~@`
+over that type dispatches on `src`. Its planner support function rewrites it to
 `body_tsv @@ ts_prox_query(proxquery)` for the GIN index, so it plans **exactly**
 like the two-clause form — index selection plus recheck:
 

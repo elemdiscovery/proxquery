@@ -6,7 +6,9 @@
 
 The motivation is to implement query syntax similar to dtSearch and Lucene without also implementing an actual custom index. All the usual [tsvector limitations](https://www.postgresql.org/docs/current/textsearch-limitations.html) apply.
 
-There is also a [plain SQL implementation](#pure-sql-port) for when compiled extensions can't be used.
+Additionally the extension implements a `proxquery_to_tsvector` function that calculates `tsvector` with (debatably) more intuitive positions through lexeme superimposition, with adjustments for accents, emoji, hyphenated words, and CJK.
+
+There is also a [plain SQL implementation](#pure-sql-port) for when compiled extensions can't be used. The port supports the DSL syntax but not the custom `tsvector` builder function.
 
 ## Install
 
@@ -37,9 +39,9 @@ docker run --rm -e POSTGRES_PASSWORD=pw ghcr.io/elemdiscovery/proxquery:pg17
 
 ### Pure-SQL port
 
-For managed Postgres, [sql/proxquery_pure.sql](sql/proxquery_pure.sql) is a re-implementation using plain SQL with the same function names and identical results, installed into a dedicated `proxquery` schema.
+For managed Postgres, [sql/proxquery_pure.sql](sql/proxquery_pure.sql) is a re-implementation of the DSL using plain SQL with the same function names and identical results, installed into a dedicated `proxquery` schema.
 
-The usage difference is that the `@~@` operator needs a compiled planner support function, so the pure port does **not** implement it and you need to call two functions for each query to properly use the index.
+The usage difference is that the `@~@` operator needs a compiled planner support function, so the pure port does **not** implement it and you need to call two functions for each query to properly use the index. The custom `tsvector` building is also not supported.
 
 ```sql
 SELECT * FROM docs
@@ -85,7 +87,7 @@ The DSL is a superset of `tsquery`. Native `tsquery` syntax works unchanged; the
 | `f*r` | infix |
 | `te?t` | single character (`?`) |
 | `##re##` | regex, whole lexeme |
-| `'a b'` | literal term (no operator/wildcard meaning) |
+| `'café'` | literal term |
 | `"a b c"` | phrase (adjacent words) |
 | `a <-> b` | `b` immediately after `a` |
 | `a <N> b` | `b` exactly `N` words after `a` |
@@ -136,12 +138,56 @@ ALTER TEXT SEARCH CONFIGURATION simple_unaccent
     WITH unaccent, simple;
 ```
 
+## Extension-only tokenizer
+
+`proxquery_to_tsvector(body, analyzer)` builds the `tsvector` with a custom tokenizer instead of a stock config.
+
+You then use `@~@` with `proxquery` and the corresponding tokenizer when searching.
+
+An example of what this allows is searching with and without accents on the same index.
+
+```sql
+CREATE TABLE docs (
+  id   bigserial PRIMARY KEY,
+  body text,
+  tsv  tsvector GENERATED ALWAYS AS (proxquery_to_tsvector(body, 'prox_icu')) STORED
+);
+CREATE INDEX docs_tsv_gin ON docs USING gin (tsv);
+
+INSERT INTO docs (body) VALUES
+  ('un café noir, please'),
+  ('a plain cafe noir here'),
+  ('the café is closed');
+
+-- find "café noir" and "cafe noir"
+SELECT id, body FROM docs WHERE tsv @~@ proxquery('prox_icu', 'cafe <-> noir');
+
+-- single quote literal `'café'` for only accented results
+SELECT id, body FROM docs WHERE tsv @~@ proxquery('prox_icu', '''café'' <-> noir');
+```
+
+The built-in analyzers:
+
+| Analyzer | Notes |
+| --- | --- |
+| `prox_icu` | default; ICU library segmentation, folds case and accents, keeps emoji |
+| `prox_unicode` | Same as default but unicode segmentation (per character CJK) |
+| `prox_icu_accent` | accent-sensitive (`café` ≠ `cafe`) |
+| `prox_icu_no_emoji` | drops emoji instead of indexing them |
+
+You can combine the custom analyzers with built-in dictionaries, with `:dict`, e.g. `prox_icu:english_stem`.
+
 ## Functions
 
 The `@~@` operator is built on functions that can also be used directly:
 
 - `ts_prox_query(text [, regconfig]) -> tsquery` -- uses the gin index.
 - `ts_prox_match(tsvector, text [, regconfig]) -> bool` -- rechecks the match based on positions.
+
+The custom tokenizer relies on `proxquery_to_tsvector` and `proxquery_match` which includes a parameter for which analyzer to use.
+
+- `proxquery_to_tsvector(body: text, analyzer: text) -> tsvector` -- builds a `tsvector` with a given analyzer.
+- `proxquery_match(tsvector, query: text, analyzer: text) -> bool` -- positional recheck for a given analyzer.
 
 These then use lower level functions that you probably don't need:
 

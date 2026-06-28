@@ -44,6 +44,8 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Atom {
     Term(String),
+    /// A literal `'…'` term — resolved exactly (no accent-fold/stem), see [`Node::Exact`].
+    Exact(String),
     Prefix(String),
     Glob { glob: String, prefix: String },
 }
@@ -54,6 +56,10 @@ pub enum Atom {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Node {
     Term(String),
+    /// A literal `'…'` term. Resolved EXACTLY — case-folded only, no accent-fold,
+    /// stemming, or decomposition — so it matches the index's preserved form. The
+    /// precision opt-out from the accent/stem-insensitive bare term.
+    Exact(String),
     Prefix(String),
     /// A `*`/`?` glob (`*ology`, `f*r`, `te?t`). `glob` is the lowercased pattern;
     /// `prefix` is its leading literal run (empty if it starts with a wildcard).
@@ -103,6 +109,7 @@ enum Tok {
     WithinOp(i32),         // <~N>                 (either order, within)
     NotWithinOp(i32, bool), // <!~N> (false) / <!-N> (true)
     Term(String),
+    Exact(String),         // 'single quoted' literal term
     Prefix(String),
     Glob(String, String),  // glob pattern, leading literal prefix
     Regex(String),         // ##...##
@@ -255,7 +262,7 @@ fn lex(input: &str) -> Result<Vec<Tok>, String> {
             if lexeme.is_empty() {
                 return Err("empty quoted term".into());
             }
-            toks.push(Tok::Term(lexeme.to_ascii_lowercase()));
+            toks.push(Tok::Exact(lexeme.to_ascii_lowercase()));
         } else if c == '#' {
             // ##regex## — everything between the delimiters is the regex verbatim.
             if chars.get(i + 1) != Some(&'#') {
@@ -380,6 +387,7 @@ impl Parser {
                 }
             }
             Some(Tok::Term(t)) => Ok(Node::Term(t)),
+            Some(Tok::Exact(t)) => Ok(Node::Exact(t)),
             Some(Tok::Prefix(p)) => Ok(Node::Prefix(p)),
             Some(Tok::Glob(glob, prefix)) => Ok(Node::Glob { glob, prefix }),
             Some(Tok::Regex(pattern)) => Ok(Node::Regex(pattern)),
@@ -394,6 +402,7 @@ fn phrase_node(atoms: Vec<Atom>) -> Node {
     if atoms.len() == 1 {
         return match atoms.into_iter().next().unwrap() {
             Atom::Term(t) => Node::Term(t),
+            Atom::Exact(t) => Node::Exact(t),
             Atom::Prefix(p) => Node::Prefix(p),
             Atom::Glob { glob, prefix } => Node::Glob { glob, prefix },
         };
@@ -405,6 +414,7 @@ fn phrase_node(atoms: Vec<Atom>) -> Node {
 fn as_atom(node: &Node) -> Option<Atom> {
     match node {
         Node::Term(t) => Some(Atom::Term(t.clone())),
+        Node::Exact(t) => Some(Atom::Exact(t.clone())),
         Node::Prefix(p) => Some(Atom::Prefix(p.clone())),
         Node::Glob { glob, prefix } => Some(Atom::Glob { glob: glob.clone(), prefix: prefix.clone() }),
         _ => None,
@@ -516,6 +526,7 @@ fn flatten(is_and: bool, children: Vec<Node>) -> Node {
 pub fn skeleton(node: &Node) -> Result<Option<String>, String> {
     Ok(match node {
         Node::Term(t) => Some(quote_lexeme(t)),
+        Node::Exact(t) => Some(quote_lexeme(t)),
         Node::Prefix(p) => Some(format!("{}:*", quote_lexeme(p))),
         // A glob with a leading literal is index-served via that prefix; one that
         // starts with a wildcard carries no key and needs a companion term.
@@ -570,6 +581,7 @@ fn phrase_skeleton(atoms: &[Atom], gaps: &[i32]) -> Option<String> {
 fn native_phrase_atom(atom: &Atom) -> Option<String> {
     match atom {
         Atom::Term(t) => Some(quote_lexeme(t)),
+        Atom::Exact(t) => Some(quote_lexeme(t)),
         Atom::Prefix(p) => Some(format!("{}:*", quote_lexeme(p))),
         Atom::Glob { prefix, .. } => (!prefix.is_empty()).then(|| format!("{}:*", quote_lexeme(prefix))),
     }
@@ -590,6 +602,116 @@ fn quote_lexeme(lex: &str) -> String {
 pub fn to_tsquery_string(input: &str) -> Result<String, String> {
     let node = normalize(parse(input)?);
     skeleton(&node)?.ok_or_else(|| {
+        "query has no positive term to drive the index; add an AND-ed positive term".to_string()
+    })
+}
+
+// --- analyzer probe: a skeleton with leaves resolved through the analyzer --------
+//
+// The cfg path lets `to_tsquery(cfg, skeleton)` resolve raw terms, but there is no
+// `to_tsquery(analyzer, …)`. So the analyzer skeleton resolves each leaf to the
+// analyzer's lexemes itself and quotes them, producing a complete tsquery string
+// that `tsqueryin` (`::tsquery`) takes verbatim — no re-tokenization, so a lexeme
+// like `cafe-bar` survives intact. Structure mirrors `skeleton`; only leaves differ.
+
+/// A term's analyzer lexemes as a quoted tsquery fragment (OR'd if several — a doc
+/// that stored *any* one must be index-selected, the soundness contract). `None`
+/// when the term resolves to nothing.
+fn resolved_term(kind: AnalyzerKind, term: &str) -> Option<String> {
+    let quoted: Vec<String> = resolve_lexemes(Resolver::Analyzer(kind), term)
+        .iter()
+        .filter_map(|l| std::str::from_utf8(l).ok().map(quote_lexeme))
+        .collect();
+    match quoted.as_slice() {
+        [] => None,
+        [one] => Some(one.clone()),
+        _ => Some(format!("({})", quoted.join(" | "))),
+    }
+}
+
+/// A literal `'…'` term's exact analyzer lexeme(s), quoted (no accent-fold/stem).
+fn resolved_exact(kind: AnalyzerKind, term: &str) -> Option<String> {
+    let quoted: Vec<String> = kind
+        .lexemes_exact(term)
+        .iter()
+        .filter_map(|l| std::str::from_utf8(l).ok().map(quote_lexeme))
+        .collect();
+    match quoted.as_slice() {
+        [] => None,
+        [one] => Some(one.clone()),
+        _ => Some(format!("({})", quoted.join(" | "))),
+    }
+}
+
+/// A prefix/glob literal folded to its single analyzer lexeme, or raw when the
+/// analyzer yields 0 or >1 lexemes (the same 0/1/>1 fan-out as the cfg path).
+fn fold_prefix(kind: AnalyzerKind, p: &str) -> String {
+    match resolve_lexemes(Resolver::Analyzer(kind), p).as_slice() {
+        [one] => String::from_utf8(one.clone()).unwrap_or_else(|_| p.to_owned()),
+        _ => p.to_owned(),
+    }
+}
+
+fn resolved_atom(kind: AnalyzerKind, atom: &Atom) -> Option<String> {
+    match atom {
+        Atom::Term(t) => resolved_term(kind, t),
+        Atom::Exact(t) => resolved_exact(kind, t),
+        Atom::Prefix(p) => Some(format!("{}:*", quote_lexeme(&fold_prefix(kind, p)))),
+        Atom::Glob { prefix, .. } => {
+            (!prefix.is_empty()).then(|| format!("{}:*", quote_lexeme(&fold_prefix(kind, prefix))))
+        }
+    }
+}
+
+/// Analyzer counterpart of [`skeleton`]: same lowering, leaves resolved + quoted.
+fn analyzer_skeleton(node: &Node, kind: AnalyzerKind) -> Result<Option<String>, String> {
+    Ok(match node {
+        Node::Term(t) => resolved_term(kind, t),
+        Node::Exact(t) => resolved_exact(kind, t),
+        Node::Prefix(p) => Some(format!("{}:*", quote_lexeme(&fold_prefix(kind, p)))),
+        Node::Glob { prefix, .. } => {
+            (!prefix.is_empty()).then(|| format!("{}:*", quote_lexeme(&fold_prefix(kind, prefix))))
+        }
+        Node::Regex(_) => None,
+        // Sound conjunction of resolved atoms — the recheck enforces adjacency.
+        Node::Phrase { atoms, .. } => {
+            let parts: Vec<String> = atoms.iter().filter_map(|a| resolved_atom(kind, a)).collect();
+            (!parts.is_empty()).then(|| conj(&parts))
+        }
+        Node::Within { a, b, .. } => {
+            optional_conj(&[analyzer_skeleton(a, kind)?, analyzer_skeleton(b, kind)?])
+        }
+        Node::NotWithin { a, .. } => analyzer_skeleton(a, kind)?,
+        Node::And(v) => {
+            let present: Vec<String> = v
+                .iter()
+                .filter_map(|c| analyzer_skeleton(c, kind).transpose())
+                .collect::<Result<_, _>>()?;
+            if present.is_empty() {
+                None
+            } else {
+                Some(conj(&present))
+            }
+        }
+        Node::Or(v) => {
+            let mut parts = Vec::with_capacity(v.len());
+            for c in v {
+                match analyzer_skeleton(c, kind)? {
+                    Some(s) => parts.push(s),
+                    None => return Ok(None),
+                }
+            }
+            Some(format!("({})", parts.join(" | ")))
+        }
+        Node::Not(_) => None,
+    })
+}
+
+/// Analyzer-resolved tsquery string for index selection (cast `::tsquery` verbatim).
+/// Errors on a keyless query, same contract as [`to_tsquery_string`].
+pub fn analyzer_tsquery_string(input: &str, kind: AnalyzerKind) -> Result<String, String> {
+    let node = normalize(parse(input)?);
+    analyzer_skeleton(&node, kind)?.ok_or_else(|| {
         "query has no positive term to drive the index; add an AND-ed positive term".to_string()
     })
 }
@@ -640,12 +762,26 @@ fn regex_compiles(pattern: &str) -> bool {
 // the predicates in [`crate::proximity`].
 
 use crate::proximity;
+use crate::tokenizer::AnalyzerKind;
 use crate::tsvector::TsVector;
 use pgrx::datum::FromDatum;
 use pgrx::pg_sys;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+
+/// How a query atom's literal text is resolved to lexeme(s) before matching — the
+/// query side of the index/query symmetry, threaded through the whole evaluator.
+#[derive(Clone, Copy)]
+pub enum Resolver {
+    /// 2-arg fast path: match the atom as a verbatim (ASCII-lowered) lexeme.
+    Literal,
+    /// Config-aware: resolve through `to_tsvector(cfg, term)`.
+    Cfg(pg_sys::Oid),
+    /// Custom Unicode tokenizer: resolve through the named analyzer, symmetric with
+    /// `proxquery_to_tsvector`.
+    Analyzer(AnalyzerKind),
+}
 
 // --- config-aware term resolution -----------------------------------------
 //
@@ -671,51 +807,69 @@ fn to_tsvector_oid() -> pg_sys::Oid {
 }
 
 /// Cache of a term's resolved lexemes (`Rc` so the hot path clones a refcount, not
-/// the Vec). Nested `config -> term -> lexemes` so a cache hit looks the term up by
+/// the Vec). Nested `resolver -> term -> lexemes` so a cache hit looks the term up by
 /// `&str` (no per-row `String` allocation); the owned key is built only on a miss.
-type ResolveCache = HashMap<pg_sys::Oid, HashMap<String, Rc<Vec<Vec<u8>>>>>;
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum CacheKey {
+    Cfg(pg_sys::Oid),
+    Analyzer(u8, Option<pg_sys::Oid>),
+}
+
+type ResolveCache = HashMap<CacheKey, HashMap<String, Rc<Vec<Vec<u8>>>>>;
 
 thread_local! {
-    // Resolution is per-row in the recheck but `(cfg, term)` repeats across rows of
-    // a scan, so memoize. Bounded by the query vocabulary.
+    // Resolution is per-row in the recheck but `(resolver, term)` repeats across rows
+    // of a scan, so memoize. Bounded by the query vocabulary.
     static RESOLVE_CACHE: RefCell<ResolveCache> = RefCell::new(HashMap::new());
 }
 
-/// Distinct lexemes of `to_tsvector(cfg, term)` (the term run through the config's
-/// dictionaries). Empty when the term is a stopword / tokenizes to nothing.
-fn resolve_lexemes(cfg: pg_sys::Oid, term: &str) -> Rc<Vec<Vec<u8>>> {
+/// Distinct lexemes a term resolves to under `r` — through the config's dictionaries
+/// (`to_tsvector(cfg, term)`) or the custom analyzer. Empty when the term is a
+/// stopword / tokenizes to nothing. Not meaningful on the literal path.
+fn resolve_lexemes(r: Resolver, term: &str) -> Rc<Vec<Vec<u8>>> {
+    let key = match r {
+        Resolver::Cfg(oid) => CacheKey::Cfg(oid),
+        Resolver::Analyzer(k) => {
+            let (base, dict) = k.cache_key();
+            CacheKey::Analyzer(base, dict)
+        }
+        Resolver::Literal => return Rc::new(Vec::new()),
+    };
     if let Some(hit) =
-        RESOLVE_CACHE.with(|m| m.borrow().get(&cfg).and_then(|inner| inner.get(term)).cloned())
+        RESOLVE_CACHE.with(|m| m.borrow().get(&key).and_then(|inner| inner.get(term)).cloned())
     {
         return hit;
     }
-    let lexemes = unsafe {
-        let text = pg_sys::cstring_to_text_with_len(
-            term.as_ptr() as *const core::ffi::c_char,
-            term.len() as i32,
-        );
-        let datum = pg_sys::OidFunctionCall2Coll(
-            to_tsvector_oid(),
-            pg_sys::InvalidOid,
-            pg_sys::Datum::from(cfg),
-            pg_sys::Datum::from(text),
-        );
-        match TsVector::from_polymorphic_datum(datum, false, pg_sys::TSVECTOROID) {
-            Some(tsv) => tsv.all_lexemes(),
-            None => Vec::new(),
-        }
+    let lexemes = match r {
+        Resolver::Cfg(cfg) => unsafe {
+            let text = pg_sys::cstring_to_text_with_len(
+                term.as_ptr() as *const core::ffi::c_char,
+                term.len() as i32,
+            );
+            let datum = pg_sys::OidFunctionCall2Coll(
+                to_tsvector_oid(),
+                pg_sys::InvalidOid,
+                pg_sys::Datum::from(cfg),
+                pg_sys::Datum::from(text),
+            );
+            match TsVector::from_polymorphic_datum(datum, false, pg_sys::TSVECTOROID) {
+                Some(tsv) => tsv.all_lexemes(),
+                None => Vec::new(),
+            }
+        },
+        Resolver::Analyzer(k) => k.lexemes(term),
+        Resolver::Literal => Vec::new(),
     };
     let rc = Rc::new(lexemes);
     RESOLVE_CACHE
-        .with(|m| m.borrow_mut().entry(cfg).or_default().insert(term.to_owned(), Rc::clone(&rc)));
+        .with(|m| m.borrow_mut().entry(key).or_default().insert(term.to_owned(), Rc::clone(&rc)));
     rc
 }
 
-/// Positions of a term resolved under `cfg`: the union over its lexeme(s) (a
-/// stemmer/thesaurus may emit several, treated like an OR of co-located synonyms).
-fn term_positions_cfg(cfg: pg_sys::Oid, term: &str, v: &TsVector) -> Vec<i32> {
-    let lexemes = resolve_lexemes(cfg, term);
-    match lexemes.as_slice() {
+/// Union of a tsvector's positions over a set of lexemes (an OR of co-located forms —
+/// a stemmer/thesaurus/analyzer may emit several).
+fn positions_union(v: &TsVector, lexemes: &[Vec<u8>]) -> Vec<i32> {
+    match lexemes {
         [] => Vec::new(),
         [one] => v.positions(one),
         many => {
@@ -730,12 +884,29 @@ fn term_positions_cfg(cfg: pg_sys::Oid, term: &str, v: &TsVector) -> Vec<i32> {
     }
 }
 
+/// Positions of a (bare) term resolved under `r` — its canonical lexeme(s).
+fn term_positions(r: Resolver, term: &str, v: &TsVector) -> Vec<i32> {
+    positions_union(v, &resolve_lexemes(r, term))
+}
+
+/// Positions of a LITERAL `'…'` term. Under an analyzer it resolves EXACTLY (no
+/// accent-fold/stem), so it matches the index's preserved form; under cfg/literal it
+/// is the normal term resolution (those paths don't superimpose, so there's nothing
+/// to be exact about).
+fn exact_positions(r: Resolver, term: &str, v: &TsVector) -> Vec<i32> {
+    match r {
+        Resolver::Analyzer(k) => positions_union(v, &k.lexemes_exact(term)),
+        Resolver::Cfg(_) => term_positions(r, term, v),
+        Resolver::Literal => v.positions(term.as_bytes()),
+    }
+}
+
 /// The prefix to scan for a `Prefix` node under `cfg` — the prefix text normalized
 /// through the config (so an accented prefix matches the unaccented stored lexemes,
 /// matching what `to_tsquery(cfg, 'p':*)` selects). Falls back to the raw prefix when
 /// the config yields zero or several lexemes.
-fn prefix_norm_cfg(cfg: pg_sys::Oid, p: &str) -> Vec<u8> {
-    let lexemes = resolve_lexemes(cfg, p);
+fn prefix_norm(r: Resolver, p: &str) -> Vec<u8> {
+    let lexemes = resolve_lexemes(r, p);
     match lexemes.as_slice() {
         [one] => one.clone(),
         _ => p.as_bytes().to_vec(),
@@ -744,8 +915,8 @@ fn prefix_norm_cfg(cfg: pg_sys::Oid, p: &str) -> Vec<u8> {
 
 /// Fold one literal glob run through `cfg`: its single resolved lexeme, or the run
 /// verbatim when `cfg` yields 0 or >1 lexemes (the same 0/1/>1 fan-out as terms).
-fn fold_run(cfg: pg_sys::Oid, run: &str) -> String {
-    match resolve_lexemes(cfg, run).as_slice() {
+fn fold_run(r: Resolver, run: &str) -> String {
+    match resolve_lexemes(r, run).as_slice() {
         [one] => String::from_utf8(one.clone()).unwrap_or_else(|_| run.to_owned()),
         _ => run.to_owned(),
     }
@@ -757,13 +928,13 @@ fn fold_run(cfg: pg_sys::Oid, run: &str) -> String {
 /// Mirrors the pure port's `_prox_fold_glob`. Returns the folded pattern and its
 /// recomputed leading prefix (so the `positions_matching` scan-narrowing keys off the
 /// folded lexemes too).
-fn fold_glob_cfg(cfg: pg_sys::Oid, glob: &str) -> (String, String) {
+fn fold_glob(r: Resolver, glob: &str) -> (String, String) {
     let mut out = String::new();
     let mut run = String::new();
     for ch in glob.chars() {
         if is_glob_char(ch) {
             if !run.is_empty() {
-                out.push_str(&fold_run(cfg, &run));
+                out.push_str(&fold_run(r, &run));
                 run.clear();
             }
             out.push(ch);
@@ -772,7 +943,7 @@ fn fold_glob_cfg(cfg: pg_sys::Oid, glob: &str) -> (String, String) {
         }
     }
     if !run.is_empty() {
-        out.push_str(&fold_run(cfg, &run));
+        out.push_str(&fold_run(r, &run));
     }
     let prefix = glob_prefix(&out);
     (out, prefix)
@@ -781,21 +952,21 @@ fn fold_glob_cfg(cfg: pg_sys::Oid, glob: &str) -> (String, String) {
 /// Positions of a glob, resolving its literal runs through `cfg` when one is given
 /// (config-aware recheck) or scanning the stored lexemes verbatim otherwise (the
 /// `simple` 2-arg fast path).
-fn glob_positions(cfg: Option<pg_sys::Oid>, glob: &str, prefix: &str, v: &TsVector) -> Vec<i32> {
-    match cfg {
-        Some(c) => {
-            let (fg, fp) = fold_glob_cfg(c, glob);
+fn glob_positions(r: Resolver, glob: &str, prefix: &str, v: &TsVector) -> Vec<i32> {
+    match r {
+        Resolver::Literal => v.positions_matching(prefix.as_bytes(), |lex| glob_match(glob, lex)),
+        _ => {
+            let (fg, fp) = fold_glob(r, glob);
             v.positions_matching(fp.as_bytes(), |lex| glob_match(&fg, lex))
         }
-        None => v.positions_matching(prefix.as_bytes(), |lex| glob_match(glob, lex)),
     }
 }
 
-pub fn eval_match(node: &Node, v: &TsVector, cfg: Option<pg_sys::Oid>) -> Result<bool, String> {
+pub fn eval_match(node: &Node, v: &TsVector, r: Resolver) -> Result<bool, String> {
     Ok(match node {
         Node::And(children) => {
             for c in children {
-                if !eval_match(c, v, cfg)? {
+                if !eval_match(c, v, r)? {
                     return Ok(false);
                 }
             }
@@ -803,15 +974,15 @@ pub fn eval_match(node: &Node, v: &TsVector, cfg: Option<pg_sys::Oid>) -> Result
         }
         Node::Or(children) => {
             for c in children {
-                if eval_match(c, v, cfg)? {
+                if eval_match(c, v, r)? {
                     return Ok(true);
                 }
             }
             false
         }
-        Node::Not(x) => !eval_match(x, v, cfg)?,
+        Node::Not(x) => !eval_match(x, v, r)?,
         Node::Within { a, b, n, ordered } => {
-            let (pa, pb) = (positions(a, v, cfg)?, positions(b, v, cfg)?);
+            let (pa, pb) = (positions(a, v, r)?, positions(b, v, r)?);
             if *ordered {
                 proximity::pre(&pa, &pb, *n)
             } else {
@@ -819,49 +990,53 @@ pub fn eval_match(node: &Node, v: &TsVector, cfg: Option<pg_sys::Oid>) -> Result
             }
         }
         Node::NotWithin { a, b, n, ordered } => {
-            proximity::not_within(&positions(a, v, cfg)?, &positions(b, v, cfg)?, *n, *ordered)
+            proximity::not_within(&positions(a, v, r)?, &positions(b, v, r)?, *n, *ordered)
         }
-        Node::Term(_) | Node::Prefix(_) | Node::Glob { .. } | Node::Regex(_) | Node::Phrase { .. } => {
-            !positions(node, v, cfg)?.is_empty()
-        }
+        Node::Term(_)
+        | Node::Exact(_)
+        | Node::Prefix(_)
+        | Node::Glob { .. }
+        | Node::Regex(_)
+        | Node::Phrase { .. } => !positions(node, v, r)?.is_empty(),
     })
 }
 
-fn positions(node: &Node, v: &TsVector, cfg: Option<pg_sys::Oid>) -> Result<Vec<i32>, String> {
+fn positions(node: &Node, v: &TsVector, r: Resolver) -> Result<Vec<i32>, String> {
     Ok(match node {
-        // Term/Prefix/Glob resolve through the config (when one is given), so a
-        // wildcard search folds like the column was built; regex stays verbatim (its
+        // Term/Prefix/Glob resolve through the config or analyzer (unless literal), so
+        // a wildcard search folds like the column was built; regex stays verbatim (its
         // skeleton emits no index key, so there is no probe to keep it consistent with).
-        Node::Term(t) => match cfg {
-            Some(c) => term_positions_cfg(c, t, v),
-            None => v.positions(t.as_bytes()),
+        Node::Term(t) => match r {
+            Resolver::Literal => v.positions(t.as_bytes()),
+            _ => term_positions(r, t, v),
         },
-        Node::Prefix(p) => match cfg {
-            Some(c) => v.positions_prefix(&prefix_norm_cfg(c, p)),
-            None => v.positions_prefix(p.as_bytes()),
+        Node::Exact(t) => exact_positions(r, t, v),
+        Node::Prefix(p) => match r {
+            Resolver::Literal => v.positions_prefix(p.as_bytes()),
+            _ => v.positions_prefix(&prefix_norm(r, p)),
         },
-        Node::Glob { glob, prefix } => glob_positions(cfg, glob, prefix, v),
+        Node::Glob { glob, prefix } => glob_positions(r, glob, prefix, v),
         Node::Regex(pattern) => {
             // Patterns are validated up front (see `validate_regexes`), so by the
             // time the recheck runs the regex is known to compile.
             let re = unsafe { Regexp::compile(pattern) };
             v.positions_matching(b"", |lex| unsafe { re.is_match(lex) })
         }
-        Node::Phrase { atoms, gaps } => phrase_positions(atoms, gaps, v, cfg),
+        Node::Phrase { atoms, gaps } => phrase_positions(atoms, gaps, v, r),
         Node::Or(children) => {
             let mut all = Vec::new();
             for c in children {
-                all.extend(positions(c, v, cfg)?);
+                all.extend(positions(c, v, r)?);
             }
             all.sort_unstable();
             all.dedup();
             all
         }
         Node::Within { a, b, n, ordered } => {
-            within_span(&positions(a, v, cfg)?, &positions(b, v, cfg)?, *n, *ordered)
+            within_span(&positions(a, v, r)?, &positions(b, v, r)?, *n, *ordered)
         }
         Node::NotWithin { a, b, n, ordered } => {
-            not_within_participants(&positions(a, v, cfg)?, &positions(b, v, cfg)?, *n, *ordered)
+            not_within_participants(&positions(a, v, r)?, &positions(b, v, r)?, *n, *ordered)
         }
         Node::And(_) | Node::Not(_) => {
             return Err("AND/NOT cannot be a proximity operand (normalization should have lifted it)".into())
@@ -952,25 +1127,26 @@ fn glob_match(pattern: &str, lexeme: &[u8]) -> bool {
     pi == p.len()
 }
 
-fn atom_positions(a: &Atom, v: &TsVector, cfg: Option<pg_sys::Oid>) -> Vec<i32> {
+fn atom_positions(a: &Atom, v: &TsVector, r: Resolver) -> Vec<i32> {
     match a {
-        Atom::Term(t) => match cfg {
-            Some(c) => term_positions_cfg(c, t, v),
-            None => v.positions(t.as_bytes()),
+        Atom::Term(t) => match r {
+            Resolver::Literal => v.positions(t.as_bytes()),
+            _ => term_positions(r, t, v),
         },
-        Atom::Prefix(p) => match cfg {
-            Some(c) => v.positions_prefix(&prefix_norm_cfg(c, p)),
-            None => v.positions_prefix(p.as_bytes()),
+        Atom::Exact(t) => exact_positions(r, t, v),
+        Atom::Prefix(p) => match r {
+            Resolver::Literal => v.positions_prefix(p.as_bytes()),
+            _ => v.positions_prefix(&prefix_norm(r, p)),
         },
-        Atom::Glob { glob, prefix } => glob_positions(cfg, glob, prefix, v),
+        Atom::Glob { glob, prefix } => glob_positions(r, glob, prefix, v),
     }
 }
 
 /// End positions of an exact-gap sequence: `atoms[i+1]` exactly `gaps[i]` after `atoms[i]`.
-fn phrase_positions(atoms: &[Atom], gaps: &[i32], v: &TsVector, cfg: Option<pg_sys::Oid>) -> Vec<i32> {
-    let mut reach = atom_positions(&atoms[0], v, cfg);
+fn phrase_positions(atoms: &[Atom], gaps: &[i32], v: &TsVector, r: Resolver) -> Vec<i32> {
+    let mut reach = atom_positions(&atoms[0], v, r);
     for (atom, &g) in atoms[1..].iter().zip(gaps) {
-        let cur = atom_positions(atom, v, cfg);
+        let cur = atom_positions(atom, v, r);
         reach = cur.into_iter().filter(|&c| reach.binary_search(&(c - g)).is_ok()).collect();
         if reach.is_empty() {
             break;

@@ -30,6 +30,9 @@ psqlq -d "$MAINT_DB" -c "CREATE DATABASE \"$BENCH_DB\""
 cd "$ROOT"   # so the bench's `\i sql/proxquery_pure.sql` resolves
 start=$(date +%s)
 raw="$(psqlq -d "$BENCH_DB" -v ndocs="$NDOCS" -v wlen="$WLEN" -v iters="$ITERS" -f bench/pure_vs_extension.sql)"
+# Custom Unicode tokenizer vs stock `simple` on an overlap-heavy corpus — a smoke
+# regression check that superimposition doesn't blow up matching cost.
+raw_tok="$(psqlq -d "$BENCH_DB" -v ndocs="$NDOCS" -v wlen="$WLEN" -v iters="$ITERS" -f bench/tokenizer_vs_simple.sql)"
 wall=$(( $(date +%s) - start ))
 
 # ---- context ----
@@ -68,6 +71,8 @@ to_md_table() {
 results_md="$(printf '%s\n' "$raw" | sed -n '/== pure-SQL port vs native extension/,/([0-9]* rows)/p' | grep '|' | to_md_table || true)"
 corpus_block="$(printf '%s\n' "$raw" | sed -n '/== corpus shape ==/,/^$/p' | sed '1d;/^$/d' || true)"
 plan_block="$(printf '%s\n' "$raw" | sed -n '/== plan:/,/([0-9]* rows)/p' | sed '1d' || true)"
+tok_corpus_md="$(printf '%s\n' "$raw_tok" | sed -n '/== corpus shape (lexeme/,/^$/p' | grep '|' | to_md_table || true)"
+tok_results_md="$(printf '%s\n' "$raw_tok" | sed -n '/== tokenizer vs simple/,/([0-9]* rows)/p' | grep '|' | to_md_table || true)"
 
 # ---- write the report ----
 {
@@ -101,6 +106,18 @@ plan_block="$(printf '%s\n' "$raw" | sed -n '/== plan:/,/([0-9]* rows)/p' | sed 
   echo "- \`ext_2cl_ms\` — extension, written as the two-clause form"
   echo "- \`pure_2cl_ms\` — pure-SQL port, the same two clauses"
   echo "- \`slowdown\` — \`pure_2cl_ms / ext_2cl_ms\`"
+  echo
+  echo "## Tokenizer vs simple (overlap overhead)"
+  echo
+  echo "Custom Unicode tokenizer (\`proxquery_to_tsvector\`, which superimposes accent /"
+  echo "hyphen / email lexemes) vs \`to_tsvector('simple', …)\` on one overlap-heavy corpus."
+  echo "term/AND rows have identical selectivity (clean per-op cost ratio); proximity rows"
+  echo "match more on prox (superimposition packs forms onto one position). \`ratio\` ="
+  echo "\`prox_ms / simple_ms\` — a smoke check that superimposition doesn't blow up matching."
+  echo
+  printf '%s\n' "$tok_corpus_md"
+  echo
+  printf '%s\n' "$tok_results_md"
   echo
   echo "<details><summary>Corpus</summary>"
   echo

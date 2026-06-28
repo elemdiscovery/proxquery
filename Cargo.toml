@@ -14,13 +14,28 @@ default = ["pg17"]
 pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
-pg_test = []
+# `pg_test` pulls in pulldown-cmark so the markdown parity-corpus parser is available
+# in BOTH `cargo pgrx test` phases (schema-gen + the test run); it is never compiled
+# into a release build.
+pg_test = ["dep:pulldown-cmark"]
 
 [dependencies]
 pgrx = "=0.19.1"
+unicode-segmentation = "1.13.3"
+unicode-normalization = "0.1.25"
+unicode-properties = "0.1.4"
+icu_segmenter = "2.2.0"
+caseless = "0.2.2"
+# Test-only (optional, enabled by the `pg_test` feature): parses the markdown parity
+# spec (tests/parity_cases.md) into cases. Not present in release builds.
+pulldown-cmark = { version = "0.13", default-features = false, optional = true }
 
 [dev-dependencies]
 pgrx-tests = "=0.19.1"
+# Also a dev-dependency (not just the optional `pg_test` entry above): the test target
+# compiles `parity_spec` via `cfg(test)` even when the `pg_test` feature is off (e.g.
+# `cargo clippy --all-targets`), so the parser must be linkable there too.
+pulldown-cmark = { version = "0.13.4", default-features = false }
 
 [profile.dev]
 panic = "unwind"
