@@ -20,9 +20,10 @@
 --   seed/qseed, target_mb, tail_words, zipf_s, batch_docs, max_doc_len,
 --   n_topics, n_stop, seg_buckets, segment_len  (corpus + topic locality)
 --   nqueries, termlo, termhi, dist_min, dist_max, query_topn  (query mix)
---   iters       timed iterations per query (after a warmup)       (3)
---   with_pure   1 = also time the pure-SQL port + parity gate     (1)
---   pure        path to the pure-SQL port                         (sql/proxquery_pure.sql)
+--   iters        timed iterations per query (after a warmup)             (3)
+--   with_pure    1 = also time the pure-SQL port + parity gate           (1)
+--   with_seqscan 1 = also time the index-disabled (seq scan) baseline    (0)
+--   pure         path to the pure-SQL port                  (sql/proxquery_pure.sql)
 
 \set ON_ERROR_STOP on
 \timing off
@@ -39,6 +40,10 @@ SET maintenance_work_mem = '512MB';
 \if :{?with_pure}
 \else
   \set with_pure 1
+\endif
+\if :{?with_seqscan}
+\else
+  \set with_seqscan 0
 \endif
 \if :{?pure}
 \else
@@ -85,10 +90,12 @@ END $$;
 
 DROP TABLE IF EXISTS results;
 CREATE TABLE results(id int, shape text, q text, candidates bigint, matches bigint,
-                     ext_op_ms numeric, ext_search_ms numeric, pure_search_ms numeric, disagree bigint);
+                     ext_op_ms numeric, ext_search_ms numeric, pure_search_ms numeric, disagree bigint,
+                     ext_seq_ms numeric);
 
-SET lb.iters     = :iters;
-SET lb.with_pure = :with_pure;
+SET lb.iters       = :iters;
+SET lb.with_pure   = :with_pure;
+SET lb.with_seqscan = :with_seqscan;
 
 \echo ''
 \echo '== running benchmark =='
@@ -96,14 +103,26 @@ DO $run$
 DECLARE
   it       int  := current_setting('lb.iters')::int;
   do_pure  bool := current_setting('lb.with_pure')::int = 1;
+  do_seq   bool := current_setting('lb.with_seqscan')::int = 1;
   r        record;
   cand     bigint; matc bigint; pmatc bigint;
-  exop     numeric; exs numeric; pus numeric; dis bigint;
+  exop     numeric; exs numeric; pus numeric; dis bigint; seqms numeric;
 BEGIN
   FOR r IN SELECT id, shape, q FROM queries ORDER BY id LOOP
     EXECUTE format('SELECT count(*) FROM corpus WHERE body_tsv @@ public.ts_prox_query(%L)', r.q) INTO cand;
     EXECUTE format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q) INTO matc;
     exop := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q), it);
+    IF do_seq THEN
+      -- Same `@~@` query with the index DISABLED: the positional recheck runs over EVERY
+      -- row (a full seq scan) — the brute-force baseline the GIN index accelerates, and the
+      -- timing counterpart of the index-vs-seq-scan correctness test. Off by default (and on
+      -- the large tier): a whole-corpus recheck per query would dominate the run.
+      SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off;
+      seqms := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q), it);
+      SET LOCAL enable_indexscan = on;  SET LOCAL enable_bitmapscan = on;
+    ELSE
+      seqms := NULL;
+    END IF;
     IF do_pure THEN
       -- The consolidated `ts_prox_search` is the recommended portable form (it inlines to
       -- the index-selection clause plus a recheck that folds away when the query's skeleton
@@ -120,7 +139,7 @@ BEGIN
     ELSE
       exs := NULL; pus := NULL; dis := NULL;
     END IF;
-    INSERT INTO results VALUES (r.id, r.shape, r.q, cand, matc, exop, exs, pus, dis);
+    INSERT INTO results VALUES (r.id, r.shape, r.q, cand, matc, exop, exs, pus, dis, seqms);
   END LOOP;
 END $run$;
 INSERT INTO phase_t VALUES ('searches', clock_timestamp());
@@ -149,6 +168,21 @@ FROM results;
 
 \echo ''
 \echo '== results: by query shape =='
+\if :with_seqscan
+SELECT shape,
+       count(*)                   AS n,
+       round(avg(candidates))     AS avg_cand,
+       round(avg(matches))        AS avg_match,
+       round(avg(ext_op_ms), 2)      AS ext_op_ms,
+       round(avg(ext_seq_ms), 2)     AS ext_seq_ms,
+       round(avg(ext_seq_ms) / nullif(avg(ext_op_ms), 0), 1) AS index_speedup,
+       round(avg(ext_search_ms), 2)  AS ext_search_ms,
+       round(avg(pure_search_ms), 2) AS pure_search_ms,
+       round(avg(pure_search_ms) / nullif(avg(ext_search_ms), 0), 1) AS slowdown
+FROM results
+GROUP BY shape
+ORDER BY ext_op_ms DESC;
+\else
 SELECT shape,
        count(*)                   AS n,
        round(avg(candidates))     AS avg_cand,
@@ -160,6 +194,7 @@ SELECT shape,
 FROM results
 GROUP BY shape
 ORDER BY ext_op_ms DESC;
+\endif
 
 -- Per-query (term-by-term) breakdown with candidate/match counts, for the collapsed
 -- section of the report. `query` is HTML-escaped (&, <, >, |, *) so the OR `|` and the

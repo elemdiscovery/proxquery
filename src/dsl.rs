@@ -757,6 +757,115 @@ fn native(node: &Node) -> Option<String> {
     }
 }
 
+// ===========================================================================
+// Config-resolved exact pushdown  ->  drop the recheck for a config-aware column
+// ===========================================================================
+//
+// `native()` above is `simple`-only: it quotes the LITERAL query lexemes verbatim, so
+// its `@@` is exactly the literal recheck. The config-aware (3-arg) path resolves each
+// term through the column's text-search config (`to_tsvector(cfg, term)`). This builder
+// is used purely as a DROPPABILITY WITNESS: it succeeds (returns `Some`) exactly when a
+// recheck-droppable query (plain boolean / phrase / prefix, no within/pre/not-within,
+// glob, regex, NOT) has every term resolve to ≥1 lexeme. Its string is the OR-of-resolved
+// lexemes (a fan-out term — a stemmer/thesaurus, or a parser-split compound like
+// `cafe-bar` under `simple_unaccent` — becomes the OR of its parts), which equals the
+// recheck; but the public `ts_prox_query_exact` does NOT return it — it returns the index
+// SELECTION `to_tsquery(cfg, skeleton)` (= `ts_prox_query`), so the index filter and the
+// gate are identical logic. The selection is a subset of the recheck (a compound's
+// `to_tsquery` phrase ⊆ the OR), so dropping the recheck preserves the two-clause result.
+// within/pre decline (exact but non-selective: they keep the selective skeleton +
+// recheck, the same gate as `simplify_tsquery_string`). Mirrors the pure port's
+// `_prox_native(_prox_resolve_ast(node, cfg))` gated by `_prox_has_within`.
+//
+// Resolver-generic in shape, but only `Resolver::Cfg` is wired (`Resolver::Literal`
+// goes through `native()`; an analyzer `Exact` would need `lexemes_exact`).
+
+/// A term's config-resolved lexeme(s) as a quoted tsquery fragment — a single lexeme or
+/// an OR of them (the recheck unions their positions, so OR is exact). `None` when it
+/// resolves to nothing (a stopword: the branch then keeps the recheck) or to a lexeme
+/// that can't survive `tsqueryin` verbatim (a backslash — see [`native_lexeme`]).
+fn native_resolved_term(r: Resolver, term: &str) -> Option<String> {
+    let lexemes = resolve_lexemes(r, term);
+    if lexemes.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = lexemes
+        .iter()
+        .map(|l| std::str::from_utf8(l).ok().and_then(native_lexeme))
+        .collect::<Option<_>>()?;
+    Some(if parts.len() == 1 { parts[0].clone() } else { format!("({})", parts.join(" | ")) })
+}
+
+/// A prefix's config-folded lexeme as a `:*` key (the prefix run normalized through the
+/// config, mirroring the `to_tsquery(cfg, 'p':*)` the skeleton selects on; raw when the
+/// config yields 0 or >1 lexemes). `None` for a backslash lexeme.
+fn native_resolved_prefix(r: Resolver, p: &str) -> Option<String> {
+    let pfx = prefix_norm(r, p);
+    Some(format!("{}:*", native_lexeme(std::str::from_utf8(&pfx).ok()?)?))
+}
+
+/// A phrase atom resolved through `r`: its single config lexeme, or — for a multi-lexeme
+/// / stopword atom — the atom's literal text verbatim (left unresolved, matching the
+/// pure port; the recheck makes both ports agree on the resulting empty match). `None`
+/// for a glob atom (no exact key) or a backslash lexeme.
+fn native_resolved_atom(r: Resolver, atom: &Atom) -> Option<String> {
+    match atom {
+        Atom::Term(t) | Atom::Exact(t) => match resolve_lexemes(r, t).as_slice() {
+            [one] => std::str::from_utf8(one).ok().and_then(native_lexeme),
+            _ => native_lexeme(t),
+        },
+        Atom::Prefix(p) => native_resolved_prefix(r, p),
+        Atom::Glob { .. } => None,
+    }
+}
+
+/// Config counterpart of [`native`]: the recheck-droppable tsquery with leaves resolved
+/// through `r`, or `None` to keep the recheck. `@@` of the result is EXACTLY the config
+/// recheck for the shapes it accepts (boolean / phrase / prefix); within/pre, glob,
+/// regex, not-within and document NOT decline.
+fn native_resolved(node: &Node, r: Resolver) -> Option<String> {
+    match node {
+        Node::Term(t) | Node::Exact(t) => native_resolved_term(r, t),
+        Node::Prefix(p) => native_resolved_prefix(r, p),
+        Node::Glob { .. } | Node::Regex(_) | Node::Not(_) | Node::NotWithin { .. } | Node::Within { .. } => {
+            None
+        }
+        Node::Phrase { atoms, gaps } => {
+            let keyed = atoms.iter().map(|a| native_resolved_atom(r, a)).collect::<Option<Vec<_>>>()?;
+            let mut s = keyed[0].clone();
+            for (atom, &g) in keyed[1..].iter().zip(gaps) {
+                let op = if g == 1 { "<->".to_string() } else { format!("<{g}>") };
+                s = format!("{s} {op} {atom}");
+            }
+            Some(format!("({s})"))
+        }
+        Node::And(v) => {
+            let parts = v.iter().map(|c| native_resolved(c, r)).collect::<Option<Vec<_>>>()?;
+            Some(format!("({})", parts.join(" & ")))
+        }
+        Node::Or(v) => {
+            let parts = v.iter().map(|c| native_resolved(c, r)).collect::<Option<Vec<_>>>()?;
+            Some(format!("({})", parts.join(" | ")))
+        }
+    }
+}
+
+/// Whether the query is recheck-droppable under `cfg` — the gate for the 3-arg
+/// `ts_prox_query_exact`. True exactly when [`native_resolved`] can build a verbatim
+/// tsquery: a droppable shape (boolean / phrase / prefix; no within/pre/not-within,
+/// glob, regex, NOT) where every term resolves to ≥1 lexeme. In that case the cfg index
+/// selection `to_tsquery(cfg, skeleton)` is a *subset* of the recheck (a compound's
+/// `to_tsquery` phrase ⊆ the recheck's OR-of-parts), so `@@ selection AND recheck`
+/// collapses to `@@ selection` and the recheck folds away. The public function then
+/// returns that **selection** (identical to `ts_prox_query`), NOT the OR witness — so the
+/// index filter and the droppability gate are one and the same logic.
+pub fn cfg_exact_droppable(input: &str, cfg: pg_sys::Oid) -> bool {
+    match parse(input) {
+        Ok(node) => native_resolved(&normalize(node), Resolver::Cfg(cfg)).is_some(),
+        Err(_) => false,
+    }
+}
+
 // --- analyzer probe: a skeleton with leaves resolved through the analyzer --------
 //
 // The cfg path lets `to_tsquery(cfg, skeleton)` resolve raw terms, but there is no
