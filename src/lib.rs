@@ -1675,7 +1675,7 @@ mod tests {
     // The extension-free port (sql/proxquery_pure.sql) must stay behavior-
     // identical to this extension, on every CI Postgres version.
     // The portable corpus is the markdown spec (tests/parity_cases.md), the single
-    // source of truth, parsed by `parity_spec::load_corpus`. The differential runner
+    // source of truth, parsed by `corpus::load_parity`. The differential runner
     // executes every case against BOTH the native extension (schema `public`) and the
     // pure-SQL port (schema `proxquery`) and asserts they agree with each other and
     // with the expected value — so the two implementations can't drift. The fuzz runner
