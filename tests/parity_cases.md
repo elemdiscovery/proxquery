@@ -36,6 +36,16 @@ single quote is the literal-term delimiter: a raw apostrophe (`it's`) opens a li
 | `litErr1` | ` ts_prox_match(to_tsvector('simple','a b'), $$it's here$$) ` | `ERR` |
 | `litErr2` | ` ts_prox_query($$''$$) ` | `ERR` |
 
+a distance must be a non-empty run of digits. Anything else — embedded space, trailing junk, a sign, or empty — raises on BOTH implementations (no silent coercion to a default distance). `<-N>` stays the legitimate ordered operator; only a malformed body errors.
+
+| label | expression | expected |
+| --- | --- | --- |
+| `dbad1` | ` ts_prox_query('a <5x> b') ` | `ERR` |
+| `dbad2` | ` ts_prox_query('a < 5> b') ` | `ERR` |
+| `dbad3` | ` ts_prox_query('a <~-5> b') ` | `ERR` |
+| `dbad4` | ` ts_prox_query('a <> b') ` | `ERR` |
+| `dbad5` | ` ts_prox_query('a <~> b') ` | `ERR` |
+
 full pipeline: index selection AND recheck (the decomposed two-clause form)
 
 | label | expression | expected |
@@ -129,6 +139,16 @@ distance clamp `<0>` = same position, on a literal co-located tsvector
 | `z0c` | ` ts_prox_match($$'a':1 'b':1$$::tsvector,'a <0> b') ` | `true` |
 | `z0e` | ` ts_prox_match($$'a':1 'b':1$$::tsvector,'a <-0> b') ` | `false` |
 | `z0f` | ` ts_prox_query_skeleton('a <0> b') ` | `('a' <0> 'b')` |
+
+distance saturation: a large or overflowing distance clamps to MAX (16383) — it does NOT error. The clamp is observable through the phrase-distance skeleton (within/pre lower to `&`, hiding N); `<16384>` (just over), an 8-digit value, and a value past i32 all collapse to the same `<16383>`, and a huge `<~N>` still matches (saturates, not errors).
+
+| label | expression | expected |
+| --- | --- | --- |
+| `dsat1` | ` ts_prox_query_skeleton('a <16383> b') ` | `('a' <16383> 'b')` |
+| `dsat2` | ` ts_prox_query_skeleton('a <16384> b') ` | `('a' <16383> 'b')` |
+| `dsat3` | ` ts_prox_query_skeleton('a <99999999> b') ` | `('a' <16383> 'b')` |
+| `dsat4` | ` ts_prox_query_skeleton('a <999999999999> b') ` | `('a' <16383> 'b')` |
+| `dsat5` | ` ts_prox_match(to_tsvector('simple','a x b'),'a <~999999> b') ` | `true` |
 
 single-quoted literal terms (the `''` escape; no operator/glob meaning) matched verbatim against a literal tsvector — shared DSL behavior on both implementations. `'it''s'` resolves to the lexeme it's; an apostrophe-stripped/prefix tsvector misses.
 

@@ -31,7 +31,13 @@
 --     (The native extension keeps `@~@`; after migrating you may switch to it.)
 --   * Performance: positions are read with `unnest(tsvector)` (O(all lexemes)
 --     per call) instead of the extension's O(log L) binary search, and the
---     query AST is re-parsed per row. Same answers, slower on large corpora.
+--     query AST is re-parsed per row. Same answers, slower on large corpora —
+--     EXCEPT bounded proximity (within/pre/phrase over plain terms, distance ≤ 32),
+--     which can skip the slow recheck entirely via `ts_prox_query_native(q)`: it
+--     lowers the query to a native `tsquery` matched by Postgres's own C phrase
+--     engine. That is the same rewrite the extension's `@~@` support function
+--     performs automatically; here it's opt-in (see that function for the seamless
+--     query form that auto-selects it and falls back to the recheck otherwise).
 --
 -- Text search configuration: `simple` (literal, lowercased), matching the
 -- extension. Internal helpers are prefixed `_prox_`.
@@ -1029,6 +1035,156 @@ CREATE OR REPLACE FUNCTION ts_prox_query(query text) RETURNS tsquery
     LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
     SET search_path = proxquery, pg_catalog AS
 $fn$ SELECT to_tsquery('simple', ts_prox_query_skeleton(query)) $fn$;
+
+-- ===========================================================================
+-- Native pushdown  ->  a tsquery whose @@ is EXACTLY the recheck (skips it)
+-- ===========================================================================
+--
+-- Mirror of the extension's native lowering (src/dsl.rs `native`). For the common
+-- bounded-proximity shapes the positional test is expressible as a native `tsquery`,
+-- evaluated by Postgres's own (C) phrase engine in the GIN `@@` heap recheck — so the
+-- slow per-row plpgsql `ts_prox_match` recheck can be SKIPPED entirely (this is most
+-- of the port's cost). within/pre lower to an OR over exact gaps:
+--   a <~n> b  ≡  OR_{k=0..n} (a <k> b | b <k> a)   (either order, |Δ| ≤ n)
+--   a <-n> b  ≡  OR_{k=1..n} (a <k> b)             (ordered, 0 < Δ ≤ n)
+-- Only shapes that map EXACTLY are accepted; everything else (glob, regex, not-
+-- within, document NOT, nested/phrase proximity operands, or a distance past 32 —
+-- the extension's NATIVE_MAX_DISTANCE) returns NULL and keeps the presence skeleton +
+-- recheck. The cap bounds the OR-expansion; past it the expansion outweighs the
+-- recheck it saves.
+--
+-- Seamless query form (auto-selects native vs recheck; the IS NULL test folds at plan
+-- time because ts_prox_query_native is IMMUTABLE, so only the taken branch survives):
+--   WHERE CASE WHEN proxquery.ts_prox_query_native(q) IS NOT NULL
+--              THEN tsv @@ proxquery.ts_prox_query_native(q)              -- fast: native @@
+--              ELSE tsv @@ proxquery.ts_prox_query(q)
+--                AND proxquery.ts_prox_match(tsv, q) END                 -- general: recheck
+
+-- A lexeme quoted for the native tsquery, or NULL if it can't survive `tsqueryin`
+-- verbatim. The native tsquery is built with `::tsquery` (tsqueryin), NOT to_tsquery,
+-- so lexemes match the recheck's exact byte lookup with no re-tokenizing/lowercasing.
+-- The exception is a backslash: tsqueryin escapes it away (`'a\b'` → lexeme `ab`), so
+-- such a term would no longer match the recheck — refuse it (it falls back to recheck).
+CREATE OR REPLACE FUNCTION _prox_native_lexeme(v text) RETURNS text
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE
+    SET search_path = proxquery, pg_catalog AS
+$fn$ SELECT CASE WHEN strpos(v, chr(92)) = 0 THEN _prox_quote_lexeme(v) END $fn$;
+
+-- A proximity operand expressible as a native phrase operand: a keyed atom (term/
+-- prefix) or an OR of them. NULL for phrase/glob/regex/nested-proximity operands.
+CREATE OR REPLACE FUNCTION _prox_native_operand(node jsonb) RETURNS text
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
+    SET search_path = proxquery, pg_catalog AS
+$fn$
+DECLARE t text := node ->> 't'; parts text[] := '{}'; c jsonb; s text;
+BEGIN
+    IF t = 'term' THEN
+        RETURN _prox_native_lexeme(node ->> 'v');
+    ELSIF t = 'prefix' THEN
+        RETURN _prox_native_lexeme(node ->> 'v') || ':*';
+    ELSIF t = 'or' THEN
+        FOR c IN SELECT value FROM jsonb_array_elements(node -> 'c') AS x(value) LOOP
+            s := _prox_native_operand(c);
+            IF s IS NULL THEN RETURN NULL; END IF;
+            parts := array_append(parts, s);
+        END LOOP;
+        RETURN '(' || array_to_string(parts, ' | ') || ')';
+    ELSE
+        RETURN NULL;
+    END IF;
+END
+$fn$;
+
+-- A phrase atom's exact native key (term/prefix). A glob is not exact (its index
+-- prefix over-matches), so a phrase containing one can't be pushed down.
+CREATE OR REPLACE FUNCTION _prox_native_phrase_atom(atom jsonb) RETURNS text
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE
+    SET search_path = proxquery, pg_catalog AS
+$fn$ SELECT CASE atom ->> 't'
+                WHEN 'term'   THEN _prox_native_lexeme(atom ->> 'v')
+                WHEN 'prefix' THEN _prox_native_lexeme(atom ->> 'v') || ':*'
+                ELSE NULL END $fn$;
+
+-- The native tsquery string for a normalized node, or NULL if not native-expressible.
+CREATE OR REPLACE FUNCTION _prox_native(node jsonb) RETURNS text
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE
+    SET search_path = proxquery, pg_catalog AS
+$fn$
+DECLARE
+    t text := node ->> 't';
+    n int; ord boolean;
+    a text; b text; s text; na text;
+    atoms jsonb; gaps jsonb;
+    parts text[] := '{}'; clauses text[] := '{}';
+    c jsonb; i int; k int;
+BEGIN
+    IF t = 'term' THEN
+        RETURN _prox_native_lexeme(node ->> 'v');
+    ELSIF t = 'prefix' THEN
+        RETURN _prox_native_lexeme(node ->> 'v') || ':*';
+    ELSIF t IN ('glob', 'regex', 'not', 'notwithin') THEN
+        RETURN NULL;
+    ELSIF t = 'phrase' THEN
+        atoms := node -> 'atoms';
+        gaps := node -> 'gaps';
+        FOR i IN 0 .. jsonb_array_length(atoms) - 1 LOOP
+            na := _prox_native_phrase_atom(atoms -> i);
+            IF na IS NULL THEN RETURN NULL; END IF;
+            IF i = 0 THEN
+                s := na;
+            ELSE
+                k := (gaps ->> (i - 1))::int;
+                s := s || CASE WHEN k = 1 THEN ' <-> ' ELSE ' <' || k || '> ' END || na;
+            END IF;
+        END LOOP;
+        RETURN '(' || s || ')';
+    ELSIF t = 'within' THEN
+        n := (node ->> 'n')::int;
+        ord := (node ->> 'ord')::boolean;
+        IF n > 32 OR (ord AND n < 1) THEN RETURN NULL; END IF;   -- 32 = NATIVE_MAX_DISTANCE
+        a := _prox_native_operand(node -> 'a');
+        b := _prox_native_operand(node -> 'b');
+        IF a IS NULL OR b IS NULL THEN RETURN NULL; END IF;
+        IF ord THEN
+            FOR k IN 1 .. n LOOP
+                clauses := array_append(clauses, a || ' <' || k || '> ' || b);
+            END LOOP;
+        ELSE
+            FOR k IN 0 .. n LOOP
+                clauses := array_append(clauses, a || ' <' || k || '> ' || b);
+                clauses := array_append(clauses, b || ' <' || k || '> ' || a);
+            END LOOP;
+        END IF;
+        RETURN '(' || array_to_string(clauses, ' | ') || ')';
+    ELSIF t IN ('and', 'or') THEN
+        FOR c IN SELECT value FROM jsonb_array_elements(node -> 'c') AS x(value) LOOP
+            s := _prox_native(c);
+            IF s IS NULL THEN RETURN NULL; END IF;
+            parts := array_append(parts, s);
+        END LOOP;
+        RETURN '(' || array_to_string(parts, CASE WHEN t = 'and' THEN ' & ' ELSE ' | ' END) || ')';
+    ELSE
+        RETURN NULL;
+    END IF;
+END
+$fn$;
+
+-- Public: the native-pushdown tsquery, or NULL when the query isn't native-
+-- expressible (then use the two-clause presence + ts_prox_match form). Mirrors the
+-- extension's ts_prox_query_native. A malformed query yields NULL here (the recheck
+-- in the fallback branch surfaces the error), matching the extension.
+CREATE OR REPLACE FUNCTION ts_prox_query_native(query text) RETURNS tsquery
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE STRICT
+    SET search_path = proxquery, pg_catalog AS
+$fn$
+BEGIN
+    -- `::tsquery` (tsqueryin) takes the lexemes VERBATIM, matching the recheck's exact
+    -- byte lookup; to_tsquery would re-tokenize / re-lowercase them. NULL ⇒ NULL.
+    RETURN _prox_native(_prox_normalize(_prox_parse(query)))::tsquery;
+EXCEPTION WHEN OTHERS THEN
+    RETURN NULL;
+END
+$fn$;
 
 -- Evaluate the DSL's positional semantics on `v` — the recheck that pairs with
 -- ts_prox_query for index selection.

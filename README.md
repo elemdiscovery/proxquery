@@ -70,7 +70,7 @@ SELECT * FROM docs WHERE body_tsv @~@ 'quick <~3> fox';
 SELECT * FROM docs WHERE body_tsv @~@ 'confidential <!~5> email';
 ```
 
-The operator `@~@` is syntax sugar for the compound usage of `ts_prox_query` and `ts_prox_match`. The `ts_prox_query` portion acts on the plain `gin(tsvector)` index and selects candidate rows by lexeme. The `ts_prox_match` then rechecks word positions in order to refine the result.
+The operator `@~@` is syntax sugar for the compound usage of `ts_prox_query` and `ts_prox_match`. The `ts_prox_query` portion acts on the plain `gin(tsvector)` index and selects candidate rows by lexeme. The `ts_prox_match` then rechecks word positions in order to refine the result when necessary.
 
 Ranking results isn't a goal of this extension, but `ts_prox_query(q)` returns a real `tsquery`, so `ts_rank_cd` can be used to get a result. It won't be particularly meaningful for complex queries.
 

@@ -96,6 +96,30 @@ CREATE FUNCTION ts_prox_query(query text) RETURNS tsquery
     requires = [ts_prox_query_skeleton],
 );
 
+/// Introspection: the `to_tsquery('simple', …)` input string whose `@@` is EXACTLY
+/// the positional recheck for a query that maps cleanly onto native `tsquery` phrase
+/// operators (bounded within/pre/phrase over plain terms — see
+/// [`dsl::native_tsquery_string`]), or NULL when the query isn't native-expressible.
+/// This is the expansion the `@~@` planner support rewrites a constant query to (the
+/// support fn folds it to a tsquery constant itself); exposed so one can check whether
+/// — and to what — a query pushes down (`SELECT ts_prox_query_native('a <~3> b')`).
+#[pg_extern(immutable, parallel_safe, strict)]
+fn ts_prox_query_native_string(query: &str) -> Option<String> {
+    dsl::native_tsquery_string(query)
+}
+
+// `tsquery` form of the native skeleton, mirroring `ts_prox_query` — introspection
+// for the pushdown expansion. NULL for a non-native query.
+pgrx::extension_sql!(
+    r#"
+CREATE FUNCTION ts_prox_query_native(query text) RETURNS tsquery
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+    AS $$ SELECT to_tsquery('simple', ts_prox_query_native_string($1)) $$;
+"#,
+    name = "ts_prox_query_native_wrapper",
+    requires = [ts_prox_query_native_string],
+);
+
 // Config-aware skeleton: same presence skeleton, but lowered through the column's
 // text-search config (`to_tsquery(cfg, …)` stems/unaccents the lexemes exactly as
 // the recheck's `to_tsvector(cfg, term)` does, so selection and recheck agree). The
@@ -230,9 +254,11 @@ CREATE OPERATOR @~@ (
     requires = [ts_prox_match],
 );
 
-/// Planner support function for `@~@` / `ts_prox_match` — derives an index
-/// condition (`tsvector @@ ts_prox_query(q)`, lossy) so the operator uses a plain
-/// GIN tsvector index. See [`support`].
+/// Planner support function for `@~@` / `ts_prox_match`. Two requests (see
+/// [`support`]): *simplify* rewrites a constant, native-expressible query to a plain
+/// `tsvector @@ ts_prox_query_native(q)` (no positional recheck); *index condition*
+/// derives the lossy presence skeleton (`tsvector @@ ts_prox_query(q)` + recheck) for
+/// everything else, so the operator still uses a plain GIN tsvector index.
 #[pg_extern(immutable, parallel_safe)]
 fn ts_prox_query_support(arg: Internal) -> Internal {
     // "No support" must be a non-NULL datum holding a NULL pointer — returning
@@ -242,7 +268,11 @@ fn ts_prox_query_support(arg: Internal) -> Internal {
         Some(datum) => datum.cast_mut_ptr::<pgrx::pg_sys::Node>(),
         None => return no_support(),
     };
-    unsafe { support::index_condition(node) }.unwrap_or_else(no_support)
+    // Two requests, dispatched by node type (each guards its own): `simplify` rewrites
+    // a native-expressible constant query to a plain `@@` (dropping the recheck);
+    // `index_condition` derives the lossy presence skeleton for everything else.
+    unsafe { support::simplify(node).or_else(|| support::index_condition(node)) }
+        .unwrap_or_else(no_support)
 }
 
 // Attach the support fn. Superuser-only, but a trusted extension's install
@@ -746,7 +776,7 @@ mod tests {
              BEGIN \
                FOR line IN EXECUTE 'EXPLAIN SELECT count(*) FROM proxtest WHERE tsv @~@ ' \
                  || quote_literal(q) LOOP \
-                 IF line LIKE '%Index Cond%ts_prox_query%' THEN hit := true; END IF; \
+                 IF line LIKE '%Index Cond%' THEN hit := true; END IF; \
                END LOOP; \
                RETURN hit; \
              END $$ LANGUAGE plpgsql",
@@ -802,7 +832,7 @@ mod tests {
                  IF has_key THEN \
                    plan_hit := false; \
                    FOR line IN EXECUTE format('EXPLAIN SELECT * FROM docs WHERE tsv @~@ %L', q) LOOP \
-                     IF line LIKE '%Index Cond%ts_prox_query%' THEN plan_hit := true; END IF; \
+                     IF line LIKE '%Index Cond%' THEN plan_hit := true; END IF; \
                    END LOOP; \
                    IF NOT plan_hit THEN RAISE EXCEPTION 'index not used for keyed query: %', q; END IF; \
                  END IF; \
@@ -827,6 +857,58 @@ mod tests {
         assert!(proxmatch("a x b", "a <~2> b")); // back again
         assert!(proxmatch("p q", "p <~1> q")); // different query → cache replaced
         assert!(!proxmatch("a x b", "p <~1> q"));
+    }
+
+    // --- native pushdown (drop the recheck for native-expressible shapes) -
+
+    #[pg_test]
+    fn native_skeleton_is_some_only_for_expressible_shapes() {
+        // Bounded within/pre/phrase over plain terms, AND/OR-combined → native.
+        for q in ["a <~2> b", "a <-3> b", "\"a b\"", "a <2> b", "a <~2> b & c",
+                  "(a | b) <~2> c", "appl* <~2> b", "a <~2> appl*"] {
+            assert!(b(&format!("SELECT ts_prox_query_native_string('{q}') IS NOT NULL")), "expected native: {q}");
+        }
+        // Beyond the cap, or shapes whose @@ is not exactly the recheck → fall back.
+        for q in ["a <~40> b", "a <!~3> b", "a <!-3> b", "##[0-9]+##", "*ology <~2> a",
+                  "a & !b", "(a <~5> b) <~5> c", "a <-0> b"] {
+            assert!(b(&format!("SELECT ts_prox_query_native_string('{q}') IS NULL")), "expected fallback: {q}");
+        }
+    }
+
+    #[pg_test]
+    fn native_pushdown_drops_recheck_and_falls_back() {
+        Spi::run("CREATE TEMP TABLE nt(id serial, tsv tsvector)").unwrap();
+        // 200 near (a@1 b@3, Δ2) + 200 far (a@1 b@7, Δ6), plus a distinct trailing token.
+        Spi::run("INSERT INTO nt(tsv) SELECT to_tsvector('simple','a x b w'||g) FROM generate_series(1,200) g").unwrap();
+        Spi::run("INSERT INTO nt(tsv) SELECT to_tsvector('simple','a x x x x x b w'||g) FROM generate_series(1,200) g").unwrap();
+        Spi::run("CREATE INDEX ON nt USING gin(tsv)").unwrap();
+        Spi::run("ANALYZE nt").unwrap();
+        Spi::run("SET enable_seqscan = off").unwrap();
+        // Does the @~@ plan for `q` contain a line matching `pat`?
+        Spi::run(
+            "CREATE FUNCTION plan_has(q text, pat text) RETURNS bool AS $$ \
+             DECLARE line text; hit bool := false; \
+             BEGIN FOR line IN EXECUTE 'EXPLAIN SELECT count(*) FROM nt WHERE tsv @~@ ' || quote_literal(q) LOOP \
+               IF line LIKE pat THEN hit := true; END IF; END LOOP; RETURN hit; END $$ LANGUAGE plpgsql",
+        ).unwrap();
+
+        // Native (Δ ≤ 32): the `@~@` clause is rewritten to a plain `tsv @@ <tsquery>`
+        // (a folded phrase literal), so the GIN index serves it and the positional
+        // recheck is gone entirely — no `@~@`, no `ts_prox_match`.
+        assert!(b("SELECT plan_has('a <~2> b', '%Bitmap Index Scan%')"), "native must be index-served");
+        assert!(!b("SELECT plan_has('a <~2> b', '%@~@%')"), "native must drop the @~@ recheck");
+        assert!(!b("SELECT plan_has('a <~2> b', '%ts_prox_match%')"), "native must drop the ts_prox_match recheck");
+        // …and it still returns exactly the recheck's rows (the near docs only).
+        let op = Spi::get_one::<i64>("SELECT count(*) FROM nt WHERE tsv @~@ 'a <~2> b'").unwrap().unwrap();
+        let re = Spi::get_one::<i64>("SELECT count(*) FROM nt WHERE ts_prox_match(tsv, 'a <~2> b')").unwrap().unwrap();
+        assert_eq!(op, 200);
+        assert_eq!(op, re);
+
+        // Fallback (Δ > 32): the `@~@` recheck is kept, over the presence skeleton.
+        assert!(b("SELECT plan_has('a <~40> b', '%@~@%')"), "fallback must keep the @~@ recheck");
+        assert!(b("SELECT plan_has('a <~40> b', '%ts_prox_query(%')"), "fallback uses the presence skeleton");
+        let op40 = Spi::get_one::<i64>("SELECT count(*) FROM nt WHERE tsv @~@ 'a <~40> b'").unwrap().unwrap();
+        assert_eq!(op40, 400); // both near and far are within 40
     }
 
     // --- compound operand combinations -----------------------------------
@@ -1247,6 +1329,40 @@ mod tests {
             b("SELECT proxquery_to_tsvector(U&'cafe\\0301', 'prox_icu') \
                = $$'café':1 'cafe':1$$::tsvector"),
             "tf_nfd: decomposed é must fold like composed café",
+        );
+        // Unicode edge behaviors with no readable plain-text form (invisible controls /
+        // combining marks), pinned here rather than in the markdown corpus (same reason
+        // as tf_nfd). `m` is the prox_icu recheck: does the bare query term find the doc?
+        let m = |doc: &str, q: &str| -> bool {
+            b(&format!(
+                "SELECT proxquery_match(proxquery_to_tsvector({doc}, 'prox_icu'), {q}, 'prox_icu')"
+            ))
+        };
+        // Wins — the canonicalizing fold makes the clean spelling find the exotic text: a
+        // leading BOM/ZWNBSP is stripped; Turkish dotted-İ case-folds to i then accent-
+        // folds the residual dot away; Arabic harakat and Hebrew niqqud are superimposed
+        // (voweled + stripped), so the unpointed spelling matches; stacked combining
+        // marks fold to the base letter.
+        assert!(m(r"U&'\FEFFword'", "'word'"), "leading BOM is stripped");
+        assert!(m(r"U&'\0130stanbul'", "'istanbul'"), "Turkish İ folds to i");
+        assert!(m("'مُحَمَّد'", "'محمد'"), "Arabic harakat superimposed (unpointed matches)");
+        assert!(m("'שָׁלוֹם'", "'שלום'"), "Hebrew niqqud superimposed (unpointed matches)");
+        assert!(m(r"U&'a\0301\0302\0303'", "'a'"), "stacked combining marks fold to base");
+        // Invisible formatting / bidi controls are stripped during normalization (Unicode
+        // default-ignorables with no textual meaning), so a soft-hyphenated word, a bidi-
+        // wrapped word, and a zero-width-split word all match their clean spelling — and a
+        // bidi RLO can't smuggle itself into an indexed lexeme (Trojan-source). The
+        // semantic joiners ZWJ/ZWNJ and emoji variation selectors are kept (see tj_* /
+        // is_ignorable_control), so emoji clusters are untouched.
+        assert!(m(r"U&'con\00ADfidential'", "'confidential'"), "soft hyphen stripped");
+        assert!(m(r"U&'a\202Eb'", "'ab'"), "bidi RLO stripped");
+        assert!(m(r"U&'co\200Bnfidential'", "'confidential'"), "ZWSP stripped, token rejoined");
+        // An over-long token (> 2046 bytes) is dropped rather than aborting the whole
+        // document (matching stock to_tsvector); the surrounding words survive.
+        assert!(
+            b("SELECT proxquery_to_tsvector('start ' || repeat('a',3000) || ' end', 'prox_icu') \
+               = $$'start':1 'end':3$$::tsvector"),
+            "over-long token dropped, neighbors kept",
         );
         const DEFERRED: &[&str] = &[];
         // Every row must at least evaluate without error.

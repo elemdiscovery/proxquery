@@ -1,13 +1,15 @@
 //! Planner support for the `@~@` operator — makes it index-served on a *plain*
-//! `gin(tsvector)` index, with no custom operator class.
+//! `gin(tsvector)` index, with no custom operator class. Two requests:
 //!
-//! When the planner considers `tsvector @~@ 'q'` against a GIN tsvector index, it
-//! asks `ts_prox_match`'s support function for usable index conditions
-//! ([`pg_sys::SupportRequestIndexCondition`]). We hand back
-//! `tsvector @@ ts_prox_query('q')` — the lexeme-presence skeleton, reusing
-//! `ts_prox_query` so a runtime-parameter query works too — and mark it **lossy**,
-//! so the original `@~@` stays as the positional recheck filter. The result is
-//! identical to the hand-written two-clause form, but as one clause.
+//! * **simplify** ([`pg_sys::SupportRequestSimplify`], [`simplify`]) — when the query
+//!   is a constant that maps EXACTLY onto a native `tsquery` (bounded within/pre/
+//!   phrase), rewrite the whole clause to a plain `tsvector @@ ts_prox_query_native('q')`.
+//!   Postgres's own (C) phrase engine then evaluates it in the GIN `@@` heap recheck,
+//!   so the custom positional recheck is dropped entirely (one detoast, not two).
+//! * **index condition** ([`pg_sys::SupportRequestIndexCondition`], [`index_condition`])
+//!   — for everything else, hand back `tsvector @@ ts_prox_query('q')` (the lexeme-
+//!   presence skeleton) marked **lossy**, so the original `@~@` stays as the positional
+//!   recheck filter. Identical to the hand-written two-clause form, but as one clause.
 //!
 //! Pure CPU at plan time (no I/O, shmem, or background workers) — Neon-safe.
 
@@ -71,6 +73,8 @@ pub unsafe fn index_condition(node: *mut pg_sys::Node) -> Option<Internal> {
     // `ts_prox_query` overloaded on the right operand's type: `ts_prox_query(text)`
     // for the plain `@~@`, `ts_prox_query(proxquery)` for the config-carrying one.
     // Passing the operand node straight through lets one code path serve both.
+    // (Native-expressible constant queries never reach here — they were rewritten to
+    // a plain `tsv @@ <native tsquery>` by the simplify path before index matching.)
     let qtype = pg_sys::exprType(query);
     let names = pg_sys::stringToQualifiedNameList(c"ts_prox_query".as_ptr(), ptr::null_mut());
     let argtypes = [qtype];
@@ -104,6 +108,85 @@ pub unsafe fn index_condition(node: *mut pg_sys::Node) -> Option<Internal> {
 
     let result = pg_sys::lappend(ptr::null_mut(), opclause.cast());
     Some(Internal::from(Some(pg_sys::Datum::from(result))))
+}
+
+/// `SupportRequestSimplify` for `@~@` / `ts_prox_match`: when the (constant, plain-
+/// `text`) query maps EXACTLY onto a native `tsquery` (bounded within/pre/phrase —
+/// see [`crate::dsl::native_tsquery_string`]), rewrite the whole clause to a plain
+/// `tsvector @@ ts_prox_query_native(query)`. That `@@` is GIN-indexable and carries
+/// its own (AM-level) exact recheck, so the custom positional recheck is gone
+/// entirely — and the rewrite is equivalent everywhere, seq scan included. Returns
+/// `None` (no rewrite) otherwise: runtime parameters, the `proxquery` (cfg/analyzer)
+/// operand, and queries that aren't fully native-expressible keep the presence
+/// skeleton + recheck via [`index_condition`].
+///
+/// # Safety
+/// `node` must be the `Node *` the planner passed to the support function.
+pub unsafe fn simplify(node: *mut pg_sys::Node) -> Option<Internal> {
+    if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_SupportRequestSimplify {
+        return None;
+    }
+    let fcall = (*node.cast::<pg_sys::SupportRequestSimplify>()).fcall;
+    if fcall.is_null() {
+        return None;
+    }
+    // `@~@` / `ts_prox_match(tsvector, text)`: arg 0 is the tsvector, arg 1 the query.
+    let args = (*fcall).args;
+    if args.is_null() || (*args).length != 2 {
+        return None;
+    }
+    let indexed = pg_sys::list_nth(args, 0).cast::<pg_sys::Node>();
+    let query = pg_sys::list_nth(args, 1).cast::<pg_sys::Node>();
+
+    // Only the plain literal path, and only a constant query that is fully native-
+    // expressible. (The cfg/analyzer `proxquery` operand is not TEXT; a runtime
+    // parameter carries no constant DSL to expand.)
+    if pg_sys::exprType(query) != pg_sys::TEXTOID {
+        return None;
+    }
+    let s = const_dsl(query)?;
+    let native_str = crate::dsl::native_tsquery_string(&s)?; // bail unless native-expressible
+
+    let at_at = pg_sys::OpernameGetOprid(
+        pg_sys::stringToQualifiedNameList(c"@@".as_ptr(), ptr::null_mut()),
+        pg_sys::TSVECTOROID,
+        pg_sys::TSQUERYOID,
+    );
+    if at_at == pg_sys::InvalidOid {
+        return None;
+    }
+
+    // Parse the native query to a tsquery NOW (plan time) and inject it as a `Const`,
+    // so the `@@` recheck evaluates a literal tsquery per row — not the DSL re-parse a
+    // funcexpr would force on every heap tuple. Use `tsqueryin` (the type's input
+    // function), NOT `to_tsquery`: the lexemes must be taken VERBATIM to match the
+    // recheck's exact byte lookup; `to_tsquery` would re-tokenize / re-lowercase them.
+    let (mut typinput, mut typioparam) = (pg_sys::InvalidOid, pg_sys::InvalidOid);
+    pg_sys::getTypeInputInfo(pg_sys::TSQUERYOID, &mut typinput, &mut typioparam);
+    // A mutable, NUL-terminated buffer: input functions may scribble on the cstring.
+    let mut buf: Vec<u8> = native_str.into_bytes();
+    buf.push(0);
+    let tsq = pg_sys::OidInputFunctionCall(
+        typinput,
+        buf.as_mut_ptr() as *mut core::ffi::c_char,
+        typioparam,
+        -1,
+    );
+    let tsq_const =
+        pg_sys::makeConst(pg_sys::TSQUERYOID, -1, pg_sys::InvalidOid, -1, tsq, false, false);
+    let opclause = pg_sys::make_opclause(
+        at_at,
+        pg_sys::BOOLOID,
+        false,
+        indexed.cast::<pg_sys::Expr>(),
+        tsq_const.cast::<pg_sys::Expr>(),
+        pg_sys::InvalidOid,
+        pg_sys::InvalidOid,
+    );
+    // make_opclause leaves opfuncid unset; fill it so the rewritten node is complete.
+    (*opclause.cast::<pg_sys::OpExpr>()).opfuncid = pg_sys::get_opcode(at_at);
+
+    Some(Internal::from(Some(pg_sys::Datum::from(opclause))))
 }
 
 /// The DSL query string carried by a *constant* right operand — the `text` itself,

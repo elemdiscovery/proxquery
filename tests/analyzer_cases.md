@@ -104,3 +104,31 @@ Per-character CJK segmentation.
 | --- | --- | --- | --- | --- |
 | `uni_term` | `prox_unicode` | `中文 文档` | `中` | `true` |
 | `uni_and` | `prox_unicode` | `中文 文档` | `中 & 档` | `true` |
+
+## Compatibility folding (NFKC)
+
+The index superimposes an NFKC-folded variant, and the query side folds to it too, so a
+fullwidth / half-width / Roman-numeral spelling matches its ASCII/normal equivalent either
+direction. Non-ASCII digits are NOT compatibility-equivalent, so they stay distinct (the
+NFKC boundary).
+
+| label | analyzer | doc | query | expected |
+| --- | --- | --- | --- | --- |
+| `nfkc_fw` | `prox_icu` | `ＡＢＣ` | `abc` | `true` |
+| `nfkc_fw_rev` | `prox_icu` | `abc` | `ＡＢＣ` | `true` |
+| `nfkc_roman` | `prox_icu` | `Ⅻ` | `xii` | `true` |
+| `nfkc_digit_miss` | `prox_icu` | `１２３` | `999` | `false` |
+| `nfkc_arab_miss` | `prox_icu` | `١٢٣` | `123` | `false` |
+
+## Structured-token tailorings
+
+A scheme-less host decomposes (`google` finds `google.com`); a hyphen run also emits the
+hyphens-removed concatenation (`123456789` finds `123-45-6789`); a text-default symbol
+(`™`) drops without a position, so a phrase reads across it.
+
+| label | analyzer | doc | query | expected |
+| --- | --- | --- | --- | --- |
+| `host_bare` | `prox_icu` | `visit google.com today` | `google` | `true` |
+| `host_full` | `prox_icu` | `visit google.com today` | `google.com` | `true` |
+| `hyphen_concat` | `prox_icu` | `call 123-45-6789 now` | `123456789` | `true` |
+| `sym_phrase` | `prox_icu` | `Foo™ Bar` | `"Foo Bar"` | `true` |

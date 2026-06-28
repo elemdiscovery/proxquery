@@ -77,6 +77,24 @@ BEGIN
             RAISE WARNING 'FAIL match:%  ext=[%] pure=[%] expected=[%]', mr.label, got_ext, got_pure, mr.expected;
             fails := fails + 1;
         END IF;
+
+        -- Native pushdown parity: when the query is native-expressible the single
+        -- `@@ ts_prox_query_native` form (what `@~@` rewrites to, and the pure port's
+        -- fast path) must equal the recheck — on BOTH implementations, and the two must
+        -- agree on whether it is native-expressible (both NULL or both not).
+        mexpr := format('CASE WHEN ts_prox_query_native(%L) IS NULL THEN NULL'
+                     || ' ELSE (to_tsvector(%L, %L) @@ ts_prox_query_native(%L)) END',
+                        mr.query, 'simple', mr.doc, mr.query);
+        got_probe_ext  := pg_temp._prox_eval(ext_sch, mexpr);
+        got_probe_pure := pg_temp._prox_eval('proxquery', mexpr);
+        IF (got_probe_ext = '<null>') IS DISTINCT FROM (got_probe_pure = '<null>') THEN
+            RAISE WARNING 'FAIL native-expressibility:%  ext=[%] pure=[%]', mr.label, got_probe_ext, got_probe_pure;
+            fails := fails + 1;
+        ELSIF got_probe_ext <> '<null>'
+              AND (got_probe_ext IS DISTINCT FROM mr.expected OR got_probe_pure IS DISTINCT FROM mr.expected) THEN
+            RAISE WARNING 'FAIL native:%  ext=[%] pure=[%] expected=[%]', mr.label, got_probe_ext, got_probe_pure, mr.expected;
+            fails := fails + 1;
+        END IF;
     END LOOP;
 
     -- Config-aware cases (the `config` table of the spec, if loaded): the 3-arg recheck

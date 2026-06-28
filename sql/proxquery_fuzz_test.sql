@@ -81,7 +81,8 @@ DECLARE
     doc text; q text;
     m_ext text; m_pure text;        -- recheck results
     sel_ext text; sel_pure text;    -- skeleton selection results
-    match_expr text; sel_expr text;
+    nat_ext text; nat_pure text;    -- native-pushdown results
+    match_expr text; sel_expr text; nat_expr text;
     fails int := 0; i int;
     N constant int := 400;
 BEGIN
@@ -119,6 +120,23 @@ BEGIN
             fails := fails + 1;
         ELSIF m_pure = 'true' AND sel_pure = 'false' THEN
             RAISE WARNING 'SUPERSET VIOLATION (pure)  doc=[%]  q=[%]', doc, q;
+            fails := fails + 1;
+        END IF;
+
+        -- C. native pushdown parity: when native-expressible, `@@ ts_prox_query_native`
+        --    (which drops the recheck) must equal the recheck, on both implementations,
+        --    and the two must agree on whether it is native-expressible.
+        nat_expr := format('CASE WHEN ts_prox_query_native(%L) IS NULL THEN NULL'
+                        || ' ELSE (to_tsvector(%L, %L) @@ ts_prox_query_native(%L)) END',
+                           q, 'simple', doc, q);
+        nat_ext  := pg_temp._prox_eval(ext_sch, nat_expr);
+        nat_pure := pg_temp._prox_eval('proxquery', nat_expr);
+        IF (nat_ext = '<null>') IS DISTINCT FROM (nat_pure = '<null>') THEN
+            RAISE WARNING 'NATIVE EXPRESSIBILITY DIVERGENCE  doc=[%] q=[%]  ext=[%] pure=[%]', doc, q, nat_ext, nat_pure;
+            fails := fails + 1;
+        ELSIF nat_ext <> '<null>'
+              AND (nat_ext IS DISTINCT FROM m_ext OR nat_pure IS DISTINCT FROM m_ext) THEN
+            RAISE WARNING 'NATIVE DIVERGENCE  doc=[%] q=[%]  native ext=[%] pure=[%] recheck=[%]', doc, q, nat_ext, nat_pure, m_ext;
             fails := fails + 1;
         END IF;
     END LOOP;
