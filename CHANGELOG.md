@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/elemdiscovery/proxquery/compare/v0.1.0...v0.2.0) - 2026-06-28
+
+### Added
+
+- Small-ish proximity queries that can convert into an enumerated position search no longer need a recheck.
+- Adding signed releases.
+- Add extension only `proxquery_to_tsvector` with specialized tsvector positioning.
+- fold glob literal runs through cfg for config-aware wildcard matching
+- add config-aware overloads resolving query terms through a regconfig
+
+### Fixed
+
+- more release-plz fixes.
+- release-plz config fix
+
 ## [0.1.0](https://github.com/elemdiscovery/proxquery/releases/tag/v0.1.0) - 2026-06-27
 
 ### Added
