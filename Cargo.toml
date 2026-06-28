@@ -5,7 +5,6 @@ edition = "2021"
 description = "Positional proximity predicates for tsvector full-text search"
 license = "MIT"
 repository = "https://github.com/elemdiscovery/proxquery"
-
 publish = false
 
 [lib]
