@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/elemdiscovery/proxquery/compare/v0.2.0...v0.3.0) - 2026-06-28
+
+### Added
+
+- [**breaking**] Consolidated `ts_prox_search` for pure SQL simplified usage. ([#17](https://github.com/elemdiscovery/proxquery/pull/17))
+
 ## [0.2.0](https://github.com/elemdiscovery/proxquery/compare/v0.1.0...v0.2.0) - 2026-06-28
 
 ### Added
