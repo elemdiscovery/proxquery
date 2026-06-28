@@ -51,7 +51,8 @@ extension, and returns **identical results** (verified — see
 | `ts_prox_query_exact(text) -> tsquery` | exact tsquery when the recheck is droppable, else NULL |
 | `ts_prox_query(text, regconfig) -> tsquery` | config-aware skeleton |
 | `ts_prox_recheck(tsvector, text, regconfig) -> bool` | config-aware recheck |
-| `ts_prox_search(tsvector, text, regconfig) -> bool` | config-aware one-call form (index-served; keeps the recheck) |
+| `ts_prox_query_exact(text, regconfig) -> tsquery` | config-aware exact tsquery when droppable, else NULL |
+| `ts_prox_search(tsvector, text, regconfig) -> bool` | config-aware one-call form (index-served; folds the recheck when droppable) |
 | `ts_prox_query_skeleton(text) -> text` | the `to_tsquery` input string |
 | `ts_prox_within / ts_prox_pre / ts_prox_not_within(tsvector, a, b, n)` | positional predicates |
 | `ts_prox_chain(tsvector, text[], int[])` | same-occurrence chain |
@@ -258,12 +259,16 @@ ergonomic; same plan).
   the config-carrying `@~@ proxquery(cfg, q)` overload; under the pure port you use
   `ts_prox_search(tsv, q, cfg)` (or the explicit two clauses) instead (next bullet).
 - Config-aware lexing **is** here: the 3-arg `ts_prox_query(text, regconfig)`,
-  `ts_prox_recheck(tsvector, text, regconfig)`, and `ts_prox_search(tsvector, text,
-  regconfig)` overloads match a column built with any text-search config (stemmed,
-  unaccented, …), identical to the extension (see [CONFIG_AWARE.md](CONFIG_AWARE.md)).
-  The 3-arg `ts_prox_search` is index-served but keeps the recheck — config term
-  resolution can fan out, so it doesn't fold the way the `simple` 2-arg form does.
-  Only the single operator is missing.
+  `ts_prox_recheck(tsvector, text, regconfig)`, `ts_prox_query_exact(text, regconfig)`,
+  and `ts_prox_search(tsvector, text, regconfig)` overloads match a column built with any
+  text-search config (stemmed, unaccented, …), identical to the extension (see
+  [CONFIG_AWARE.md](CONFIG_AWARE.md)). The 3-arg `ts_prox_search` is index-served and
+  **folds the recheck** for a droppable (boolean / phrase / prefix) query just like the
+  2-arg `simple` form: `ts_prox_query_exact(q, cfg)` returns the config index selection
+  (`= ts_prox_query`) gated by droppability, and that selection is a subset of the recheck
+  (a parser-split compound's `to_tsquery` phrase ⊆ the recheck's OR-of-parts), so `@@
+  selection` alone equals the two-clause form. Proximity and the lossy shapes keep the
+  recheck. Only the single operator is missing.
 
 ## Parity with the extension
 

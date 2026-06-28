@@ -63,13 +63,16 @@ to_md_table() {
 # then render it as a Markdown table
 section() { printf '%s\n' "$1" | sed -n "/== $2 /,/^$/p" | grep '|' | to_md_table || true; }
 
+# The index-disabled (seq scan) baseline (`with_seqscan`) is OFF here: a whole-corpus
+# recheck per query would dominate these tiers. It's measured only by the small PR report
+# (bench/report.sh), which pairs it with the index-vs-seq-scan correctness test.
 echo "[large-bench] SMALL tier: ${SMALL_MB} MiB, ${SMALL_QUERIES} queries (extension + pure)" >&2
 psqlq -d "$MAINT_DB" -c "CREATE DATABASE \"$DB_S\""
 s_start=$(date +%s)
 raw_small="$(psqlq -d "$DB_S" \
   -v seed="$SEED" -v qseed="$QSEED" -v target_mb="$SMALL_MB" \
   -v tail_words="$TAIL_WORDS" -v zipf_s="$ZIPF_S" \
-  -v nqueries="$SMALL_QUERIES" -v iters="$SMALL_ITERS" -v with_pure=1 -f "$SQL")"
+  -v nqueries="$SMALL_QUERIES" -v iters="$SMALL_ITERS" -v with_pure=1 -v with_seqscan=0 -f "$SQL")"
 s_wall=$(( $(date +%s) - s_start ))
 # raw per-query timings, for an easy reference point (gitignored)
 psqlq -d "$DB_S" -c "\copy (SELECT id, shape, q, candidates, matches, ext_op_ms, ext_search_ms, pure_search_ms FROM results ORDER BY id) TO 'bench/reports/results_small.csv' WITH (FORMAT csv, HEADER true)"
@@ -82,7 +85,7 @@ if [ "$RUN_LARGE" = "1" ]; then
   raw_large="$(psqlq -d "$DB_L" \
     -v seed="$SEED" -v qseed="$QSEED" -v target_mb="$LARGE_MB" \
     -v tail_words="$TAIL_WORDS" -v zipf_s="$ZIPF_S" \
-    -v nqueries="$LARGE_QUERIES" -v iters="$LARGE_ITERS" -v with_pure=0 -f "$SQL")"
+    -v nqueries="$LARGE_QUERIES" -v iters="$LARGE_ITERS" -v with_pure=0 -v with_seqscan=0 -f "$SQL")"
   l_wall=$(( $(date +%s) - l_start ))
   psqlq -d "$DB_L" -c "\copy (SELECT id, shape, q, candidates, matches, ext_op_ms FROM results ORDER BY id) TO 'bench/reports/results_large.csv' WITH (FORMAT csv, HEADER true)"
 fi

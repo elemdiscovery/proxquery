@@ -148,6 +148,33 @@ CREATE FUNCTION ts_prox_query_exact(query text) RETURNS tsquery
     requires = [ts_prox_query_exact_string],
 );
 
+/// Whether the recheck is droppable for `query` under `cfg` — the gate for the 3-arg
+/// `ts_prox_query_exact`. True for boolean / phrase / prefix queries whose every term
+/// resolves to ≥1 lexeme under `cfg`; false for within/pre/not-within, glob-suffix,
+/// regex, NOT, or a stopword-emptied branch. When true the index selection
+/// `ts_prox_query(q, cfg)` is a subset of the recheck, so the recheck folds away.
+/// `cfg` arrives as a plain oid (regconfig is binary-coercible).
+#[pg_extern(immutable, parallel_safe, strict)]
+fn ts_prox_query_exact_cfg_droppable(query: &str, cfg: pgrx::pg_sys::Oid) -> bool {
+    dsl::cfg_exact_droppable(query, cfg)
+}
+
+// `ts_prox_query_exact(q, cfg)` IS `ts_prox_query(q, cfg)` gated by droppability: the
+// recheck-droppable tsquery is the index selection itself (so the filter and the gate are
+// identical logic), or NULL when the recheck is needed. The CASE short-circuits, so
+// `ts_prox_query` (which raises on a keyless query) is only evaluated for a droppable —
+// hence keyed — query.
+pgrx::extension_sql!(
+    r#"
+CREATE FUNCTION ts_prox_query_exact(query text, cfg regconfig) RETURNS tsquery
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+    AS $$ SELECT CASE WHEN ts_prox_query_exact_cfg_droppable($1, $2::oid)
+                      THEN ts_prox_query($1, $2) END $$;
+"#,
+    name = "ts_prox_query_exact_cfg_wrapper",
+    requires = [ts_prox_query_exact_cfg_droppable, "ts_prox_query_cfg_wrapper"],
+);
+
 // Consolidated indexable search: one INLINABLE function = `@@ ts_prox_query(q)` plus the
 // recheck-droppable fold — identical to the pure port's `ts_prox_search`, so the recommended
 // one-call SQL is drop-in portable across the pure→native migration. NOT `STRICT` (the `OR`
@@ -350,11 +377,14 @@ CREATE FUNCTION ts_prox_recheck(v tsvector, query text, cfg regconfig) RETURNS b
 
 -- 3-arg consolidated search (config-aware): the one-call form for a non-`simple` column,
 -- mirroring the pure port's `ts_prox_search(tsv, q, cfg)`. Inlinable (no SET clause), so the
--- `@@ ts_prox_query(q, cfg)` clause drives the index; it does NOT fold the recheck — config
--- term resolution can fan out, so the skeleton is a superset, not exactly the match.
+-- `@@ ts_prox_query(q, cfg)` clause drives the index, and for a recheck-droppable (boolean /
+-- phrase / prefix) constant query the `(ts_prox_query_exact(q, cfg) IS NOT NULL OR …)`
+-- const-folds away, dropping the per-row recheck (and its re-detoast) — the resolved-lexeme
+-- skeleton is exactly the match. within/pre and the lossy shapes keep the recheck.
 CREATE FUNCTION ts_prox_search(v tsvector, query text, cfg regconfig) RETURNS boolean
     LANGUAGE sql IMMUTABLE PARALLEL SAFE
-    AS $$ SELECT v @@ ts_prox_query(query, cfg) AND ts_prox_recheck(v, query, cfg) $$;
+    AS $$ SELECT v @@ ts_prox_query(query, cfg)
+              AND (ts_prox_query_exact(query, cfg) IS NOT NULL OR ts_prox_recheck(v, query, cfg)) $$;
 
 -- The typed right operand for @~@: a (source, query) pair. `src` is a regconfig name
 -- or a proxquery analyzer name.
@@ -402,7 +432,8 @@ ALTER FUNCTION ts_prox_recheck(tsvector, proxquery) SUPPORT ts_prox_query_suppor
         proxquery_build_query,
         proxquery_recheck,
         proxquery_is_analyzer,
-        "ts_prox_query_cfg_wrapper"
+        "ts_prox_query_cfg_wrapper",
+        "ts_prox_query_exact_cfg_wrapper"
     ],
 );
 
@@ -1287,9 +1318,10 @@ mod tests {
     #[pg_test]
     fn ts_prox_search_config_aware() {
         // The 3-arg `ts_prox_search(tsv, q, cfg)` — the one-call form for a non-`simple`
-        // column — must inline + drive the GIN index, and return exactly the explicit cfg
-        // two-clause form. (It keeps the recheck; config term resolution can fan out, so it
-        // does not fold like the 2-arg `simple` form.)
+        // column — must inline + drive the GIN index, fold the recheck for a droppable
+        // (boolean / phrase / prefix) query and keep it for proximity, and return exactly
+        // the explicit cfg two-clause form. Each term resolves through the config, so a
+        // fan-out (stemmer/compound) becomes an OR of lexemes, which `@@` matches exactly.
         Spi::run("CREATE TEMP TABLE sct(id serial, tsv tsvector)").unwrap();
         Spi::run("INSERT INTO sct(tsv) SELECT to_tsvector('english','the running shoes number '||g) FROM generate_series(1,300) g").unwrap();
         Spi::run("CREATE INDEX ON sct USING gin(tsv)").unwrap();
@@ -1305,15 +1337,121 @@ mod tests {
         // Inlines + index-served: the `@@ ts_prox_query(q, cfg)` clause drives the GIN index.
         assert!(b("SELECT s3_plan_has('running <~2> shoes', '%Bitmap Index Scan%')"), "3-arg ts_prox_search must inline + use the index");
         assert!(b("SELECT s3_plan_has('running & shoes', '%Bitmap Index Scan%')"), "3-arg ts_prox_search must inline + use the index (boolean)");
+        // Boolean / phrase fold the recheck away (the cfg-resolved skeleton is exactly the
+        // match); within keeps it. Same fold the 2-arg `simple` form gets.
+        assert!(!b("SELECT s3_plan_has('running & shoes', '%ts_prox_recheck%')"), "cfg boolean must fold the recheck away");
+        assert!(!b("SELECT s3_plan_has('\"running shoes\"', '%ts_prox_recheck%')"), "cfg phrase must fold the recheck away");
+        assert!(b("SELECT s3_plan_has('running <~2> shoes', '%ts_prox_recheck%')"), "cfg within must keep the recheck");
+
+        // The 3-arg `ts_prox_query_exact(q, cfg)` gate: non-NULL for droppable shapes, NULL
+        // for within / glob / regex, and NULL for a stopword-emptied branch (recheck kept).
+        assert!(b("SELECT ts_prox_query_exact('running & shoes', 'english') IS NOT NULL"), "cfg boolean is droppable");
+        assert!(b("SELECT ts_prox_query_exact('running <~2> shoes', 'english') IS NULL"), "cfg within is not droppable");
+        assert!(b("SELECT ts_prox_query_exact('* shoes', 'english') IS NULL OR ts_prox_query_exact('sho*', 'english') IS NOT NULL"), "cfg suffix-glob keeps the recheck");
+        assert!(b("SELECT ts_prox_query_exact('the & running', 'english') IS NULL"), "cfg stopword branch keeps the recheck");
+        // `@@ ts_prox_query_exact` is the full recheck match for a droppable query.
+        assert!(b("SELECT to_tsvector('english','the running shoes') @@ ts_prox_query_exact('running & shoes', 'english')"));
 
         // Results identical to the explicit cfg two-clause form (english stems running→run, shoes→shoe).
         let cnt = |sql: &str| Spi::get_one::<i64>(sql).unwrap().unwrap();
-        for q in ["running & shoes", "running <~2> shoes", "running <~1> number"] {
+        for q in ["running & shoes", "\"running shoes\"", "running <~2> shoes", "running <~1> number"] {
             let one = cnt(&format!("SELECT count(*) FROM sct WHERE ts_prox_search(tsv, '{q}', 'english')"));
             let two = cnt(&format!(
                 "SELECT count(*) FROM sct WHERE tsv @@ ts_prox_query('{q}', 'english') AND ts_prox_recheck(tsv, '{q}', 'english')"
             ));
             assert_eq!(one, two, "3-arg ts_prox_search must equal the cfg two-clause form for {q}");
+        }
+    }
+
+    #[pg_test]
+    fn config_index_path_matches_seqscan() {
+        // #3 (the recheck) must yield identical rows with and without the index — the GIN
+        // index is a transparent accelerator, never a result change. For every config + query
+        // shape, `idx_seq_ok` compares the recommended indexed form three ways and requires
+        // they all agree:
+        //   • ts_prox_search(tsv,q,cfg) forced through the index (Bitmap Index Scan),
+        //   • the SAME predicate forced through a seq scan (the recheck run on every row),
+        //   • the explicit two-clause `@@ ts_prox_query AND ts_prox_recheck` (recheck NEVER
+        //     dropped).
+        // idx==seq proves the index doesn't change the answer; fold==two-clause proves the
+        // recheck-drop is result-preserving (and so the droppability gate is sound). Covers
+        // boolean/phrase/prefix (recheck dropped), proximity/ordered/not-within/glob/regex/NOT
+        // (recheck kept), and fan-out compounds — all keyed so the index plan is forced.
+        Spi::run(
+            "CREATE FUNCTION idx_seq_ok(relname text, cfg text, q text) RETURNS text AS $$ \
+             DECLARE s_seq text; s_idx text; s_2c text; line text; plan_hit boolean := false; has_key boolean; \
+             BEGIN \
+               BEGIN PERFORM ts_prox_query(q, cfg::regconfig); has_key := true; EXCEPTION WHEN OTHERS THEN has_key := false; END; \
+               SET LOCAL enable_seqscan=off; SET LOCAL enable_indexscan=on; SET LOCAL enable_bitmapscan=on; \
+               EXECUTE format('SELECT coalesce(array_agg(id ORDER BY id), ''{}''::int[])::text FROM %I WHERE ts_prox_search(tsv, %L, %L::regconfig)', relname, q, cfg) INTO s_idx; \
+               EXECUTE format('SELECT coalesce(array_agg(id ORDER BY id), ''{}''::int[])::text FROM %I WHERE tsv @@ ts_prox_query(%L, %L::regconfig) AND ts_prox_recheck(tsv, %L, %L::regconfig)', relname, q, cfg, q, cfg) INTO s_2c; \
+               IF has_key THEN \
+                 FOR line IN EXECUTE format('EXPLAIN SELECT * FROM %I WHERE ts_prox_search(tsv, %L, %L::regconfig)', relname, q, cfg) LOOP \
+                   IF line LIKE '%Bitmap Index Scan%' OR line LIKE '%Index Scan%' THEN plan_hit := true; END IF; \
+                 END LOOP; \
+                 IF NOT plan_hit THEN RETURN 'no-index'; END IF; \
+               END IF; \
+               SET LOCAL enable_seqscan=on; SET LOCAL enable_indexscan=off; SET LOCAL enable_bitmapscan=off; \
+               EXECUTE format('SELECT coalesce(array_agg(id ORDER BY id), ''{}''::int[])::text FROM %I WHERE ts_prox_search(tsv, %L, %L::regconfig)', relname, q, cfg) INTO s_seq; \
+               IF s_idx IS DISTINCT FROM s_seq THEN RETURN 'idx<>seq idx='||s_idx||' seq='||s_seq; END IF; \
+               IF s_idx IS DISTINCT FROM s_2c  THEN RETURN 'fold<>2c fold='||s_idx||' 2c='||s_2c; END IF; \
+               RETURN 'ok'; \
+             END $$ LANGUAGE plpgsql",
+        ).unwrap();
+
+        let ok = |relname: &str, cfg: &str, q: &str| {
+            let r = Spi::get_one::<String>(&format!("SELECT idx_seq_ok('{relname}', '{cfg}', $q${q}$q$)"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(r, "ok", "index/seqscan/two-clause disagree for [{cfg}] {q}: {r}");
+        };
+
+        // English (built-in stemming). Duplicated rows so the planner prefers the index.
+        Spi::run("CREATE TEMP TABLE cidx_e(id serial primary key, tsv tsvector)").unwrap();
+        Spi::run(
+            "INSERT INTO cidx_e(tsv) SELECT to_tsvector('english', d) FROM unnest(ARRAY[ \
+                'the running shoes are here', 'walking shoes and socks', 'running fast number two', \
+                'a quiet library corner', 'running shoes number five', 'shoes without any running', \
+                'he was running right by the shoes', 'number then running far far far far apart shoes']) \
+              AS d, generate_series(1,30)",
+        ).unwrap();
+        Spi::run("CREATE INDEX ON cidx_e USING gin(tsv)").unwrap();
+        Spi::run("ANALYZE cidx_e").unwrap();
+        for q in [
+            "running & shoes", "running | walking", "\"running shoes\"", "running <~2> shoes",
+            "running <-2> shoes", "running <!~3> number", "runn*", "run*ng", "shoes & !walking",
+            "shoes & ##r.n##",
+        ] {
+            ok("cidx_e", "english", q);
+        }
+
+        // simple_unaccent (accent folding, no stemming/stopwords) — needs contrib `unaccent`;
+        // skipped gracefully when absent so contrib-less CI still passes.
+        let unaccent_ok = Spi::run(
+            "CREATE EXTENSION IF NOT EXISTS unaccent; \
+             DROP TEXT SEARCH CONFIGURATION IF EXISTS cu_cfg; \
+             CREATE TEXT SEARCH CONFIGURATION cu_cfg (COPY = simple); \
+             ALTER TEXT SEARCH CONFIGURATION cu_cfg ALTER MAPPING FOR \
+               asciiword, word, numword, asciihword, hword, numhword, hword_asciipart, hword_part, hword_numpart \
+               WITH unaccent, simple",
+        )
+        .is_ok();
+        if unaccent_ok {
+            Spi::run("CREATE TEMP TABLE cidx_u(id serial primary key, tsv tsvector)").unwrap();
+            Spi::run(
+                "INSERT INTO cidx_u(tsv) SELECT to_tsvector('cu_cfg', d) FROM unnest(ARRAY[ \
+                    'un café noir', 'le café-bar ferme', 'du thé vert ici', 'cafe sans accent', \
+                    'noir comme le café', 'un café-bar parisien', 'bien paré ici', 'le bar ouvert']) \
+                  AS d, generate_series(1,30)",
+            ).unwrap();
+            Spi::run("CREATE INDEX ON cidx_u USING gin(tsv)").unwrap();
+            Spi::run("ANALYZE cidx_u").unwrap();
+            for q in [
+                "cafe & noir", "cafe | noir", "\"café noir\"", "cafe <~2> noir", "café-bar",
+                "cafe-bar", "caf?", "caf*", "cafe & !the",
+            ] {
+                ok("cidx_u", "cu_cfg", q);
+            }
         }
     }
 

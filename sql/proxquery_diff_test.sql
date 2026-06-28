@@ -162,9 +162,29 @@ BEGIN
                 END IF;
             END IF;
 
+            -- 3-arg recheck-droppable parity: `ts_prox_query_exact(q, cfg)` is `ts_prox_query(q,
+            -- cfg)` (the index selection) gated by droppability — NULL for within/pre/not-within,
+            -- glob-suffix, regex, NOT. The two ports must agree on whether it is droppable (both
+            -- NULL or both not); when non-NULL its `@@` equals the recheck over the corpus (docs
+            -- keep compounds whole, so the selection's phrase and the recheck's OR coincide).
+            mexpr := format('CASE WHEN ts_prox_query_exact(%L, %L::regconfig) IS NULL THEN NULL'
+                         || ' ELSE (to_tsvector(%L::regconfig, %L) @@ ts_prox_query_exact(%L, %L::regconfig)) END',
+                            mr.query, mr.cfg, mr.cfg, mr.doc, mr.query, mr.cfg);
+            got_probe_ext  := pg_temp._prox_eval(ext_sch, mexpr);
+            got_probe_pure := pg_temp._prox_eval('proxquery', mexpr);
+            IF (got_probe_ext = '<null>') IS DISTINCT FROM (got_probe_pure = '<null>') THEN
+                RAISE WARNING 'FAIL cfg-exact-droppability:%  ext=[%] pure=[%]', mr.label, got_probe_ext, got_probe_pure;
+                fails := fails + 1;
+            ELSIF got_probe_ext <> '<null>'
+                  AND (got_probe_ext IS DISTINCT FROM mr.expected OR got_probe_pure IS DISTINCT FROM mr.expected) THEN
+                RAISE WARNING 'FAIL cfg-exact:%  ext=[%] pure=[%] expected=[%]', mr.label, got_probe_ext, got_probe_pure, mr.expected;
+                fails := fails + 1;
+            END IF;
+
             -- 3-arg consolidated `ts_prox_search(tsv, q, cfg)` must agree across ports (it
-            -- composes the cfg skeleton + cfg recheck) and, for a keyed query, equal the
-            -- recheck. Keyless ⇒ ts_prox_query raises ⇒ both collapse to 'ERR' (still equal).
+            -- composes the cfg skeleton + cfg recheck, folding the recheck when droppable) and,
+            -- for a keyed query, equal the recheck. Keyless ⇒ ts_prox_query raises ⇒ both
+            -- collapse to 'ERR' (still equal).
             mexpr := format('ts_prox_search(to_tsvector(%L::regconfig, %L), %L, %L::regconfig)',
                             mr.cfg, mr.doc, mr.query, mr.cfg);
             got_probe_ext  := pg_temp._prox_eval(ext_sch, mexpr);

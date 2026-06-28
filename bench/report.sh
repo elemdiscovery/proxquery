@@ -44,7 +44,7 @@ start=$(date +%s)
 # small. RUN_LARGE is irrelevant here; we invoke large_bench.sql directly.
 raw="$(psqlq -d "$BENCH_DB" -v seed="$SEED" -v qseed="$QSEED" \
         -v target_mb="$SMALL_MB" -v nqueries="$NQUERIES" -v iters="$LB_ITERS" \
-        -v with_pure=1 -f bench/large/large_bench.sql)"
+        -v with_pure=1 -v with_seqscan=1 -f bench/large/large_bench.sql)"
 # Custom Unicode tokenizer vs stock `simple` on an overlap-heavy corpus — a smoke
 # regression check that superimposition doesn't blow up matching cost.
 raw_tok="$(psqlq -d "$BENCH_DB" -v ndocs="$NDOCS" -v wlen="$WLEN" -v iters="$ITERS" -f bench/tokenizer_vs_simple.sql)"
@@ -131,7 +131,10 @@ scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs s
   echo
   printf '%s\n' "$results_md"
   echo
-  echo "- \`ext_op_ms\` — extension single operator \`tsv @~@ q\`"
+  echo "- \`ext_op_ms\` — extension single operator \`tsv @~@ q\` (GIN-index-served)"
+  echo "- \`ext_seq_ms\` — the SAME \`@~@\` query with the index disabled (recheck over every"
+  echo "  row, a full seq scan) — the brute-force baseline; identical rows, just unaccelerated"
+  echo "- \`index_speedup\` — \`ext_seq_ms / ext_op_ms\` (how much the GIN index buys)"
   echo "- \`ext_search_ms\` — extension via the consolidated \`ts_prox_search(tsv, q)\`"
   echo "- \`pure_search_ms\` — pure-SQL port via the same \`ts_prox_search\`"
   echo "- \`slowdown\` — \`pure_search_ms / ext_search_ms\`"

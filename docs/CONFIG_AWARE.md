@@ -47,6 +47,8 @@ query, and stays `IMMUTABLE` so it folds into the index condition):
 | --- | --- |
 | `ts_prox_query(text, regconfig)` | index-selection skeleton under a config |
 | `ts_prox_recheck(tsvector, text, regconfig)` | positional recheck under a config |
+| `ts_prox_query_exact(text, regconfig)` | the recheck-droppable tsquery under a config (NULL when the recheck is needed) |
+| `ts_prox_search(tsvector, text, regconfig)` | one-call index-selection + recheck, folding the recheck when droppable |
 | `tsvector @~@ proxquery(cfg, q)` | the single indexable operator, config in a typed right operand |
 
 The existing 2-arg `ts_prox_query(text)` / `ts_prox_recheck(tsvector, text)` and the
