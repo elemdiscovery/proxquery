@@ -33,11 +33,11 @@
 --     per call) instead of the extension's O(log L) binary search, and the
 --     query AST is re-parsed per row. Same answers, slower on large corpora —
 --     EXCEPT bounded proximity (within/pre/phrase over plain terms, distance ≤ 32),
---     which can skip the slow recheck entirely via `ts_prox_query_native(q)`: it
---     lowers the query to a native `tsquery` matched by Postgres's own C phrase
---     engine. That is the same rewrite the extension's `@~@` support function
---     performs automatically; here it's opt-in (see that function for the seamless
---     query form that auto-selects it and falls back to the recheck otherwise).
+--     where the recheck is skipped: `ts_prox_match` lowers the query to a native
+--     `tsquery` matched by Postgres's own C phrase engine (the same rewrite the
+--     extension's `@~@` support function performs). This happens automatically in
+--     the standard two-clause form — no special syntax — for literal or custom-plan
+--     queries; see `ts_prox_match` / `ts_prox_query_native` for the parameter caveat.
 --
 -- Text search configuration: `simple` (literal, lowercased), matching the
 -- extension. Internal helpers are prefixed `_prox_`.
@@ -1043,8 +1043,8 @@ $fn$ SELECT to_tsquery('simple', ts_prox_query_skeleton(query)) $fn$;
 -- Mirror of the extension's native lowering (src/dsl.rs `native`). For the common
 -- bounded-proximity shapes the positional test is expressible as a native `tsquery`,
 -- evaluated by Postgres's own (C) phrase engine in the GIN `@@` heap recheck — so the
--- slow per-row plpgsql `ts_prox_match` recheck can be SKIPPED entirely (this is most
--- of the port's cost). within/pre lower to an OR over exact gaps:
+-- slow per-row positional recheck can be SKIPPED entirely (it is most of the port's
+-- cost). within/pre lower to an OR over exact gaps:
 --   a <~n> b  ≡  OR_{k=0..n} (a <k> b | b <k> a)   (either order, |Δ| ≤ n)
 --   a <-n> b  ≡  OR_{k=1..n} (a <k> b)             (ordered, 0 < Δ ≤ n)
 -- Only shapes that map EXACTLY are accepted; everything else (glob, regex, not-
@@ -1053,12 +1053,14 @@ $fn$ SELECT to_tsquery('simple', ts_prox_query_skeleton(query)) $fn$;
 -- recheck. The cap bounds the OR-expansion; past it the expansion outweighs the
 -- recheck it saves.
 --
--- Seamless query form (auto-selects native vs recheck; the IS NULL test folds at plan
--- time because ts_prox_query_native is IMMUTABLE, so only the taken branch survives):
---   WHERE CASE WHEN proxquery.ts_prox_query_native(q) IS NOT NULL
---              THEN tsv @@ proxquery.ts_prox_query_native(q)              -- fast: native @@
---              ELSE tsv @@ proxquery.ts_prox_query(q)
---                AND proxquery.ts_prox_match(tsv, q) END                 -- general: recheck
+-- `ts_prox_match(v, q)` (below) applies this automatically — it is an INLINEABLE
+-- coalesce of `v @@ ts_prox_query_native(q)` over the positional recheck — so the
+-- ordinary two-clause form gets the pushdown for free, no special syntax:
+--   WHERE tsv @@ proxquery.ts_prox_query(q) AND proxquery.ts_prox_match(tsv, q)
+-- fast for native shapes, recheck for the rest. The native tsquery is built once for a
+-- literal (const-folded) or a custom-plan parameter; a bind parameter that flips to a
+-- GENERIC plan re-parses it per row (still correct, still faster than the bare recheck)
+-- — inline the query as a literal to avoid that.
 
 -- A lexeme quoted for the native tsquery, or NULL if it can't survive `tsqueryin`
 -- verbatim. The native tsquery is built with `::tsquery` (tsqueryin), NOT to_tsquery,
@@ -1186,9 +1188,10 @@ EXCEPTION WHEN OTHERS THEN
 END
 $fn$;
 
--- Evaluate the DSL's positional semantics on `v` — the recheck that pairs with
--- ts_prox_query for index selection.
-CREATE OR REPLACE FUNCTION ts_prox_match(v tsvector, query text) RETURNS boolean
+-- The positional recheck: evaluate the DSL's semantics on `v` directly. Internal —
+-- the public ts_prox_match wraps it with the native-pushdown fast path below. Keeps the
+-- `ts_prox_match:` error prefix so user-facing errors are unchanged.
+CREATE OR REPLACE FUNCTION _prox_match_recheck(v tsvector, query text) RETURNS boolean
     LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE STRICT
     SET search_path = proxquery, pg_catalog AS
 $fn$
@@ -1202,6 +1205,22 @@ EXCEPTION WHEN OTHERS THEN
     RAISE EXCEPTION 'ts_prox_match: %', SQLERRM;
 END
 $fn$;
+
+-- Public recheck: the partner of ts_prox_query for index selection. An INLINEABLE sql
+-- coalesce (LANGUAGE sql, IMMUTABLE, no SET clause, qualified body, no sub-select — all
+-- required to inline) so that in `tsv @@ ts_prox_query(q) AND ts_prox_match(tsv, q)` the
+-- planner splices the body in: for a native-expressible `q` it becomes `tsv @@ <native
+-- tsquery>` (Postgres's C phrase engine, no positional recheck); otherwise it reduces to
+-- the positional recheck. The index always comes from the explicit ts_prox_query clause,
+-- so even if this never inlines the worst case is the recheck, never a seq scan. Same
+-- boolean as the recheck — ts_prox_query_native(q) is exactly equivalent, or NULL.
+-- NOT marked STRICT on purpose: a strict SQL function whose body uses a nonstrict
+-- function (coalesce) is not inlined, and inlining is the whole point. NULL args still
+-- yield NULL here because the inner ts_prox_query_native / _prox_match_recheck are STRICT.
+CREATE OR REPLACE FUNCTION ts_prox_match(v tsvector, query text) RETURNS boolean
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$ SELECT coalesce(v @@ proxquery.ts_prox_query_native(query),
+                     proxquery._prox_match_recheck(v, query)) $fn$;
 
 -- ===========================================================================
 -- Config-aware surface (3-arg overloads)
