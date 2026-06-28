@@ -25,6 +25,11 @@ concurrency:
   group: docker-smoke-${{ github.ref }}
   cancel-in-progress: true
 
+# Least-privilege default for GITHUB_TOKEN: this workflow only checks out and
+# builds, so read access to repo contents is all it needs.
+permissions:
+  contents: read
+
 jobs:
   smoke:
     name: docker pg${{ matrix.pg }}
