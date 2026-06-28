@@ -10,7 +10,7 @@ The headline: against an `english` column, `running <~3> shoes` matches a docume
 stored as `run … shoe`. Against a `simple_unaccent` column, `CAFÉ` matches `café`.
 
 > For the **custom Unicode tokenizer** (emoji, superimposed accents/hyphens/emails,
-> ICU CJK, `:dict` stemming) — an ediscovery-oriented alternative to a stock
+> ICU CJK, `:dict` stemming) — an alternative to a stock
 > `regconfig` — see the [tokenizer user guide](TOKENIZER.md).
 
 ## The idea: proxquery *consumes* a config, it doesn't author one

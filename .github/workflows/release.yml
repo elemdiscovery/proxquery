@@ -91,8 +91,13 @@ jobs:
     if: ${{ needs.release.outputs.released == 'true' }}
     uses: ./.github/workflows/release-build.yml
     secrets: inherit
+    # Caller is the ceiling for a reusable workflow's token: grant the OIDC +
+    # attestation scopes here too, or the called build job's request is denied.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
 
   # Every other commit: rolling edge pre-release (PG 17, amd64 + arm64).
   build-edge:
@@ -101,5 +106,10 @@ jobs:
     if: ${{ needs.release.outputs.released != 'true' }}
     uses: ./.github/workflows/edge-build.yml
     secrets: inherit
+    # Caller is the ceiling for a reusable workflow's token: grant the OIDC +
+    # attestation scopes here too, or the called build job's request is denied.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write

@@ -27,6 +27,14 @@ jobs:
   build:
     name: pg${{ matrix.pg }} ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+    # Least privilege for the build leg: it only reads source and writes a
+    # provenance attestation. (The publish job keeps the workflow-level
+    # `contents: write` it needs to attach assets to the Release.)
+    permissions:
+      contents: read
+      id-token: write           # OIDC identity for keyless Sigstore signing
+      attestations: write       # persist the attestation
+      artifact-metadata: write  # create the artifact storage record
     strategy:
       fail-fast: false
       matrix:
@@ -36,7 +44,7 @@ jobs:
           - arch: amd64
             runner: ubuntu-latest
           - arch: arm64
-            runner: ubuntu-24.04-arm   # GitHub-hosted arm64 (free for public repos)
+            runner: ubuntu-24.04-arm   # GitHub-hosted arm64
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -90,6 +98,16 @@ jobs:
           tar -czf "dist/${STAGE}.tar.gz" "$STAGE"
           ( cd dist && sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256" )
           echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+
+      # Sign the tarball with a keyless Sigstore build-provenance attestation,
+      # bound to this workflow's OIDC identity (no stored key to manage). Anyone
+      # can later confirm a download was built by this repo's CI with:
+      #   gh attestation verify <tarball> --repo elemdiscovery/proxquery
+      - name: Attest build provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          # No predicate or SBOM inputs, so actions/attest defaults to SLSA build provenance.
+          subject-path: dist/*.tar.gz
 
       - name: Upload tarball artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
