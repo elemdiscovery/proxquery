@@ -157,7 +157,7 @@ pub fn load_tokenizer() {
 
 /// Load `tests/analyzer_cases.md` into `_prox_an(label, analyzer, doc, query, expected)`
 /// for the `analyzer_operator_corpus` test (the DSL operator surface under the custom
-/// tokenizer, checked via `proxquery_match` and the `@~@` index path).
+/// tokenizer, checked via `proxquery_recheck` and the `@~@` index path).
 pub fn load_analyzer_ops() {
     let tables = parse_tables(include_str!("../tests/analyzer_cases.md"));
     let rows = rows_for(&tables, &["label", "analyzer", "doc", "query", "expected"]);

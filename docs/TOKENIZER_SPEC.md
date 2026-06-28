@@ -17,7 +17,7 @@ already made (see below).
 - **Extension-only, both sides.** Query atoms resolve through the same tokenizer, which
   pure SQL can't replicate. The default-parser path (`to_tsvector(cfg,…)`) is unchanged
   and stays mirrored across the extension and the pure-SQL port. The matching engine
-  (DSL / proximity / `ts_prox_match` / operators) is shared and is **not** forked — it
+  (DSL / proximity / `ts_prox_recheck` / operators) is shared and is **not** forked — it
   reads any tsvector and already handles superimposed positions.
 
 ## Pipeline

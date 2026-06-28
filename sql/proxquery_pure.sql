@@ -12,32 +12,34 @@
 -- single `DROP SCHEMA proxquery CASCADE`. The native extension is relocatable,
 -- so it installs into the same schema for a transparent migration:
 --     CREATE EXTENSION proxquery SCHEMA proxquery;
--- Call the functions schema-qualified (`proxquery.ts_prox_match(…)`) or add the
+-- Call the functions schema-qualified (`proxquery.ts_prox_recheck(…)`) or add the
 -- schema to your search_path (`SET search_path = public, proxquery;`). Each
 -- public function pins its own search_path, so it resolves correctly either way.
 --
 -- What is the same: the DSL, the skeleton tsquery (`ts_prox_query`), the
--- positional recheck (`ts_prox_match`), and the positional predicate functions —
+-- positional recheck (`ts_prox_recheck`), and the positional predicate functions —
 -- all produce identical results to the Rust extension.
 --
 -- What differs:
 --   * No `@~@` operator. The native extension's single indexable operator needs
 --     a C planner support function (impossible in SQL). Rather than ship a
 --     look-alike `@~@` that silently seq-scans, this port omits it entirely, so
---     proximity queries must be written in the form that is actually index-
---     served — the two clauses the support function would otherwise inject:
+--     proximity queries are written in the form that is actually index-served —
+--     the two clauses the support function would otherwise inject:
 --         WHERE tsv @@ proxquery.ts_prox_query(q)   -- GIN index selects
---           AND proxquery.ts_prox_match(tsv, q)       -- positional recheck
+--           AND proxquery.ts_prox_recheck(tsv, q)       -- positional recheck
+--     or, equivalently, the one inlinable call `proxquery.ts_prox_search(tsv, q)`,
+--     which the planner folds back open to those clauses (see `ts_prox_search`).
 --     (The native extension keeps `@~@`; after migrating you may switch to it.)
 --   * Performance: positions are read with `unnest(tsvector)` (O(all lexemes)
 --     per call) instead of the extension's O(log L) binary search, and the
 --     query AST is re-parsed per row. Same answers, slower on large corpora —
 --     EXCEPT bounded proximity (within/pre/phrase over plain terms, distance ≤ 32),
---     where the recheck is skipped: `ts_prox_match` lowers the query to a native
+--     where the recheck is skipped: `ts_prox_recheck` lowers the query to a native
 --     `tsquery` matched by Postgres's own C phrase engine (the same rewrite the
 --     extension's `@~@` support function performs). This happens automatically in
 --     the standard two-clause form — no special syntax — for literal or custom-plan
---     queries; see `ts_prox_match` / `ts_prox_query_native` for the parameter caveat.
+--     queries; see `ts_prox_recheck` / `ts_prox_query_native` for the parameter caveat.
 --
 -- Text search configuration: `simple` (literal, lowercased), matching the
 -- extension. Internal helpers are prefixed `_prox_`.
@@ -1053,10 +1055,10 @@ $fn$ SELECT to_tsquery('simple', ts_prox_query_skeleton(query)) $fn$;
 -- recheck. The cap bounds the OR-expansion; past it the expansion outweighs the
 -- recheck it saves.
 --
--- `ts_prox_match(v, q)` (below) applies this automatically — it is an INLINEABLE
+-- `ts_prox_recheck(v, q)` (below) applies this automatically — it is an INLINEABLE
 -- coalesce of `v @@ ts_prox_query_native(q)` over the positional recheck — so the
 -- ordinary two-clause form gets the pushdown for free, no special syntax:
---   WHERE tsv @@ proxquery.ts_prox_query(q) AND proxquery.ts_prox_match(tsv, q)
+--   WHERE tsv @@ proxquery.ts_prox_query(q) AND proxquery.ts_prox_recheck(tsv, q)
 -- fast for native shapes, recheck for the rest. The native tsquery is built once for a
 -- literal (const-folded) or a custom-plan parameter; a bind parameter that flips to a
 -- GENERIC plan re-parses it per row (still correct, still faster than the bare recheck)
@@ -1172,7 +1174,7 @@ END
 $fn$;
 
 -- Public: the native-pushdown tsquery, or NULL when the query isn't native-
--- expressible (then use the two-clause presence + ts_prox_match form). Mirrors the
+-- expressible (then use the two-clause presence + ts_prox_recheck form). Mirrors the
 -- extension's ts_prox_query_native. A malformed query yields NULL here (the recheck
 -- in the fallback branch surfaces the error), matching the extension.
 CREATE OR REPLACE FUNCTION ts_prox_query_native(query text) RETURNS tsquery
@@ -1188,10 +1190,72 @@ EXCEPTION WHEN OTHERS THEN
 END
 $fn$;
 
+-- ===========================================================================
+-- Recheck-droppable form  ->  the skeleton @@ alone is the EXACT match
+-- ===========================================================================
+--
+-- For a query with no proximity/not-within operator (plain boolean / phrase / prefix
+-- over terms), the presence skeleton `ts_prox_query(q)` is itself the EXACT answer —
+-- the positional recheck removes nothing (avg_cand == avg_match). So the second clause
+-- of the two-clause form is pure overhead: a Filter that re-detoasts the (often TOASTed)
+-- tsvector on every candidate row. `ts_prox_query_exact(q)` returns a non-NULL tsquery
+-- exactly when the recheck is droppable — i.e. native-expressible AND free of within/pre/
+-- not-within (whose native form is exact but NON-selective, so it must keep the skeleton
+-- + recheck, never drive the index alone). It is the pure-SQL mirror of the extension's
+-- `ts_prox_query_exact` / planner `simplify` gate (`dsl::simplify_tsquery_string`).
+--
+-- Recommended query form — one self-folding template that const-folds to the optimal
+-- plan for a LITERAL or custom-plan query (a generic-plan bind parameter keeps the
+-- recheck, still correct):
+--     WHERE tsv @@ proxquery.ts_prox_query(q)
+--       AND (proxquery.ts_prox_query_exact(q) IS NOT NULL OR proxquery.ts_prox_recheck(tsv, q))
+-- When exact(q) is non-NULL the planner folds `(true OR recheck)` away (one clause, no
+-- re-detoast); otherwise `(false OR recheck)` reduces to the recheck (the two-clause form).
+
+-- Whether the normalized AST contains a within/pre (`within`) or not-within (`notwithin`)
+-- node anywhere — the gate for `ts_prox_query_exact`. Mirrors the extension's
+-- `dsl::contains_within`. A within/not-within at the top returns true immediately; only
+-- and/or/not need to be searched (a within nested under a within is already caught).
+CREATE OR REPLACE FUNCTION _prox_has_within(node jsonb) RETURNS boolean
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$
+    SELECT CASE node ->> 't'
+        WHEN 'within'    THEN true
+        WHEN 'notwithin' THEN true
+        WHEN 'not'       THEN _prox_has_within(node -> 'x')
+        WHEN 'and'       THEN EXISTS (SELECT 1 FROM jsonb_array_elements(node -> 'c') AS e(v)
+                                      WHERE _prox_has_within(e.v))
+        WHEN 'or'        THEN EXISTS (SELECT 1 FROM jsonb_array_elements(node -> 'c') AS e(v)
+                                      WHERE _prox_has_within(e.v))
+        ELSE false
+    END
+$fn$;
+
+-- Public: the EXACT-match tsquery when the recheck is droppable (boolean / phrase /
+-- prefix), or NULL when the recheck is needed (within/pre/not-within, glob-suffix, regex,
+-- document NOT, or a malformed query). Non-NULL ⇒ `tsv @@ ts_prox_query_exact(q)` alone is
+-- the full match. Mirrors the extension's `ts_prox_query_exact`.
+CREATE OR REPLACE FUNCTION ts_prox_query_exact(query text) RETURNS tsquery
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE STRICT
+    SET search_path = proxquery, pg_catalog AS
+$fn$
+DECLARE node jsonb;
+BEGIN
+    node := _prox_normalize(_prox_parse(query));
+    IF _prox_has_within(node) THEN
+        RETURN NULL;                              -- exact but non-selective ⇒ keep recheck
+    END IF;
+    -- `::tsquery` (tsqueryin), verbatim lexemes — matches the recheck's exact byte lookup.
+    RETURN _prox_native(node)::tsquery;           -- NULL for glob-suffix / regex / NOT
+EXCEPTION WHEN OTHERS THEN
+    RETURN NULL;
+END
+$fn$;
+
 -- The positional recheck: evaluate the DSL's semantics on `v` directly. Internal —
--- the public ts_prox_match wraps it with the native-pushdown fast path below. Keeps the
--- `ts_prox_match:` error prefix so user-facing errors are unchanged.
-CREATE OR REPLACE FUNCTION _prox_match_recheck(v tsvector, query text) RETURNS boolean
+-- the public ts_prox_recheck wraps it with the native-pushdown fast path below. Keeps the
+-- `ts_prox_recheck:` error prefix so user-facing errors are unchanged.
+CREATE OR REPLACE FUNCTION _prox_recheck(v tsvector, query text) RETURNS boolean
     LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE STRICT
     SET search_path = proxquery, pg_catalog AS
 $fn$
@@ -1202,13 +1266,13 @@ BEGIN
     PERFORM _prox_validate_regexes(node);
     RETURN _prox_eval(node, v);
 EXCEPTION WHEN OTHERS THEN
-    RAISE EXCEPTION 'ts_prox_match: %', SQLERRM;
+    RAISE EXCEPTION 'ts_prox_recheck: %', SQLERRM;
 END
 $fn$;
 
 -- Public recheck: the partner of ts_prox_query for index selection. An INLINEABLE sql
 -- coalesce (LANGUAGE sql, IMMUTABLE, no SET clause, qualified body, no sub-select — all
--- required to inline) so that in `tsv @@ ts_prox_query(q) AND ts_prox_match(tsv, q)` the
+-- required to inline) so that in `tsv @@ ts_prox_query(q) AND ts_prox_recheck(tsv, q)` the
 -- planner splices the body in: for a native-expressible `q` it becomes `tsv @@ <native
 -- tsquery>` (Postgres's C phrase engine, no positional recheck); otherwise it reduces to
 -- the positional recheck. The index always comes from the explicit ts_prox_query clause,
@@ -1216,11 +1280,39 @@ $fn$;
 -- boolean as the recheck — ts_prox_query_native(q) is exactly equivalent, or NULL.
 -- NOT marked STRICT on purpose: a strict SQL function whose body uses a nonstrict
 -- function (coalesce) is not inlined, and inlining is the whole point. NULL args still
--- yield NULL here because the inner ts_prox_query_native / _prox_match_recheck are STRICT.
-CREATE OR REPLACE FUNCTION ts_prox_match(v tsvector, query text) RETURNS boolean
+-- yield NULL here because the inner ts_prox_query_native / _prox_recheck are STRICT.
+CREATE OR REPLACE FUNCTION ts_prox_recheck(v tsvector, query text) RETURNS boolean
     LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
 $fn$ SELECT coalesce(v @@ proxquery.ts_prox_query_native(query),
-                     proxquery._prox_match_recheck(v, query)) $fn$;
+                     proxquery._prox_recheck(v, query)) $fn$;
+
+-- ===========================================================================
+-- Consolidated indexable search  ->  the recommended form in one call
+-- ===========================================================================
+--
+-- `ts_prox_search(v, q)` collapses the recommended index-selection + recheck form into a
+-- single call. It is written to INLINE (LANGUAGE sql, IMMUTABLE, NOT strict, no SET clause,
+-- fully-qualified body, single SELECT) so the planner splices its body back into the query:
+-- the `v @@ ts_prox_query(q)` clause is re-exposed for the plain `gin(tsvector)` index, and
+-- for a recheck-droppable (boolean / phrase / prefix) constant query the
+-- `(ts_prox_query_exact(q) IS NOT NULL OR …)` const-folds away, dropping the per-row recheck
+-- (and its tsvector re-detoast). Exactly equal to — and the same plan as — the explicit form:
+--     WHERE proxquery.ts_prox_search(tsv, q)        -- one call; planner folds it open
+--   ≡ WHERE tsv @@ proxquery.ts_prox_query(q)
+--       AND (proxquery.ts_prox_query_exact(q) IS NOT NULL OR proxquery.ts_prox_recheck(tsv, q))
+--
+-- CAVEAT — index use rides on that inlining. Should it ever fail to inline (the body gains a
+-- SET clause, is marked STRICT, is wrapped where the planner can't see the `@@`, …) it
+-- degrades SILENTLY to a sequential scan. The explicit two-clause form keeps `@@` visible in
+-- the query text and so can never lose the index; prefer it where robustness beats brevity.
+-- (The test suite EXPLAINs ts_prox_search and asserts a Bitmap Index Scan, so a regression
+-- here fails loudly rather than silently seq-scanning.) `simple`-only, like ts_prox_query_exact:
+-- a config-aware column keeps the explicit `ts_prox_query(q,cfg) AND ts_prox_recheck(tsv,q,cfg)`.
+CREATE OR REPLACE FUNCTION ts_prox_search(v tsvector, query text) RETURNS boolean
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$ SELECT v @@ proxquery.ts_prox_query(query)
+         AND (proxquery.ts_prox_query_exact(query) IS NOT NULL
+              OR proxquery.ts_prox_recheck(v, query)) $fn$;
 
 -- ===========================================================================
 -- Config-aware surface (3-arg overloads)
@@ -1365,7 +1457,7 @@ CREATE OR REPLACE FUNCTION ts_prox_query(query text, cfg regconfig) RETURNS tsqu
 $fn$ SELECT to_tsquery(cfg, ts_prox_query_skeleton(query)) $fn$;
 
 -- 3-arg recheck: resolve terms through cfg, then evaluate.
-CREATE OR REPLACE FUNCTION ts_prox_match(v tsvector, query text, cfg regconfig) RETURNS boolean
+CREATE OR REPLACE FUNCTION ts_prox_recheck(v tsvector, query text, cfg regconfig) RETURNS boolean
     LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE STRICT
     SET search_path = proxquery, pg_catalog AS
 $fn$
@@ -1376,13 +1468,31 @@ BEGIN
     PERFORM _prox_validate_regexes(node);
     RETURN _prox_eval(node, v);
 EXCEPTION WHEN OTHERS THEN
-    RAISE EXCEPTION 'ts_prox_match: %', SQLERRM;
+    RAISE EXCEPTION 'ts_prox_recheck: %', SQLERRM;
 END
 $fn$;
+
+-- 3-arg consolidated search (config-aware) — the one-call form to use for a column built
+-- with a non-`simple` config, in place of the explicit two clauses. Same inlinable shape as
+-- the 2-arg `ts_prox_search`, so it index-serves via `@@ ts_prox_query(q, cfg)`. It does NOT
+-- fold the recheck, though: under a text-search config a term can resolve to several lexemes,
+-- so the skeleton is a superset of the match rather than exactly it (the 2-arg `simple` fold
+-- relies on verbatim lexemes that match the recheck's exact byte lookup). So config boolean
+-- queries keep the recheck — it is still one call instead of two, and still index-served.
+CREATE OR REPLACE FUNCTION ts_prox_search(v tsvector, query text, cfg regconfig) RETURNS boolean
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$ SELECT v @@ proxquery.ts_prox_query(query, cfg)
+         AND proxquery.ts_prox_recheck(v, query, cfg) $fn$;
 
 -- NOTE: no `@~@` operator (neither the 2-arg nor the `proxquery(cfg, q)` overload).
 -- The native extension's single indexable operator needs a C planner support
 -- function that cannot be written in SQL; a SQL-only look-alike would silently
 -- seq-scan every query. So proximity queries here are always written as the two
 -- index-served clauses (the same plan the operator expands to under the extension):
---     WHERE tsv @@ proxquery.ts_prox_query(q [,cfg]) AND proxquery.ts_prox_match(tsv, q [,cfg])
+--     WHERE tsv @@ proxquery.ts_prox_query(q [,cfg]) AND proxquery.ts_prox_recheck(tsv, q [,cfg])
+-- For the best plan on boolean / phrase / prefix queries, wrap the recheck so it folds
+-- away when unnecessary (see `ts_prox_query_exact` above) — never worse, often far faster:
+--     WHERE tsv @@ proxquery.ts_prox_query(q)
+--       AND (proxquery.ts_prox_query_exact(q) IS NOT NULL OR proxquery.ts_prox_recheck(tsv, q))
+-- `ts_prox_search(tsv, q)` is that exact form in one inlinable call (2-arg / `simple` only):
+--     WHERE proxquery.ts_prox_search(tsv, q)

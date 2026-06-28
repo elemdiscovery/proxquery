@@ -93,7 +93,7 @@ parity_md="$(printf '%s\n' "$raw" | sed -n '/== parity (pure port vs extension/,
 vocab_md="$(printf '%s\n' "$raw" | sed -n '/== vocabulary ==/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
 corpus_block="$(printf '%s\n' "$raw" | sed -n '/== corpus shape ==/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
 plan_op_block="$(printf '%s\n' "$raw" | sed -n '/== plan: @~@ within/,/([0-9]* row/p' | sed '1d' || true)"
-plan_pure_block="$(printf '%s\n' "$raw" | sed -n '/== plan: pure two-clause/,/([0-9]* row/p' | sed '1d' || true)"
+plan_search_block="$(printf '%s\n' "$raw" | sed -n '/== plan: ts_prox_search on a boolean/,/([0-9]* row/p' | sed '1d' || true)"
 tok_corpus_md="$(printf '%s\n' "$raw_tok" | sed -n '/== corpus shape (lexeme/,/^$/p' | grep '|' | to_md_table || true)"
 tok_results_md="$(printf '%s\n' "$raw_tok" | sed -n '/== tokenizer vs simple/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
 scale_results_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: pure vs extension recheck by text length/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
@@ -131,9 +131,9 @@ scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs s
   printf '%s\n' "$results_md"
   echo
   echo "- \`ext_op_ms\` — extension single operator \`tsv @~@ q\`"
-  echo "- \`ext_2cl_ms\` — extension, written as the two-clause form"
-  echo "- \`pure_2cl_ms\` — pure-SQL port, the same two clauses"
-  echo "- \`slowdown\` — \`pure_2cl_ms / ext_2cl_ms\`"
+  echo "- \`ext_search_ms\` — extension via the consolidated \`ts_prox_search(tsv, q)\`"
+  echo "- \`pure_search_ms\` — pure-SQL port via the same \`ts_prox_search\`"
+  echo "- \`slowdown\` — \`pure_search_ms / ext_search_ms\`"
   echo
   echo "Parity (extension vs pure match counts on the same corpus — \`mismatches\` must be 0;"
   echo "it is also gated independently, so a nonzero count fails this job):"
@@ -186,10 +186,10 @@ scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs s
   echo
   echo "</details>"
   echo
-  echo "<details><summary>Plan — pure two-clause (GIN-index-served)</summary>"
+  echo "<details><summary>Plan — ts_prox_search on a boolean query (recheck folded away, Bitmap Index Scan)</summary>"
   echo
   echo '```'
-  printf '%s\n' "$plan_pure_block"
+  printf '%s\n' "$plan_search_block"
   echo '```'
   echo
   echo "</details>"

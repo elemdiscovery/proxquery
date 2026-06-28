@@ -106,10 +106,10 @@ WHERE tsv @~@ proxquery('prox_icu', 'cafe <-> noir')
 
 -- 2) the explicit two clauses it expands to (GIN probe AND positional recheck)
 WHERE tsv @@ ts_prox_query(proxquery('prox_icu','cafe <-> noir'))
-  AND proxquery_match(tsv, 'cafe <-> noir', 'prox_icu')
+  AND proxquery_recheck(tsv, 'cafe <-> noir', 'prox_icu')
 
 -- 3) a bare recheck (seq scan; no index)
-WHERE proxquery_match(tsv, 'cafe <-> noir', 'prox_icu')
+WHERE proxquery_recheck(tsv, 'cafe <-> noir', 'prox_icu')
 ```
 
 `@~@` carries a planner support function that rewrites form (1) into form (2) against
@@ -145,9 +145,9 @@ literal quote.)
   alter the column and reindex.
 - **Extension-only.** This path is not in the pure-SQL port. The default-parser /
   config-aware path ([CONFIG_AWARE.md](CONFIG_AWARE.md)) remains available in both.
-- **Two function families.** `ts_prox_*` (`ts_prox_query`, `ts_prox_match(tsv, q,
+- **Two function families.** `ts_prox_*` (`ts_prox_query`, `ts_prox_recheck(tsv, q,
   regconfig)`) is the **stock / regconfig** family — portable, and present in the
-  pure-SQL port. `proxquery_*` (`proxquery_to_tsvector`, `proxquery_match(tsv, q,
+  pure-SQL port. `proxquery_*` (`proxquery_to_tsvector`, `proxquery_recheck(tsv, q,
   analyzer)`) is the **custom-tokenizer** family — extension-only. The split is
   deliberate: a function's family tells you whether it works under the pure port. The
   `@~@ proxquery(src, q)` operator is the convenience that dispatches to either (also

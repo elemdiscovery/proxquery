@@ -46,16 +46,16 @@ query, and stays `IMMUTABLE` so it folds into the index condition):
 | Form | Use |
 | --- | --- |
 | `ts_prox_query(text, regconfig)` | index-selection skeleton under a config |
-| `ts_prox_match(tsvector, text, regconfig)` | positional recheck under a config |
+| `ts_prox_recheck(tsvector, text, regconfig)` | positional recheck under a config |
 | `tsvector @~@ proxquery(cfg, q)` | the single indexable operator, config in a typed right operand |
 
-The existing 2-arg `ts_prox_query(text)` / `ts_prox_match(tsvector, text)` and the
+The existing 2-arg `ts_prox_query(text)` / `ts_prox_recheck(tsvector, text)` and the
 plain `tsvector @~@ text` operator are unchanged — still `simple`, still literal.
 This is purely additive.
 
 These `ts_prox_*` functions are the **stock / regconfig** family and are mirrored by
 the pure-SQL port. The custom Unicode tokenizer has a parallel **`proxquery_*`**
-family (`proxquery_to_tsvector`, `proxquery_match`) that is **extension-only** — see
+family (`proxquery_to_tsvector`, `proxquery_recheck`) that is **extension-only** — see
 the [tokenizer guide](TOKENIZER.md). A function's family tells you whether it works
 under the pure port.
 
@@ -66,7 +66,7 @@ CREATE INDEX ON docs USING gin (body_tsv);   -- body_tsv = to_tsvector('english'
 
 SELECT * FROM docs
 WHERE body_tsv @@ ts_prox_query('running <~3> shoes', 'english')   -- Bitmap Index Scan
-  AND ts_prox_match(body_tsv, 'running <~3> shoes', 'english');     -- recheck filter
+  AND ts_prox_recheck(body_tsv, 'running <~3> shoes', 'english');     -- recheck filter
 ```
 
 ### As the single operator (extension only)
@@ -161,7 +161,7 @@ literal). Everything above is additive.
 ## Pure-SQL parity
 
 The pure-SQL port ([PURE_SQL.md](PURE_SQL.md)) ships the same 3-arg
-`ts_prox_query` / `ts_prox_match` overloads, with identical results — both ports
+`ts_prox_query` / `ts_prox_recheck` overloads, with identical results — both ports
 call the same Postgres `to_tsvector` / `to_tsquery` builtins, so they can't drift
 (checked by the differential and fuzz suites, now including config-aware cases).
 The `@~@ proxquery(cfg, q)` operator is **extension only** — like `@~@` itself, its

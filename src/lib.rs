@@ -100,7 +100,7 @@ CREATE FUNCTION ts_prox_query(query text) RETURNS tsquery
 /// the positional recheck for a query that maps cleanly onto native `tsquery` phrase
 /// operators (bounded within/pre/phrase over plain terms — see
 /// [`dsl::native_tsquery_string`]), or NULL when the query isn't native-expressible.
-/// This is the recheck-dropping form the pure-SQL port and `ts_prox_match`'s native
+/// This is the recheck-dropping form the pure-SQL port and `ts_prox_recheck`'s native
 /// fast-path use; exposed so one can check whether — and to what — a query pushes down
 /// (`SELECT ts_prox_query_native('a <~3> b')`). NOTE: the `@~@` planner support only
 /// *rewrites a constant clause* to this for phrase/exact/boolean shapes; `within`/`pre`
@@ -121,6 +121,49 @@ CREATE FUNCTION ts_prox_query_native(query text) RETURNS tsquery
 "#,
     name = "ts_prox_query_native_wrapper",
     requires = [ts_prox_query_native_string],
+);
+
+/// The recheck-droppable native tsquery, or NULL when the recheck is needed. Unlike
+/// [`ts_prox_query_native_string`], this is `None` for `within`/`pre`/`not-within` (whose
+/// native form is exact but NON-selective — it must keep the `a & b` skeleton + recheck,
+/// never drive the index alone). Non-NULL exactly when `tsv @@ ts_prox_query_exact(q)`
+/// alone is the full match: plain boolean / phrase / prefix. Same gate the `@~@` planner
+/// `simplify` uses ([`dsl::simplify_tsquery_string`]); exposed so the pure-SQL port's
+/// recommended one-clause form stays drop-in-portable to the native extension.
+#[pg_extern(immutable, parallel_safe, strict)]
+fn ts_prox_query_exact_string(query: &str) -> Option<String> {
+    dsl::simplify_tsquery_string(query)
+}
+
+// `tsquery` form of the recheck-droppable native query, mirroring the pure port's
+// `ts_prox_query_exact`. `::tsquery` (tsqueryin) takes the lexemes VERBATIM, matching the
+// recheck's exact byte lookup; NULL (non-droppable / malformed) stays NULL.
+pgrx::extension_sql!(
+    r#"
+CREATE FUNCTION ts_prox_query_exact(query text) RETURNS tsquery
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
+    AS $$ SELECT ts_prox_query_exact_string($1)::tsquery $$;
+"#,
+    name = "ts_prox_query_exact_wrapper",
+    requires = [ts_prox_query_exact_string],
+);
+
+// Consolidated indexable search: one INLINABLE function = `@@ ts_prox_query(q)` plus the
+// recheck-droppable fold — identical to the pure port's `ts_prox_search`, so the recommended
+// one-call SQL is drop-in portable across the pure→native migration. NOT `STRICT` (the `OR`
+// is nonstrict — a strict SQL function with a nonstrict body is not inlined, and inlining is
+// what re-exposes the `@@` to the GIN index). Index use therefore rides on inlining; the test
+// suite EXPLAINs it and asserts a Bitmap Index Scan so a regression is loud, not a silent seq
+// scan. (Extension users normally just write `@~@`, which the C support fn already optimizes.)
+pgrx::extension_sql!(
+    r#"
+CREATE FUNCTION ts_prox_search(v tsvector, query text) RETURNS boolean
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE
+    AS $$ SELECT v @@ ts_prox_query(query)
+              AND (ts_prox_query_exact(query) IS NOT NULL OR ts_prox_recheck(v, query)) $$;
+"#,
+    name = "ts_prox_search_wrapper",
+    requires = ["ts_prox_query_wrapper", "ts_prox_query_exact_wrapper", ts_prox_recheck],
 );
 
 // Config-aware skeleton: same presence skeleton, but lowered through the column's
@@ -164,35 +207,35 @@ fn cached_ast(query: &str) -> Result<Rc<dsl::Node>, String> {
 
 /// Evaluate the proxquery DSL's positional semantics on `v` — the recheck that
 /// pairs with `ts_prox_query` for index selection (`v @@ ts_prox_query(q) AND
-/// ts_prox_match(v, q)`).
+/// ts_prox_recheck(v, q)`).
 #[pg_extern(immutable, parallel_safe)]
-fn ts_prox_match(v: TsVector, query: &str) -> bool {
+fn ts_prox_recheck(v: TsVector, query: &str) -> bool {
     let node = match cached_ast(query) {
         Ok(n) => n,
-        Err(e) => error!("ts_prox_match: {e}"),
+        Err(e) => error!("ts_prox_recheck: {e}"),
     };
     match dsl::eval_match(&node, &v, dsl::Resolver::Literal) {
         Ok(m) => m,
-        Err(e) => error!("ts_prox_match: {e}"),
+        Err(e) => error!("ts_prox_recheck: {e}"),
     }
 }
 
 /// Config-aware recheck: resolve each query *term* through `cfg`
 /// (`to_tsvector(cfg, term)`) so it matches a column built with that text-search
 /// config (stemmed/unaccented/locale-folded lexemes). The `simple` 2-arg
-/// [`ts_prox_match`] is the literal-lexeme fast path; this is the explicit-config
-/// form behind the 3-arg `ts_prox_match(tsvector, text, regconfig)` overload and
+/// [`ts_prox_recheck`] is the literal-lexeme fast path; this is the explicit-config
+/// form behind the 3-arg `ts_prox_recheck(tsvector, text, regconfig)` overload and
 /// the `@~@ proxquery(cfg, q)` operator. `cfg` arrives as a plain `oid` (regconfig
 /// is binary-coercible); the SQL wrappers do the `regconfig::oid` cast.
 #[pg_extern(immutable, parallel_safe)]
-fn ts_prox_match_cfg(v: TsVector, query: &str, cfg: pgrx::pg_sys::Oid) -> bool {
+fn ts_prox_recheck_cfg(v: TsVector, query: &str, cfg: pgrx::pg_sys::Oid) -> bool {
     let node = match cached_ast(query) {
         Ok(n) => n,
-        Err(e) => error!("ts_prox_match: {e}"),
+        Err(e) => error!("ts_prox_recheck: {e}"),
     };
     match dsl::eval_match(&node, &v, dsl::Resolver::Cfg(cfg)) {
         Ok(m) => m,
-        Err(e) => error!("ts_prox_match: {e}"),
+        Err(e) => error!("ts_prox_recheck: {e}"),
     }
 }
 
@@ -202,18 +245,18 @@ fn ts_prox_match_cfg(v: TsVector, query: &str, cfg: pgrx::pg_sys::Oid) -> bool {
 /// superimposed `café`/`cafe` the indexer stored). Extension-only; the pure-SQL port
 /// can't run the Rust tokenizer.
 #[pg_extern(immutable, parallel_safe)]
-fn proxquery_match(v: TsVector, query: &str, analyzer: &str) -> bool {
+fn proxquery_recheck(v: TsVector, query: &str, analyzer: &str) -> bool {
     let kind = match crate::tokenizer::AnalyzerKind::from_name(analyzer) {
         Some(k) => k,
-        None => error!("proxquery_match: unknown analyzer '{analyzer}'"),
+        None => error!("proxquery_recheck: unknown analyzer '{analyzer}'"),
     };
     let node = match cached_ast(query) {
         Ok(n) => n,
-        Err(e) => error!("proxquery_match: {e}"),
+        Err(e) => error!("proxquery_recheck: {e}"),
     };
     match dsl::eval_match(&node, &v, dsl::Resolver::Analyzer(kind)) {
         Ok(m) => m,
-        Err(e) => error!("proxquery_match: {e}"),
+        Err(e) => error!("proxquery_recheck: {e}"),
     }
 }
 
@@ -242,7 +285,7 @@ fn proxquery_is_analyzer(src: &str) -> bool {
     crate::tokenizer::AnalyzerKind::from_name(src).is_some()
 }
 
-// The single-clause surface: `text_tsv @~@ 'a <~5> b'`. For now it is `ts_prox_match`
+// The single-clause surface: `text_tsv @~@ 'a <~5> b'`. For now it is `ts_prox_recheck`
 // sugar (a seq-scan recheck); the planner support function below teaches it to use
 // the GIN index. The right operand is the DSL string.
 pgrx::extension_sql!(
@@ -250,14 +293,14 @@ pgrx::extension_sql!(
 CREATE OPERATOR @~@ (
     LEFTARG = tsvector,
     RIGHTARG = text,
-    FUNCTION = ts_prox_match
+    FUNCTION = ts_prox_recheck
 );
 "#,
     name = "proxmatch_operator",
-    requires = [ts_prox_match],
+    requires = [ts_prox_recheck],
 );
 
-/// Planner support function for `@~@` / `ts_prox_match`. Two requests (see
+/// Planner support function for `@~@` / `ts_prox_recheck`. Two requests (see
 /// [`support`]): *simplify* rewrites a constant, native-expressible query to a plain
 /// `tsvector @@ ts_prox_query_native(q)` (no positional recheck); *index condition*
 /// derives the lossy presence skeleton (`tsvector @@ ts_prox_query(q)` + recheck) for
@@ -281,18 +324,18 @@ fn ts_prox_query_support(arg: Internal) -> Internal {
 // Attach the support fn. Superuser-only, but a trusted extension's install
 // script runs privileged, so this works on managed/Neon-style installs too.
 pgrx::extension_sql!(
-    "ALTER FUNCTION ts_prox_match(tsvector, text) SUPPORT ts_prox_query_support;",
+    "ALTER FUNCTION ts_prox_recheck(tsvector, text) SUPPORT ts_prox_query_support;",
     name = "proxmatch_support",
-    requires = [ts_prox_match, ts_prox_query_support],
+    requires = [ts_prox_recheck, ts_prox_query_support],
 );
 
 // --- the @~@ operand: one `proxquery(src, q)` for both regconfig and analyzer ------
 //
-// The 3-arg `ts_prox_query`/`ts_prox_match(…, regconfig)` are the explicit-config
+// The 3-arg `ts_prox_query`/`ts_prox_recheck(…, regconfig)` are the explicit-config
 // two-clause form (mirrored by the pure-SQL port). The `@~@` operator can't take a
 // third arg, so the normalization SOURCE rides in one typed operand: `proxquery(src, q)`,
 // where `src` names EITHER a stock `regconfig` OR a custom analyzer. The operand's
-// `ts_prox_query`/`ts_prox_match` dispatch on `src` (`proxquery_is_analyzer`): an
+// `ts_prox_query`/`ts_prox_recheck` dispatch on `src` (`proxquery_is_analyzer`): an
 // analyzer resolves through the Rust tokenizer, anything else through
 // `to_tsvector(src::regconfig, …)`. So `tsv @~@ proxquery('english', q)` and
 // `tsv @~@ proxquery('prox_icu', q)` are spelled identically. The generic support fn
@@ -301,9 +344,17 @@ pgrx::extension_sql!(
 pgrx::extension_sql!(
     r#"
 -- 3-arg recheck: regconfig cast to oid for the internal (regconfig is an oid alias).
-CREATE FUNCTION ts_prox_match(v tsvector, query text, cfg regconfig) RETURNS bool
+CREATE FUNCTION ts_prox_recheck(v tsvector, query text, cfg regconfig) RETURNS bool
     LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
-    AS $$ SELECT ts_prox_match_cfg($1, $2, $3::oid) $$;
+    AS $$ SELECT ts_prox_recheck_cfg($1, $2, $3::oid) $$;
+
+-- 3-arg consolidated search (config-aware): the one-call form for a non-`simple` column,
+-- mirroring the pure port's `ts_prox_search(tsv, q, cfg)`. Inlinable (no SET clause), so the
+-- `@@ ts_prox_query(q, cfg)` clause drives the index; it does NOT fold the recheck — config
+-- term resolution can fan out, so the skeleton is a superset, not exactly the match.
+CREATE FUNCTION ts_prox_search(v tsvector, query text, cfg regconfig) RETURNS boolean
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE
+    AS $$ SELECT v @@ ts_prox_query(query, cfg) AND ts_prox_recheck(v, query, cfg) $$;
 
 -- The typed right operand for @~@: a (source, query) pair. `src` is a regconfig name
 -- or a proxquery analyzer name.
@@ -325,32 +376,33 @@ CREATE FUNCTION ts_prox_query(pq proxquery) RETURNS tsquery
 -- Recheck over the operand. plpgsql (not sql) so the planner does NOT inline the
 -- operator into a bare call — inlining would strip the @~@ OpExpr and bypass the
 -- support function, losing the index.
-CREATE FUNCTION ts_prox_match(v tsvector, pq proxquery) RETURNS bool
+CREATE FUNCTION ts_prox_recheck(v tsvector, pq proxquery) RETURNS bool
     LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE STRICT
     AS $$ BEGIN
         IF proxquery_is_analyzer(pq.src) THEN
-            RETURN proxquery_match(v, pq.q, pq.src);
+            RETURN proxquery_recheck(v, pq.q, pq.src);
         ELSE
-            RETURN ts_prox_match_cfg(v, pq.q, pq.src::regconfig::oid);
+            RETURN ts_prox_recheck_cfg(v, pq.q, pq.src::regconfig::oid);
         END IF;
     END $$;
 
 CREATE OPERATOR @~@ (
     LEFTARG = tsvector,
     RIGHTARG = proxquery,
-    FUNCTION = ts_prox_match
+    FUNCTION = ts_prox_recheck
 );
 
-ALTER FUNCTION ts_prox_match(tsvector, proxquery) SUPPORT ts_prox_query_support;
+ALTER FUNCTION ts_prox_recheck(tsvector, proxquery) SUPPORT ts_prox_query_support;
 "#,
     name = "proxquery_config_aware",
     requires = [
         ts_prox_query_skeleton,
-        ts_prox_match_cfg,
+        ts_prox_recheck_cfg,
         ts_prox_query_support,
         proxquery_build_query,
-        proxquery_match,
-        proxquery_is_analyzer
+        proxquery_recheck,
+        proxquery_is_analyzer,
+        "ts_prox_query_cfg_wrapper"
     ],
 );
 
@@ -509,7 +561,7 @@ mod tests {
         // so a normally-built document never holds a backslash lexeme — the term
         // matches nothing, via both the recheck and the full operator.
         let q = "$$'a\\b'$$"; // the DSL term  'a\b'
-        assert!(!b(&format!("SELECT ts_prox_match(to_tsvector('simple','a b'), {q})")));
+        assert!(!b(&format!("SELECT ts_prox_recheck(to_tsvector('simple','a b'), {q})")));
         assert!(!b(&format!("SELECT to_tsvector('simple','a b') @~@ {q}")));
         // It still compiles to a valid index skeleton (no error / NULL).
         assert!(b(&format!("SELECT ts_prox_query({q}) IS NOT NULL")));
@@ -591,17 +643,17 @@ mod tests {
     }
 
 
-    // --- ts_prox_match recheck + full pipeline -----------------------------
+    // --- ts_prox_recheck recheck + full pipeline -----------------------------
     fn proxmatch(doc: &str, q: &str) -> bool {
         let (doc, q) = (doc.replace('\'', "''"), q.replace('\'', "''"));
-        b(&format!("SELECT ts_prox_match(to_tsvector('simple','{doc}'), '{q}')"))
+        b(&format!("SELECT ts_prox_recheck(to_tsvector('simple','{doc}'), '{q}')"))
     }
     // Selection AND recheck together — what the proxsearch()-style wrapper does.
     fn proxfind(doc: &str, q: &str) -> bool {
         let (doc, q) = (doc.replace('\'', "''"), q.replace('\'', "''"));
         b(&format!(
             "SELECT to_tsvector('simple','{doc}') @@ ts_prox_query('{q}') \
-                 AND ts_prox_match(to_tsvector('simple','{doc}'), '{q}')"
+                 AND ts_prox_recheck(to_tsvector('simple','{doc}'), '{q}')"
         ))
     }
 
@@ -668,12 +720,12 @@ mod tests {
         assert!(proxmatch("a b", "a <~1> b")); //   …whereas <~1> does match adjacency
         // …but co-located lexemes (a@1 b@1) DO match `<0>` / `<~0>`.
         let tv = "$$'a':1 'b':1$$::tsvector"; // a and b at the same position
-        assert!(b(&format!("SELECT ts_prox_match({tv}, 'a <~0> b')")));
-        assert!(b(&format!("SELECT ts_prox_match({tv}, 'a <0> b')")));
+        assert!(b(&format!("SELECT ts_prox_recheck({tv}, 'a <~0> b')")));
+        assert!(b(&format!("SELECT ts_prox_recheck({tv}, 'a <0> b')")));
         // matches native tsquery exactly (the `<N> unchanged` promise).
         assert!(b(&format!("SELECT {tv} @@ to_tsquery('simple','a <0> b')")));
         // ordered `<-0>` (strictly before, at distance ≤0) is contradictory ⇒ false.
-        assert!(!b(&format!("SELECT ts_prox_match({tv}, 'a <-0> b')")));
+        assert!(!b(&format!("SELECT ts_prox_recheck({tv}, 'a <-0> b')")));
     }
 
     #[pg_test]
@@ -803,8 +855,8 @@ mod tests {
 
     #[pg_test]
     fn operator_index_path_matches_recheck_across_query_types() {
-        // @~@ IS `ts_prox_match` plus a planner support fn that, under a GIN index,
-        // rewrites it to `tsv @@ ts_prox_query(q) AND ts_prox_match(tsv, q)`. Driven by
+        // @~@ IS `ts_prox_recheck` plus a planner support fn that, under a GIN index,
+        // rewrites it to `tsv @@ ts_prox_query(q) AND ts_prox_recheck(tsv, q)`. Driven by
         // the SAME structured corpus as the function tests (the `match` table in the
         // markdown parity spec), this builds one indexed table from the distinct docs and
         // confirms, for every distinct query, that @~@ over the index (a) is actually
@@ -840,7 +892,7 @@ mod tests {
                    IF NOT plan_hit THEN RAISE EXCEPTION 'index not used for keyed query: %', q; END IF; \
                  END IF; \
                  SET LOCAL enable_seqscan = on; SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off; \
-                 EXECUTE format('SELECT coalesce(array_agg(id ORDER BY id), ''{}''::int[])::text FROM docs WHERE ts_prox_match(tsv, %L)', q) INTO s_seq; \
+                 EXECUTE format('SELECT coalesce(array_agg(id ORDER BY id), ''{}''::int[])::text FROM docs WHERE ts_prox_recheck(tsv, %L)', q) INTO s_seq; \
                  IF s_idx IS DISTINCT FROM s_seq THEN \
                    RAISE EXCEPTION '@~@ index path % differs from recheck % for query: %', s_idx, s_seq, q; \
                  END IF; \
@@ -898,12 +950,12 @@ mod tests {
         // Native AND selective (phrase / exact `<N>` / boolean): the `@~@` clause is
         // rewritten to a plain `tsv @@ <tsquery>` (a folded phrase literal), so the GIN
         // index serves it and the positional recheck is gone entirely — no `@~@`, no
-        // `ts_prox_match`. `a <2> b` is the near docs' exact gap (a@1 b@3) ⇒ 200 rows.
+        // `ts_prox_recheck`. `a <2> b` is the near docs' exact gap (a@1 b@3) ⇒ 200 rows.
         assert!(b("SELECT plan_has('a <2> b', '%Bitmap Index Scan%')"), "exact <N> must be index-served");
         assert!(!b("SELECT plan_has('a <2> b', '%@~@%')"), "exact <N> must drop the @~@ recheck");
-        assert!(!b("SELECT plan_has('a <2> b', '%ts_prox_match%')"), "exact <N> must drop the ts_prox_match recheck");
+        assert!(!b("SELECT plan_has('a <2> b', '%ts_prox_recheck%')"), "exact <N> must drop the ts_prox_recheck recheck");
         let ph = Spi::get_one::<i64>("SELECT count(*) FROM nt WHERE tsv @~@ 'a <2> b'").unwrap().unwrap();
-        let phre = Spi::get_one::<i64>("SELECT count(*) FROM nt WHERE ts_prox_match(tsv, 'a <2> b')").unwrap().unwrap();
+        let phre = Spi::get_one::<i64>("SELECT count(*) FROM nt WHERE ts_prox_recheck(tsv, 'a <2> b')").unwrap().unwrap();
         assert_eq!(ph, 200);
         assert_eq!(ph, phre);
 
@@ -921,7 +973,7 @@ mod tests {
         // would instead fold to a bare `@@ <const tsquery>` with neither marker.)
         // …and it still returns exactly the recheck's rows (the near docs only).
         let op = Spi::get_one::<i64>("SELECT count(*) FROM nt WHERE tsv @~@ 'a <~2> b'").unwrap().unwrap();
-        let re = Spi::get_one::<i64>("SELECT count(*) FROM nt WHERE ts_prox_match(tsv, 'a <~2> b')").unwrap().unwrap();
+        let re = Spi::get_one::<i64>("SELECT count(*) FROM nt WHERE ts_prox_recheck(tsv, 'a <~2> b')").unwrap().unwrap();
         assert_eq!(op, 200);
         assert_eq!(op, re);
 
@@ -931,6 +983,99 @@ mod tests {
         assert!(b("SELECT plan_has('a <~40> b', '%ts_prox_query(%')"), "fallback uses the presence skeleton");
         let op40 = Spi::get_one::<i64>("SELECT count(*) FROM nt WHERE tsv @~@ 'a <~40> b'").unwrap().unwrap();
         assert_eq!(op40, 400); // both near and far are within 40
+    }
+
+    #[pg_test]
+    fn exact_is_some_only_when_recheck_droppable() {
+        // Plain boolean / phrase / exact-`<N>` / prefix → the skeleton @@ IS the match,
+        // so the recheck is droppable (exact is non-NULL).
+        for q in ["a & b", "a | b", "foo", "\"x y\"", "a <2> b", "appl*",
+                  "a & \"x y\" & c", "(a | b) & c"] {
+            assert!(b(&format!("SELECT ts_prox_query_exact('{q}') IS NOT NULL")), "expected droppable: {q}");
+        }
+        // within/pre (native but NON-selective), not-within, suffix-glob, regex, document
+        // NOT → the recheck does real work, so exact is NULL (keep the two-clause form).
+        for q in ["a <~3> b", "a <-3> b", "a <!~3> b", "a <2> b <~3> c",
+                  "*ology", "##[0-9]+##", "a & !b", "study <~3> *ology"] {
+            assert!(b(&format!("SELECT ts_prox_query_exact('{q}') IS NULL")), "expected recheck-needed: {q}");
+        }
+    }
+
+    #[pg_test]
+    fn exact_template_folds_recheck_and_stays_correct() {
+        // The recommended self-folding form:
+        //   tsv @@ ts_prox_query(q) AND (ts_prox_query_exact(q) IS NOT NULL OR ts_prox_recheck(tsv,q))
+        // const-folds to one clause (no recheck) for an exact query, two clauses otherwise.
+        Spi::run("CREATE TEMP TABLE et(id serial, tsv tsvector)").unwrap();
+        Spi::run("INSERT INTO et(tsv) SELECT to_tsvector('simple','a x b w'||g) FROM generate_series(1,200) g").unwrap();
+        Spi::run("INSERT INTO et(tsv) SELECT to_tsvector('simple','a x x x x x b w'||g) FROM generate_series(1,200) g").unwrap();
+        Spi::run("CREATE INDEX ON et USING gin(tsv)").unwrap();
+        Spi::run("ANALYZE et").unwrap();
+        Spi::run("SET enable_seqscan = off").unwrap();
+        // Does the self-folding template's plan for `q` contain `pat`?
+        Spi::run(
+            "CREATE FUNCTION tpl_has(q text, pat text) RETURNS bool AS $$ \
+             DECLARE line text; hit bool := false; \
+             BEGIN FOR line IN EXECUTE \
+               'EXPLAIN SELECT count(*) FROM et WHERE tsv @@ ts_prox_query(' || quote_literal(q) || \
+               ') AND (ts_prox_query_exact(' || quote_literal(q) || ') IS NOT NULL OR ts_prox_recheck(tsv, ' || quote_literal(q) || '))' \
+             LOOP IF line LIKE pat THEN hit := true; END IF; END LOOP; RETURN hit; END $$ LANGUAGE plpgsql",
+        ).unwrap();
+
+        // Boolean `a & b`: exact is non-NULL ⇒ `(true OR recheck)` folds the recheck away —
+        // index-served, no ts_prox_recheck in the plan at all.
+        assert!(b("SELECT tpl_has('a & b', '%Bitmap Index Scan%')"), "boolean must be index-served");
+        assert!(!b("SELECT tpl_has('a & b', '%ts_prox_recheck%')"), "boolean must fold the recheck away");
+        // within `a <~2> b`: exact is NULL ⇒ `(false OR recheck)` keeps the recheck.
+        assert!(b("SELECT tpl_has('a <~2> b', '%ts_prox_recheck%')"), "within must keep the recheck");
+
+        // …and the template returns exactly the plain two-clause form's rows, both shapes.
+        let cnt = |sql: &str| Spi::get_one::<i64>(sql).unwrap().unwrap();
+        for q in ["a & b", "a <~2> b"] {
+            let tmpl = cnt(&format!(
+                "SELECT count(*) FROM et WHERE tsv @@ ts_prox_query('{q}') \
+                 AND (ts_prox_query_exact('{q}') IS NOT NULL OR ts_prox_recheck(tsv,'{q}'))"
+            ));
+            let two = cnt(&format!(
+                "SELECT count(*) FROM et WHERE tsv @@ ts_prox_query('{q}') AND ts_prox_recheck(tsv,'{q}')"
+            ));
+            assert_eq!(tmpl, two, "self-folding template must equal the two-clause form for {q}");
+        }
+    }
+
+    #[pg_test]
+    fn ts_prox_search_inlines_and_stays_index_served() {
+        // `ts_prox_search(tsv, q)` is the consolidated one-call form. It must INLINE so the
+        // planner sees the embedded `@@ ts_prox_query(q)` and uses the GIN index (an inlining
+        // failure would silently seq-scan — this test makes that loud), folding the recheck
+        // for a boolean query and keeping it for a proximity one.
+        Spi::run("CREATE TEMP TABLE st(id serial, tsv tsvector)").unwrap();
+        Spi::run("INSERT INTO st(tsv) SELECT to_tsvector('simple','a x b w'||g) FROM generate_series(1,200) g").unwrap();
+        Spi::run("INSERT INTO st(tsv) SELECT to_tsvector('simple','a x x x x x b w'||g) FROM generate_series(1,200) g").unwrap();
+        Spi::run("CREATE INDEX ON st USING gin(tsv)").unwrap();
+        Spi::run("ANALYZE st").unwrap();
+        Spi::run("SET enable_seqscan = off").unwrap();
+        Spi::run(
+            "CREATE FUNCTION s_plan_has(q text, pat text) RETURNS bool AS $$ \
+             DECLARE line text; hit bool := false; \
+             BEGIN FOR line IN EXECUTE 'EXPLAIN SELECT count(*) FROM st WHERE ts_prox_search(tsv, ' || quote_literal(q) || ')' \
+             LOOP IF line LIKE pat THEN hit := true; END IF; END LOOP; RETURN hit; END $$ LANGUAGE plpgsql",
+        ).unwrap();
+
+        // Headline guard: inlines + index-served (Bitmap Index Scan), never a seq scan.
+        assert!(b("SELECT s_plan_has('a & b', '%Bitmap Index Scan%')"), "ts_prox_search must inline + use the index (boolean)");
+        assert!(b("SELECT s_plan_has('a <~2> b', '%Bitmap Index Scan%')"), "ts_prox_search must inline + use the index (within)");
+        // Boolean folds the recheck away; within keeps it.
+        assert!(!b("SELECT s_plan_has('a & b', '%ts_prox_recheck%')"), "boolean must fold the recheck away");
+        assert!(b("SELECT s_plan_has('a <~2> b', '%ts_prox_recheck%')"), "within must keep the recheck");
+
+        // …and returns exactly the explicit two-clause form's rows, across shapes.
+        let cnt = |sql: &str| Spi::get_one::<i64>(sql).unwrap().unwrap();
+        for q in ["a & b", "a | b", "a <~2> b", "\"a x b\"", "a <2> b"] {
+            let one = cnt(&format!("SELECT count(*) FROM st WHERE ts_prox_search(tsv, '{q}')"));
+            let two = cnt(&format!("SELECT count(*) FROM st WHERE tsv @@ ts_prox_query('{q}') AND ts_prox_recheck(tsv,'{q}')"));
+            assert_eq!(one, two, "ts_prox_search must equal the two-clause form for {q}");
+        }
     }
 
     // --- compound operand combinations -----------------------------------
@@ -1036,41 +1181,41 @@ mod tests {
         Spi::run("SELECT ts_prox_query('*ology')").unwrap();
     }
 
-    #[pg_test(error = "ts_prox_match: a bare `*` matches everything; give it a literal part")]
+    #[pg_test(error = "ts_prox_recheck: a bare `*` matches everything; give it a literal part")]
     fn err_dangling_bare_star() {
         // A hanging bare `*` (`something *`, space-separated) is rejected at parse
         // time — it would match every lexeme. (Attached, `something*` is a normal
         // prefix search; see prefix_native_form_and_exact_term.)
-        Spi::run("SELECT ts_prox_match(to_tsvector('simple','something here'), 'something *')").unwrap();
+        Spi::run("SELECT ts_prox_recheck(to_tsvector('simple','something here'), 'something *')").unwrap();
     }
 
-    #[pg_test(error = "ts_prox_match: expected `)`")]
+    #[pg_test(error = "ts_prox_recheck: expected `)`")]
     fn err_unbalanced_parens() {
-        Spi::run("SELECT ts_prox_match(to_tsvector('simple','a b'), '(a <~5> b')").unwrap();
+        Spi::run("SELECT ts_prox_recheck(to_tsvector('simple','a b'), '(a <~5> b')").unwrap();
     }
 
-    #[pg_test(error = "ts_prox_match: not-within needs a direction: `<!~N>` (either order) or `<!-N>` (ordered)")]
+    #[pg_test(error = "ts_prox_recheck: not-within needs a direction: `<!~N>` (either order) or `<!-N>` (ordered)")]
     fn err_not_within_without_direction() {
         // dtSearch-style bare `w/N` and a directionless `<!N>` are both rejected.
-        Spi::run("SELECT ts_prox_match(to_tsvector('simple','a b'), 'a <!5> b')").unwrap();
+        Spi::run("SELECT ts_prox_recheck(to_tsvector('simple','a b'), 'a <!5> b')").unwrap();
     }
 
-    #[pg_test(error = "ts_prox_match: unexpected end of query")]
+    #[pg_test(error = "ts_prox_recheck: unexpected end of query")]
     fn err_trailing_operator() {
-        Spi::run("SELECT ts_prox_match(to_tsvector('simple','a b'), 'a &')").unwrap();
+        Spi::run("SELECT ts_prox_recheck(to_tsvector('simple','a b'), 'a &')").unwrap();
     }
 
-    #[pg_test(error = "ts_prox_match: invalid regex `[`")]
+    #[pg_test(error = "ts_prox_recheck: invalid regex `[`")]
     fn err_invalid_regex() {
         // A ##regex## that can't compile is a query bug → fail, don't suppress.
-        Spi::run("SELECT ts_prox_match(to_tsvector('simple','alpha beta'), '##[##')").unwrap();
+        Spi::run("SELECT ts_prox_recheck(to_tsvector('simple','alpha beta'), '##[##')").unwrap();
     }
 
-    #[pg_test(error = "ts_prox_match: invalid regex `[`")]
+    #[pg_test(error = "ts_prox_recheck: invalid regex `[`")]
     fn err_invalid_regex_fails_regardless_of_short_circuit() {
         // Validation is up front, so a malformed regex fails the query even when a
         // sibling branch (`alpha`) would have matched and short-circuited eval.
-        Spi::run("SELECT ts_prox_match(to_tsvector('simple','alpha beta'), 'alpha | ##[##')").unwrap();
+        Spi::run("SELECT ts_prox_recheck(to_tsvector('simple','alpha beta'), 'alpha | ##[##')").unwrap();
     }
 
     // --- config-aware surface (3-arg overloads + @~@ proxquery operator) ----
@@ -1078,10 +1223,10 @@ mod tests {
     #[pg_test]
     fn config_aware_english_stemming() {
         // The headline: a SURFACE query term matches the stored STEM under `english`.
-        assert!(b("SELECT ts_prox_match(to_tsvector('english','the running shoes'),'running <~2> shoes','english')"));
-        assert!(b("SELECT ts_prox_match(to_tsvector('english','the running shoes'),'run <~2> shoe','english')"));
+        assert!(b("SELECT ts_prox_recheck(to_tsvector('english','the running shoes'),'running <~2> shoes','english')"));
+        assert!(b("SELECT ts_prox_recheck(to_tsvector('english','the running shoes'),'run <~2> shoe','english')"));
         // The 2-arg simple path is literal — it does NOT match the stem (unchanged).
-        assert!(!b("SELECT ts_prox_match(to_tsvector('english','the running shoes'),'running <~2> shoes')"));
+        assert!(!b("SELECT ts_prox_recheck(to_tsvector('english','the running shoes'),'running <~2> shoes')"));
         // The skeleton is config-independent; only the wrapping config differs, so the
         // 3-arg selection picks the stemmed lexemes.
         assert_eq!(
@@ -1140,18 +1285,51 @@ mod tests {
     }
 
     #[pg_test]
+    fn ts_prox_search_config_aware() {
+        // The 3-arg `ts_prox_search(tsv, q, cfg)` — the one-call form for a non-`simple`
+        // column — must inline + drive the GIN index, and return exactly the explicit cfg
+        // two-clause form. (It keeps the recheck; config term resolution can fan out, so it
+        // does not fold like the 2-arg `simple` form.)
+        Spi::run("CREATE TEMP TABLE sct(id serial, tsv tsvector)").unwrap();
+        Spi::run("INSERT INTO sct(tsv) SELECT to_tsvector('english','the running shoes number '||g) FROM generate_series(1,300) g").unwrap();
+        Spi::run("CREATE INDEX ON sct USING gin(tsv)").unwrap();
+        Spi::run("ANALYZE sct").unwrap();
+        Spi::run("SET enable_seqscan = off").unwrap();
+        Spi::run(
+            "CREATE FUNCTION s3_plan_has(q text, pat text) RETURNS bool AS $$ \
+             DECLARE line text; hit bool := false; \
+             BEGIN FOR line IN EXECUTE 'EXPLAIN SELECT count(*) FROM sct WHERE ts_prox_search(tsv, ' || quote_literal(q) || ', ''english'')' \
+             LOOP IF line LIKE pat THEN hit := true; END IF; END LOOP; RETURN hit; END $$ LANGUAGE plpgsql",
+        ).unwrap();
+
+        // Inlines + index-served: the `@@ ts_prox_query(q, cfg)` clause drives the GIN index.
+        assert!(b("SELECT s3_plan_has('running <~2> shoes', '%Bitmap Index Scan%')"), "3-arg ts_prox_search must inline + use the index");
+        assert!(b("SELECT s3_plan_has('running & shoes', '%Bitmap Index Scan%')"), "3-arg ts_prox_search must inline + use the index (boolean)");
+
+        // Results identical to the explicit cfg two-clause form (english stems running→run, shoes→shoe).
+        let cnt = |sql: &str| Spi::get_one::<i64>(sql).unwrap().unwrap();
+        for q in ["running & shoes", "running <~2> shoes", "running <~1> number"] {
+            let one = cnt(&format!("SELECT count(*) FROM sct WHERE ts_prox_search(tsv, '{q}', 'english')"));
+            let two = cnt(&format!(
+                "SELECT count(*) FROM sct WHERE tsv @@ ts_prox_query('{q}', 'english') AND ts_prox_recheck(tsv, '{q}', 'english')"
+            ));
+            assert_eq!(one, two, "3-arg ts_prox_search must equal the cfg two-clause form for {q}");
+        }
+    }
+
+    #[pg_test]
     fn config_aware_user_defined_config() {
         // A user-defined config works exactly like a built-in — proxquery only ever
         // passes the regconfig you name into `to_tsvector`. (Custom config, no contrib
         // dependency: a copy of english under a different name.)
         Spi::run("DROP TEXT SEARCH CONFIGURATION IF EXISTS myeng").unwrap();
         Spi::run("CREATE TEXT SEARCH CONFIGURATION myeng (COPY = english)").unwrap();
-        assert!(b("SELECT ts_prox_match(to_tsvector('myeng','the running shoes'),'running <~2> shoes','myeng')"));
+        assert!(b("SELECT ts_prox_recheck(to_tsvector('myeng','the running shoes'),'running <~2> shoes','myeng')"));
         assert!(b("SELECT to_tsvector('myeng','the running shoes') @~@ proxquery('myeng','running <~2> shoes')"));
         // Two-clause form selects via the same custom config.
         assert!(b(
             "SELECT to_tsvector('myeng','the running shoes') @@ ts_prox_query('running <~2> shoes','myeng') \
-             AND ts_prox_match(to_tsvector('myeng','the running shoes'),'running <~2> shoes','myeng')"
+             AND ts_prox_recheck(to_tsvector('myeng','the running shoes'),'running <~2> shoes','myeng')"
         ));
     }
 
@@ -1160,16 +1338,16 @@ mod tests {
         // A glob's literal runs resolve through `cfg` just like a term — here `simple`,
         // whose `to_tsvector` Unicode-lowercases a run the ASCII-only query lexer leaves
         // alone. `*É` folds to `*é` and matches the stored lexeme `café` …
-        assert!(b("SELECT ts_prox_match(to_tsvector('simple','un CAFÉ noir'),'*É','simple')"));
+        assert!(b("SELECT ts_prox_recheck(to_tsvector('simple','un CAFÉ noir'),'*É','simple')"));
         // … but the accent is PRESERVED (folds case, not accent), so it does not match
         // the unaccented `cafe` — proving the feature is config-driven, not hardcoded.
-        assert!(!b("SELECT ts_prox_match(to_tsvector('simple','un cafe noir'),'*É','simple')"));
+        assert!(!b("SELECT ts_prox_recheck(to_tsvector('simple','un cafe noir'),'*É','simple')"));
         // The 2-arg `simple` path is unchanged: ASCII-only lower leaves `É`, so no match.
-        assert!(!b("SELECT ts_prox_match(to_tsvector('simple','un CAFÉ noir'),'*É')"));
+        assert!(!b("SELECT ts_prox_recheck(to_tsvector('simple','un CAFÉ noir'),'*É')"));
         // Verbatim fallback: a run resolving to 0/>1 lexemes (punctuated/alphanumeric)
         // is kept as-is — no empty result, no error, identical to the 2-arg behavior.
-        assert!(b("SELECT ts_prox_match(to_tsvector('simple','x foo.bar baz'),'foo.bar*','simple')"));
-        assert!(b("SELECT ts_prox_match(to_tsvector('simple','an abc123 token'),'abc123*','simple')"));
+        assert!(b("SELECT ts_prox_recheck(to_tsvector('simple','x foo.bar baz'),'foo.bar*','simple')"));
+        assert!(b("SELECT ts_prox_recheck(to_tsvector('simple','an abc123 token'),'abc123*','simple')"));
         // Operator form, leading-literal glob (index-drivable): folds through the cfg.
         assert!(b("SELECT to_tsvector('simple','this is confidential') @~@ proxquery('simple','con*ial')"));
     }
@@ -1197,16 +1375,16 @@ mod tests {
 
         // `?` / suffix / infix wildcards all fold their literal runs to the unaccented
         // lexeme form the column was built with.
-        assert!(b("SELECT ts_prox_match(to_tsvector('simple_unaccent','un café noir'),'caf?','simple_unaccent')"));
-        assert!(b("SELECT ts_prox_match(to_tsvector('simple_unaccent','bien paré ici'),'*ré','simple_unaccent')"));
+        assert!(b("SELECT ts_prox_recheck(to_tsvector('simple_unaccent','un café noir'),'caf?','simple_unaccent')"));
+        assert!(b("SELECT ts_prox_recheck(to_tsvector('simple_unaccent','bien paré ici'),'*ré','simple_unaccent')"));
         // `p` is recomputed from the FOLDED glob (`café*o` → `cafe*o`), so the prefix
         // scan keys off `cafe` and reaches `cafezinho`.
-        assert!(b("SELECT ts_prox_match(to_tsvector('simple_unaccent','o cafezinho'),'café*o','simple_unaccent')"));
+        assert!(b("SELECT ts_prox_recheck(to_tsvector('simple_unaccent','o cafezinho'),'café*o','simple_unaccent')"));
         // Operator form.
         assert!(b("SELECT to_tsvector('simple_unaccent','o cafezinho') @~@ proxquery('simple_unaccent','café*o')"));
         // The SAME query is accent-SENSITIVE on plain `simple` (no match) — the column's
         // config, not the library, decides whether accents are stripped.
-        assert!(!b("SELECT ts_prox_match(to_tsvector('simple','o cafezinho'),'café*o','simple')"));
+        assert!(!b("SELECT ts_prox_recheck(to_tsvector('simple','o cafezinho'),'café*o','simple')"));
 
         // GIN-index soundness on a folding column: the probe folds the glob prefix
         // (`'cafe':*`) and selects the candidate; the recheck — now folding the same way
@@ -1321,18 +1499,18 @@ mod tests {
         // within <~2> of `a` (distance 2); the bare parts (c@4, d@5) are not — which is
         // why the OR-of-forms query already works via the compound, with no parser work.
         let normal = "$$'a':1 'b':2 'c-d':3 'c':4 'd':5$$::tsvector";
-        assert!(b(&format!("SELECT ts_prox_match({normal}, $$a <~2> 'c-d'$$)")));
-        assert!(!b(&format!("SELECT ts_prox_match({normal}, $$a <~2> c$$)")));
-        assert!(!b(&format!("SELECT ts_prox_match({normal}, $$a <~2> d$$)")));
+        assert!(b(&format!("SELECT ts_prox_recheck({normal}, $$a <~2> 'c-d'$$)")));
+        assert!(!b(&format!("SELECT ts_prox_recheck({normal}, $$a <~2> c$$)")));
+        assert!(!b(&format!("SELECT ts_prox_recheck({normal}, $$a <~2> d$$)")));
 
         // Superimposed: c-d, c, d ALL at position 3 → every form is distance 2 from `a`,
         // so each disjunct hits, not just the compound. This is the only behavior a
         // custom parser would unlock — and it needs no change here.
         let sup = "$$'a':1 'b':2 'c-d':3 'c':3 'd':3$$::tsvector";
-        assert!(b(&format!("SELECT ts_prox_match({sup}, $$a <~2> 'c-d'$$)")));
-        assert!(b(&format!("SELECT ts_prox_match({sup}, $$a <~2> c$$)")));
-        assert!(b(&format!("SELECT ts_prox_match({sup}, $$a <~2> d$$)")));
-        assert!(b(&format!("SELECT ts_prox_match({sup}, $$a <~2> (c | d | 'c-d')$$)")));
+        assert!(b(&format!("SELECT ts_prox_recheck({sup}, $$a <~2> 'c-d'$$)")));
+        assert!(b(&format!("SELECT ts_prox_recheck({sup}, $$a <~2> c$$)")));
+        assert!(b(&format!("SELECT ts_prox_recheck({sup}, $$a <~2> d$$)")));
+        assert!(b(&format!("SELECT ts_prox_recheck({sup}, $$a <~2> (c | d | 'c-d')$$)")));
     }
 
     #[pg_test]
@@ -1357,7 +1535,7 @@ mod tests {
         // as tf_nfd). `m` is the prox_icu recheck: does the bare query term find the doc?
         let m = |doc: &str, q: &str| -> bool {
             b(&format!(
-                "SELECT proxquery_match(proxquery_to_tsvector({doc}, 'prox_icu'), {q}, 'prox_icu')"
+                "SELECT proxquery_recheck(proxquery_to_tsvector({doc}, 'prox_icu'), {q}, 'prox_icu')"
             ))
         };
         // Wins — the canonicalizing fold makes the clean spelling find the exotic text: a
@@ -1423,7 +1601,7 @@ mod tests {
         // (seq scan) — the GIN index path is a later phase.
         let m = |doc: &str, q: &str| -> bool {
             b(&format!(
-                "SELECT proxquery_match(proxquery_to_tsvector($d${doc}$d$, 'prox_icu'), \
+                "SELECT proxquery_recheck(proxquery_to_tsvector($d${doc}$d$, 'prox_icu'), \
                  $q${q}$q$, 'prox_icu')"
             ))
         };
@@ -1448,7 +1626,7 @@ mod tests {
         assert!(m("mail a@b.com here", "mail <-> a"));
         // The prox_unicode analyzer resolves symmetrically too (per-char CJK).
         assert!(b(
-            "SELECT proxquery_match(proxquery_to_tsvector('中文 文档', 'prox_unicode'), \
+            "SELECT proxquery_recheck(proxquery_to_tsvector('中文 文档', 'prox_unicode'), \
              '中', 'prox_unicode')"
         ));
     }
@@ -1457,7 +1635,7 @@ mod tests {
     fn analyzer_index_path() {
         // The analyzer `@~@ proxquery(...)` overload must be GIN-index-served (the
         // probe folds query atoms the same way the column was built) AND agree with the
-        // bare `proxquery_match` recheck (the recheck⟹probe soundness invariant).
+        // bare `proxquery_recheck` recheck (the recheck⟹probe soundness invariant).
         Spi::run("CREATE TEMP TABLE adocs(id serial primary key, tsv tsvector)").unwrap();
         // Distinct docs duplicated + noise, so the planner prefers the index.
         Spi::run(
@@ -1510,7 +1688,7 @@ mod tests {
             .unwrap()
             .unwrap();
             let recheck = Spi::get_one::<i64>(&format!(
-                "SELECT count(*) FROM adocs WHERE proxquery_match(tsv, '{q}', 'prox_icu')"
+                "SELECT count(*) FROM adocs WHERE proxquery_recheck(tsv, '{q}', 'prox_icu')"
             ))
             .unwrap()
             .unwrap();
@@ -1529,7 +1707,7 @@ mod tests {
         // symmetrically on both sides.
         let m = |doc: &str, an: &str, q: &str| -> bool {
             b(&format!(
-                "SELECT proxquery_match(proxquery_to_tsvector($d${doc}$d$, '{an}'), \
+                "SELECT proxquery_recheck(proxquery_to_tsvector($d${doc}$d$, '{an}'), \
                  $q${q}$q$, '{an}')"
             ))
         };
@@ -1553,7 +1731,7 @@ mod tests {
         // symmetrically on both sides. Bare presets are unaffected (no dict, no cost).
         let m = |doc: &str, an: &str, q: &str| -> bool {
             b(&format!(
-                "SELECT proxquery_match(proxquery_to_tsvector($d${doc}$d$, '{an}'), \
+                "SELECT proxquery_recheck(proxquery_to_tsvector($d${doc}$d$, '{an}'), \
                  $q${q}$q$, '{an}')"
             ))
         };
@@ -1657,7 +1835,7 @@ mod tests {
         // precision escape hatch: resolved EXACTLY, it matches only the accented spelling.
         let m = |doc: &str, q: &str| -> bool {
             b(&format!(
-                "SELECT proxquery_match(proxquery_to_tsvector($d${doc}$d$, 'prox_icu'), \
+                "SELECT proxquery_recheck(proxquery_to_tsvector($d${doc}$d$, 'prox_icu'), \
                  $q${q}$q$, 'prox_icu')"
             ))
         };
@@ -1684,7 +1862,7 @@ mod tests {
         // apostrophe full-form is reachable as a literal `'…'` (resolved exactly).
         let m = |doc: &str, q: &str| -> bool {
             b(&format!(
-                "SELECT proxquery_match(proxquery_to_tsvector($d${doc}$d$, 'prox_icu'), \
+                "SELECT proxquery_recheck(proxquery_to_tsvector($d${doc}$d$, 'prox_icu'), \
                  $q${q}$q$, 'prox_icu')"
             ))
         };
@@ -1718,7 +1896,7 @@ mod tests {
         // implementations by the SQL corpus: litErr1/litErr2 and litq1–litq3.)
         let m = |doc: &str, q: &str| -> bool {
             b(&format!(
-                "SELECT proxquery_match(proxquery_to_tsvector($d${doc}$d$, 'prox_icu'), \
+                "SELECT proxquery_recheck(proxquery_to_tsvector($d${doc}$d$, 'prox_icu'), \
                  $q${q}$q$, 'prox_icu')"
             ))
         };
@@ -1762,7 +1940,7 @@ mod tests {
             "SELECT coalesce(string_agg(label || $$: got=$$ || got || $$ want=$$ || expected, E'\\n' \
                  ORDER BY label), '') \
              FROM (SELECT label, expected, \
-                      proxquery_match(proxquery_to_tsvector(doc, analyzer), query, analyzer)::text AS got \
+                      proxquery_recheck(proxquery_to_tsvector(doc, analyzer), query, analyzer)::text AS got \
                    FROM _prox_an) s \
              WHERE got IS DISTINCT FROM expected",
         )
@@ -1797,7 +1975,7 @@ mod tests {
                      IF NOT plan_hit THEN RAISE EXCEPTION 'analyzer % query [%] did not use the index', a, q; END IF; \
                    END IF; \
                    SET LOCAL enable_seqscan=on; SET LOCAL enable_indexscan=off; SET LOCAL enable_bitmapscan=off; \
-                   EXECUTE format('SELECT count(*) FROM _ai WHERE proxquery_match(tsv, %L, %L)', q, a) INTO n_seq; \
+                   EXECUTE format('SELECT count(*) FROM _ai WHERE proxquery_recheck(tsv, %L, %L)', q, a) INTO n_seq; \
                    IF n_idx IS DISTINCT FROM n_seq THEN \
                      RAISE EXCEPTION 'analyzer % query [%]: index=% recheck=% (soundness)', a, q, n_idx, n_seq; \
                    END IF; \
@@ -1832,6 +2010,67 @@ mod tests {
     fn pure_sql_matches_extension_fuzz() {
         Spi::run(include_str!("../sql/proxquery_pure.sql")).expect("load pure-SQL port");
         Spi::run(include_str!("../sql/proxquery_fuzz_test.sql")).expect("differential fuzz test");
+    }
+
+    // Smoke test: every ```sql block in README.md must run without error, so a renamed
+    // function or broken syntax the README still references fails CI loudly. Results are NOT
+    // checked here — examples with expected output (e.g. the café/cafe rows) are asserted in
+    // their own dedicated tests. The README is written for reading, not running, so the test
+    // absorbs three setup assumptions: (1) `CREATE EXTENSION proxquery` is already installed →
+    // skip that block; (2) the early examples query a `docs(body_tsv)` table the README never
+    // shows creating, and the analyzer section later recreates `docs` with its own schema →
+    // seed a `docs(body_tsv)` fixture and DROP it before a `CREATE TABLE docs`; (3) the
+    // custom-config example needs the `unaccent` contrib → skip it when it isn't available.
+    #[pg_test]
+    fn readme_examples_run_without_error() {
+        // The pure-SQL port (schema `proxquery`) backs the `proxquery.ts_prox_search`
+        // examples; the extension (schema `public`) backs `@~@` / `proxquery(...)` /
+        // `proxquery_to_tsvector`. Put both on the search_path.
+        Spi::run(include_str!("../sql/proxquery_pure.sql")).expect("load pure-SQL port");
+        Spi::run("SET search_path = public, proxquery, pg_catalog").unwrap();
+        Spi::run("CREATE TABLE docs(id bigserial, body_tsv tsvector)").unwrap();
+        let has_unaccent = Spi::get_one::<i64>(
+            "SELECT count(*) FROM pg_available_extensions WHERE name = 'unaccent'",
+        )
+        .unwrap()
+        .unwrap_or(0)
+            > 0;
+
+        let readme = include_str!("../README.md");
+        let (mut total, mut ran, mut in_sql) = (0, 0, false);
+        let mut buf = String::new();
+        for line in readme.lines() {
+            if in_sql {
+                if line.trim_start().starts_with("```") {
+                    in_sql = false;
+                    let block = buf.trim().to_string();
+                    total += 1;
+                    if block.is_empty() || block.starts_with("CREATE EXTENSION proxquery") {
+                        continue; // already installed in the test
+                    }
+                    if block.contains("unaccent") && !has_unaccent {
+                        continue; // contrib not available here
+                    }
+                    // the analyzer section recreates `docs` with its own schema — drop the fixture first
+                    let sql = if block.contains("CREATE TABLE docs") {
+                        format!("DROP TABLE IF EXISTS docs CASCADE;\n{block}")
+                    } else {
+                        block.clone()
+                    };
+                    Spi::run(&sql).unwrap_or_else(|e| {
+                        panic!("README sql block #{total} failed: {e:?}\n--- block ---\n{block}\n-------------")
+                    });
+                    ran += 1;
+                } else {
+                    buf.push_str(line);
+                    buf.push('\n');
+                }
+            } else if line.trim_start().starts_with("```sql") {
+                in_sql = true;
+                buf.clear();
+            }
+        }
+        assert!(ran >= 4, "expected to run the README's sql examples; ran {ran} of {total} blocks");
     }
 }
 

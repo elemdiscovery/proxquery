@@ -6,10 +6,10 @@
 --   * pure-SQL port      -> proxquery schema  (sql/proxquery_pure.sql)
 -- For each query shape we report the candidate count (rows the @@ skeleton
 -- selects), the match count, and avg server-side ms for three forms:
---   ext_op_ms    : extension single operator `tsv @~@ q`  (support fn: index + recheck)
---   ext_2cl_ms   : extension, written as the portable two clauses
---   pure_2cl_ms  : pure-SQL port, the same two clauses
---   slowdown     : pure_2cl_ms / ext_2cl_ms  (the apples-to-apples cost of going binary-free)
+--   ext_op_ms      : extension single operator `tsv @~@ q`  (support fn: index + recheck)
+--   ext_search_ms  : extension via the consolidated `ts_prox_search(tsv, q)`
+--   pure_search_ms : pure-SQL port via the same `ts_prox_search`
+--   slowdown       : pure_search_ms / ext_search_ms  (apples-to-apples cost of going binary-free)
 -- A per-query parity column (`disagree`) must be 0 — the two implementations
 -- must select the identical row set on this corpus.
 --
@@ -89,6 +89,11 @@ SELECT count(*) AS docs,
 FROM bench;
 
 -- ---- timing harness: avg server-side ms over `iters` runs, after a warmup ---
+-- `q` MUST embed the DSL string as a LITERAL (callers use format(... %L ...)). Plain
+-- `EXECUTE q` re-plans the literal each run with no plan cache, so every run is a custom
+-- plan where `ts_prox_search` inlines and its recheck folds — we time the real index-served
+-- plan. Do NOT switch to `EXECUTE ... USING $1` / `PREPARE`: a generic plan can't const-fold
+-- the query and silently stops the fold, making the timings measure the wrong plan.
 CREATE OR REPLACE FUNCTION bench_ms(q text, iters int) RETURNS numeric
 LANGUAGE plpgsql AS $$
 DECLARE t0 timestamptz; t1 timestamptz; i int; sink bigint;
@@ -101,10 +106,12 @@ BEGIN
 END $$;
 
 -- One row of the comparison for a DSL query `q`: counts, three timings, the
--- pure/ext slowdown, and a pure-vs-extension parity check (must be 0).
+-- pure/ext slowdown, and a pure-vs-extension parity check (must be 0). The portable
+-- form is the consolidated `ts_prox_search(tsv, q)` (index selection + a recheck that
+-- folds away when the skeleton is exact); ext_search is the apples-to-apples denominator.
 CREATE OR REPLACE FUNCTION bench_row(q text, iters int)
 RETURNS TABLE(candidates bigint, matches bigint,
-              ext_op_ms numeric, ext_2cl_ms numeric, pure_2cl_ms numeric,
+              ext_op_ms numeric, ext_search_ms numeric, pure_search_ms numeric,
               slowdown numeric, disagree bigint)
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -112,18 +119,18 @@ BEGIN
     INTO candidates;
   EXECUTE format('SELECT count(*) FROM bench WHERE body_tsv @~@ %L', q)
     INTO matches;
-  ext_op_ms   := bench_ms(format('SELECT count(*) FROM bench WHERE body_tsv @~@ %L', q), iters);
-  ext_2cl_ms  := bench_ms(format('SELECT count(*) FROM bench WHERE body_tsv @@ public.ts_prox_query(%L) AND public.ts_prox_match(body_tsv,%L)', q, q), iters);
-  pure_2cl_ms := bench_ms(format('SELECT count(*) FROM bench WHERE body_tsv @@ proxquery.ts_prox_query(%L) AND proxquery.ts_prox_match(body_tsv,%L)', q, q), iters);
-  slowdown    := round(pure_2cl_ms / nullif(ext_2cl_ms, 0), 1);
+  ext_op_ms      := bench_ms(format('SELECT count(*) FROM bench WHERE body_tsv @~@ %L', q), iters);
+  ext_search_ms  := bench_ms(format('SELECT count(*) FROM bench WHERE public.ts_prox_search(body_tsv, %L)', q), iters);
+  pure_search_ms := bench_ms(format('SELECT count(*) FROM bench WHERE proxquery.ts_prox_search(body_tsv, %L)', q), iters);
+  slowdown       := round(pure_search_ms / nullif(ext_search_ms, 0), 1);
   EXECUTE format($p$
     SELECT count(*) FROM (
       (SELECT id FROM bench WHERE body_tsv @~@ %L
-       EXCEPT SELECT id FROM bench WHERE body_tsv @@ proxquery.ts_prox_query(%L) AND proxquery.ts_prox_match(body_tsv,%L))
+       EXCEPT SELECT id FROM bench WHERE proxquery.ts_prox_search(body_tsv, %L))
       UNION ALL
-      (SELECT id FROM bench WHERE body_tsv @@ proxquery.ts_prox_query(%L) AND proxquery.ts_prox_match(body_tsv,%L)
+      (SELECT id FROM bench WHERE proxquery.ts_prox_search(body_tsv, %L)
        EXCEPT SELECT id FROM bench WHERE body_tsv @~@ %L)
-    ) d $p$, q, q, q, q, q, q)
+    ) d $p$, q, q, q, q)
     INTO disagree;
   RETURN NEXT;
 END $$;
@@ -132,9 +139,11 @@ END $$;
 \echo '== pure-SQL port vs native extension (avg ms/query; disagree must be 0) =='
 CREATE TEMP TABLE bench_results AS
 SELECT t.q AS query, r.candidates, r.matches,
-       r.ext_op_ms, r.ext_2cl_ms, r.pure_2cl_ms, r.slowdown, r.disagree
+       r.ext_op_ms, r.ext_search_ms, r.pure_search_ms, r.slowdown, r.disagree
 FROM (VALUES
-        ('a <~3> b'),
+        ('a & b'),                       -- boolean: ts_prox_search folds the recheck away
+        ('a | b'),                       --   "       (skeleton is exact ⇒ no re-detoast)
+        ('a <~3> b'),                    -- proximity: recheck does real work (kept)
         ('a <~3> b <~3> c'),
         ('confidential <!~5> email'),
         ('ssn <~3> ##[0-9]{9}##')
@@ -155,20 +164,17 @@ BEGIN
     RAISE NOTICE 'parity: pure port and extension agree on all % queries', (SELECT count(*) FROM bench_results);
 END $$;
 
+-- `ts_prox_search` inlines, so the planner sees the `@@ ts_prox_query(q)` clause and uses
+-- the GIN index. For a boolean (recheck-droppable) query the recheck folds away entirely —
+-- Bitmap Index Scan with NO Filter, no per-row re-detoast.
 \echo ''
-\echo '== plan: pure two-clause is GIN-index-served (Bitmap Index Scan + recheck Filter) =='
+\echo '== plan: ts_prox_search on a boolean query folds the recheck away (Bitmap Index, no Filter) =='
 EXPLAIN (COSTS off, TIMING off, SUMMARY off)
-SELECT count(*) FROM bench
-WHERE body_tsv @@ proxquery.ts_prox_query('a <~3> b')
-  AND proxquery.ts_prox_match(body_tsv, 'a <~3> b');
+SELECT count(*) FROM bench WHERE proxquery.ts_prox_search(body_tsv, 'a & b');
 
--- The @~@ operator on a within/pre shape must be served the SAME way: the planner
--- support keeps the selective `a & b` presence skeleton as the Index Cond + the `@~@`
--- positional recheck as the heap Filter. (It must NOT rewrite the clause to the native
--- `<~>` OR-expansion, which is non-selective and the planner mis-estimates into a seq
--- scan — the within pessimization. Only phrase/exact/boolean are rewritten to a bare
--- native `@@` that drops the recheck.) Expect: Bitmap Index Scan on `ts_prox_query(...)`.
+-- For a within/pre shape the recheck does real work, so it is kept as the heap Filter over
+-- the selective `a & b` presence skeleton — still index-served, never a seq scan.
 \echo ''
-\echo '== plan: the @~@ operator (within) is index-served via the a&b skeleton, NOT a seq scan =='
+\echo '== plan: ts_prox_search on a within query keeps the recheck Filter (still index-served) =='
 EXPLAIN (COSTS off, TIMING off, SUMMARY off)
-SELECT count(*) FROM bench WHERE body_tsv @~@ 'a <~3> b';
+SELECT count(*) FROM bench WHERE proxquery.ts_prox_search(body_tsv, 'a <~3> b');

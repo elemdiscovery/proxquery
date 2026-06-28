@@ -66,6 +66,12 @@ INSERT INTO phase_t VALUES ('corpus (generate + GIN)', clock_timestamp());
 
 -- ================================================================= benchmark
 -- avg server-side ms over `iters` runs, after a warmup that also primes caches.
+-- `q` MUST be a fully-formed query with the DSL string embedded as a LITERAL (callers
+-- build it with format(... %L ...)). Plain `EXECUTE q` re-plans the literal on every run
+-- with no plan cache, so each run is a custom plan where `ts_prox_search` inlines and its
+-- recheck folds — i.e. we time the real index-served plan. Do NOT switch to `EXECUTE ...
+-- USING $1` or `PREPARE`: a parameterized/generic plan can't const-fold the query and
+-- silently stops the inlining/fold, which would make the timings measure the wrong plan.
 CREATE OR REPLACE FUNCTION bench_ms(q text, iters int) RETURNS numeric
 LANGUAGE plpgsql AS $$
 DECLARE t0 timestamptz; t1 timestamptz; i int; sink bigint;
@@ -79,7 +85,7 @@ END $$;
 
 DROP TABLE IF EXISTS results;
 CREATE TABLE results(id int, shape text, q text, candidates bigint, matches bigint,
-                     ext_op_ms numeric, ext_2cl_ms numeric, pure_2cl_ms numeric, disagree bigint);
+                     ext_op_ms numeric, ext_search_ms numeric, pure_search_ms numeric, disagree bigint);
 
 SET lb.iters     = :iters;
 SET lb.with_pure = :with_pure;
@@ -92,28 +98,29 @@ DECLARE
   do_pure  bool := current_setting('lb.with_pure')::int = 1;
   r        record;
   cand     bigint; matc bigint; pmatc bigint;
-  exop     numeric; ex2 numeric; pu2 numeric; dis bigint;
+  exop     numeric; exs numeric; pus numeric; dis bigint;
 BEGIN
   FOR r IN SELECT id, shape, q FROM queries ORDER BY id LOOP
     EXECUTE format('SELECT count(*) FROM corpus WHERE body_tsv @@ public.ts_prox_query(%L)', r.q) INTO cand;
     EXECUTE format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q) INTO matc;
     exop := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q), it);
     IF do_pure THEN
-      -- ext_2cl is the apples-to-apples denominator for the pure slowdown ratio;
-      -- it is ~identical to ext_op (the operator IS the two-clause form), so it is
-      -- only worth timing when the pure port is also being timed.
-      ex2  := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @@ public.ts_prox_query(%L) AND public.ts_prox_match(body_tsv,%L)', r.q, r.q), it);
+      -- The consolidated `ts_prox_search` is the recommended portable form (it inlines to
+      -- the index-selection clause plus a recheck that folds away when the query's skeleton
+      -- is exact). ext_search is the apples-to-apples denominator for the pure slowdown
+      -- ratio — same form, different engine — so it is only timed alongside the pure port.
+      exs  := bench_ms(format('SELECT count(*) FROM corpus WHERE public.ts_prox_search(body_tsv, %L)', r.q), it);
       -- Parity here is a per-query match-COUNT check (cheap): a differing count
       -- proves a differing row set. The exhaustive row-set identity guarantee is
       -- the matrix job's dedicated pure_sql_port_matches_extension test; this is
       -- a perf + smoke run, so we keep the parity probe to one extra pure count.
-      EXECUTE format('SELECT count(*) FROM corpus WHERE body_tsv @@ proxquery.ts_prox_query(%L) AND proxquery.ts_prox_match(body_tsv,%L)', r.q, r.q) INTO pmatc;
-      pu2 := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @@ proxquery.ts_prox_query(%L) AND proxquery.ts_prox_match(body_tsv,%L)', r.q, r.q), it);
+      EXECUTE format('SELECT count(*) FROM corpus WHERE proxquery.ts_prox_search(body_tsv, %L)', r.q) INTO pmatc;
+      pus := bench_ms(format('SELECT count(*) FROM corpus WHERE proxquery.ts_prox_search(body_tsv, %L)', r.q), it);
       dis := abs(matc - pmatc);
     ELSE
-      ex2 := NULL; pu2 := NULL; dis := NULL;
+      exs := NULL; pus := NULL; dis := NULL;
     END IF;
-    INSERT INTO results VALUES (r.id, r.shape, r.q, cand, matc, exop, ex2, pu2, dis);
+    INSERT INTO results VALUES (r.id, r.shape, r.q, cand, matc, exop, exs, pus, dis);
   END LOOP;
 END $run$;
 INSERT INTO phase_t VALUES ('searches', clock_timestamp());
@@ -136,8 +143,8 @@ SELECT count(*)                          AS queries,
        round(percentile_cont(0.5)  WITHIN GROUP (ORDER BY ext_op_ms)::numeric, 2)  AS ext_op_p50,
        round(percentile_cont(0.95) WITHIN GROUP (ORDER BY ext_op_ms)::numeric, 2)  AS ext_op_p95,
        round(max(ext_op_ms), 2)          AS ext_op_max,
-       round(avg(pure_2cl_ms), 2)        AS pure_avg,
-       round(avg(pure_2cl_ms) / nullif(avg(ext_2cl_ms), 0), 1) AS slowdown
+       round(avg(pure_search_ms), 2)     AS pure_avg,
+       round(avg(pure_search_ms) / nullif(avg(ext_search_ms), 0), 1) AS slowdown
 FROM results;
 
 \echo ''
@@ -146,33 +153,68 @@ SELECT shape,
        count(*)                   AS n,
        round(avg(candidates))     AS avg_cand,
        round(avg(matches))        AS avg_match,
-       round(avg(ext_op_ms), 2)   AS ext_op_ms,
-       round(avg(ext_2cl_ms), 2)  AS ext_2cl_ms,
-       round(avg(pure_2cl_ms), 2) AS pure_2cl_ms,
-       round(avg(pure_2cl_ms) / nullif(avg(ext_2cl_ms), 0), 1) AS slowdown
+       round(avg(ext_op_ms), 2)      AS ext_op_ms,
+       round(avg(ext_search_ms), 2)  AS ext_search_ms,
+       round(avg(pure_search_ms), 2) AS pure_search_ms,
+       round(avg(pure_search_ms) / nullif(avg(ext_search_ms), 0), 1) AS slowdown
 FROM results
 GROUP BY shape
 ORDER BY ext_op_ms DESC;
 
 -- ------------------------------------------------------------- pushdown plans
--- Plan-shape guard, surfaced in the PR comment. A representative within/pre query
--- (taken from the generated mix, so it uses real corpus terms) must stay GIN-index-
--- served via the selective `a & b` presence skeleton + a positional recheck — the
--- `@~@` operator must NOT rewrite it to the native `<~>` OR-expansion, which is
--- non-selective and the planner mis-estimates into a sequential scan. Both the operator
--- and the portable two-clause form should show a Bitmap Index Scan on the skeleton.
+-- Plan-shape guards, surfaced in the PR comment, using real queries from the generated
+-- mix. (1) A within/pre query via the `@~@` operator must stay GIN-index-served via the
+-- selective `a & b` skeleton + a positional recheck — NOT rewritten to the native `<~>`
+-- OR-expansion, which is non-selective and the planner mis-estimates into a seq scan.
+-- (2) The recommended `ts_prox_search` must inline + use the index, and on a boolean query
+-- fold the recheck away entirely (Bitmap Index Scan, no Filter — no per-row re-detoast).
 SELECT coalesce((SELECT q FROM queries WHERE shape = 'within' ORDER BY id LIMIT 1),
                 'a <~5> b') AS within_q \gset
+SELECT coalesce((SELECT q FROM queries WHERE shape IN ('and2','or2','single') ORDER BY id LIMIT 1),
+                'a & b') AS bool_q \gset
 \echo ''
 \echo '== plan: @~@ within is index-served via the a&b skeleton (not a seq scan) =='
 EXPLAIN (COSTS off, TIMING off, SUMMARY off)
 SELECT count(*) FROM corpus WHERE body_tsv @~@ :'within_q';
 \echo ''
-\echo '== plan: pure two-clause is GIN-index-served (Bitmap Index Scan + recheck Filter) =='
+\echo '== plan: ts_prox_search on a boolean query folds the recheck away (Bitmap Index, no Filter) =='
 EXPLAIN (COSTS off, TIMING off, SUMMARY off)
-SELECT count(*) FROM corpus
-WHERE body_tsv @@ proxquery.ts_prox_query(:'within_q')
-  AND proxquery.ts_prox_match(body_tsv, :'within_q');
+SELECT count(*) FROM corpus WHERE proxquery.ts_prox_search(body_tsv, :'bool_q');
+
+-- Gate the two plan-shape guarantees (selectivity-independent, so they don't flake on the
+-- planner's index-vs-seqscan choice): a silent regression must FAIL the run, not just read
+-- as slow timings. (1) the `@~@` within must keep its `@~@` positional recheck — losing it
+-- means within was rewritten to the non-selective native OR-expansion (the seq-scan
+-- pessimization). (2) `ts_prox_search` must inline (no opaque `ts_prox_search(` left in the
+-- plan, else it silently seq-scans) and fold the recheck away on a boolean query.
+SET lb.within_q = :'within_q';
+SET lb.bool_q   = :'bool_q';
+DO $plan$
+DECLARE
+  line text;
+  op_keeps_recheck boolean := false;
+  search_inlined   boolean := true;
+  search_folded    boolean := true;
+BEGIN
+  FOR line IN EXECUTE format('EXPLAIN SELECT count(*) FROM corpus WHERE body_tsv @~@ %L',
+                             current_setting('lb.within_q')) LOOP
+    IF line LIKE '%@~@%' THEN op_keeps_recheck := true; END IF;
+  END LOOP;
+  FOR line IN EXECUTE format('EXPLAIN SELECT count(*) FROM corpus WHERE proxquery.ts_prox_search(body_tsv, %L)',
+                             current_setting('lb.bool_q')) LOOP
+    IF line LIKE '%ts_prox_search(%' THEN search_inlined := false; END IF;
+    IF line LIKE '%ts_prox_recheck%' OR line LIKE '%_prox_recheck%' THEN search_folded := false; END IF;
+  END LOOP;
+  IF NOT op_keeps_recheck THEN
+    RAISE EXCEPTION 'plan guard: @~@ within [%] lost its recheck — within rewritten to the native OR-expansion (seq-scan pessimization)', current_setting('lb.within_q');
+  END IF;
+  IF NOT search_inlined THEN
+    RAISE EXCEPTION 'plan guard: ts_prox_search [%] did not inline — it would silently seq-scan', current_setting('lb.bool_q');
+  END IF;
+  IF NOT search_folded THEN
+    RAISE EXCEPTION 'plan guard: ts_prox_search [%] did not fold the recheck on a boolean query', current_setting('lb.bool_q');
+  END IF;
+END $plan$;
 
 -- Parity: with the pure port enabled, every query's extension and pure match
 -- counts must agree. Reported as a visible row, then gated (timings on a shared

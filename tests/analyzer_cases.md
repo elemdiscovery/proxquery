@@ -2,7 +2,7 @@
 
 Extension-only: exercises the full DSL operator surface under the custom tokenizer.
 Loaded by `corpus::load_analyzer_ops`; run by the `analyzer_operator_corpus` `#[pg_test]`,
-which asserts, for every row, that the `proxquery_match` recheck equals `expected`, and
+which asserts, for every row, that the `proxquery_recheck` recheck equals `expected`, and
 for every distinct query that the GIN-indexed `@~@` result equals the bare recheck
 (probe soundness) and that the plan uses the index when the query carries a key.
 

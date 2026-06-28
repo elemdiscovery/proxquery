@@ -612,7 +612,7 @@ pub fn to_tsquery_string(input: &str) -> Result<String, String> {
 //
 // For the common bounded-proximity shapes the positional test can be expressed as
 // a native `tsquery` and evaluated by Postgres's own (fast, C) phrase engine in the
-// GIN `@@` heap recheck — so the custom `ts_prox_match` recheck is dropped entirely
+// GIN `@@` heap recheck — so the custom `ts_prox_recheck` recheck is dropped entirely
 // (the planner support fn marks the index condition non-lossy). within/pre lower to
 // an OR over exact gaps, which is exactly the proximity predicate:
 //   a <~n> b  ≡  OR_{k=0..n} (a <k> b | b <k> a)   (either order, |Δ| ≤ n)

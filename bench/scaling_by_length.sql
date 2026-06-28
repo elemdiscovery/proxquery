@@ -74,8 +74,8 @@ BEGIN
     EXECUTE 'SELECT array_agg(body_tsv) FROM scorpus' INTO vs;   -- detoast ONCE, into memory
     -- warm both rechecks (compile cached plans) before timing anything.
     FOREACH v IN ARRAY vs LOOP
-        PERFORM public.ts_prox_match(v, q);
-        PERFORM proxquery.ts_prox_match(v, q);
+        PERFORM public.ts_prox_recheck(v, q);
+        PERFORM proxquery.ts_prox_recheck(v, q);
     END LOOP;
 
     t0 := clock_timestamp();
@@ -84,12 +84,12 @@ BEGIN
     floor_ms := round(extract(epoch FROM (t1 - t0)) * 1000.0 / iters, 2);
 
     t0 := clock_timestamp();
-    FOR i IN 1..iters LOOP FOREACH v IN ARRAY vs LOOP PERFORM public.ts_prox_match(v, q); END LOOP; END LOOP;
+    FOR i IN 1..iters LOOP FOREACH v IN ARRAY vs LOOP PERFORM public.ts_prox_recheck(v, q); END LOOP; END LOOP;
     t1 := clock_timestamp();
     ext_ms := round(extract(epoch FROM (t1 - t0)) * 1000.0 / iters, 1);
 
     t0 := clock_timestamp();
-    FOR i IN 1..iters LOOP FOREACH v IN ARRAY vs LOOP PERFORM proxquery.ts_prox_match(v, q); END LOOP; END LOOP;
+    FOR i IN 1..iters LOOP FOREACH v IN ARRAY vs LOOP PERFORM proxquery.ts_prox_recheck(v, q); END LOOP; END LOOP;
     t1 := clock_timestamp();
     pure_ms := round(extract(epoch FROM (t1 - t0)) * 1000.0 / iters, 1);
 END $$;
@@ -144,9 +144,9 @@ BEGIN
     SELECT round(avg(length(body_tsv)), 1), count(*) INTO lex, ndoc FROM scorpus;
     -- matches and parity are correctness checks (untimed): the two rechecks must
     -- return the same boolean for every doc.
-    EXECUTE format('SELECT count(*) FILTER (WHERE public.ts_prox_match(body_tsv, %L)),'
-                || ' count(*) FILTER (WHERE public.ts_prox_match(body_tsv, %L)'
-                || ' IS DISTINCT FROM proxquery.ts_prox_match(body_tsv, %L)) FROM scorpus',
+    EXECUTE format('SELECT count(*) FILTER (WHERE public.ts_prox_recheck(body_tsv, %L)),'
+                || ' count(*) FILTER (WHERE public.ts_prox_recheck(body_tsv, %L)'
+                || ' IS DISTINCT FROM proxquery.ts_prox_recheck(body_tsv, %L)) FROM scorpus',
                    q, q, q)
       INTO matc, dis;
 

@@ -25,9 +25,9 @@ large tier shows how the extension alone scales.
 Each tier's report includes a **phase-timing** table (wall seconds for setup /
 corpus generation / searches) so you can see where the run's time actually went,
 and writes **raw per-query timings** to `bench/reports/results_{small,large}.csv`
-(both uploaded as the workflow artifact). `ext_2cl_ms` (≈ identical to `ext_op_ms`)
-is only timed on the small tier, where it is the denominator of the pure
-`slowdown` ratio.
+(both uploaded as the workflow artifact). `ext_search_ms` (the extension via the
+consolidated `ts_prox_search`, ≈ identical to `ext_op_ms`) is only timed on the small
+tier, where it is the denominator of the pure `slowdown` ratio.
 
 ## Repeatability
 

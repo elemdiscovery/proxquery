@@ -31,7 +31,7 @@ pub unsafe fn index_condition(node: *mut pg_sys::Node) -> Option<Internal> {
     }
     let req = node.cast::<pg_sys::SupportRequestIndexCondition>();
 
-    // The clause is `tsvector @~@ text` (OpExpr) or `ts_prox_match(tsvector, text)`
+    // The clause is `tsvector @~@ text` (OpExpr) or `ts_prox_recheck(tsvector, text)`
     // (FuncExpr) — both carry the two operands in `args`.
     let clause = (*req).node;
     if clause.is_null() {
@@ -57,7 +57,7 @@ pub unsafe fn index_condition(node: *mut pg_sys::Node) -> Option<Internal> {
     // If the query is a constant with no positive index term — a bare wildcard,
     // regex, or pure negation — offer no index condition. Otherwise we'd inject
     // `@@ ts_prox_query(const)`, which the planner folds and which *errors* for such
-    // queries; instead let the `@~@` / `ts_prox_match` filter handle it (seq scan).
+    // queries; instead let the `@~@` / `ts_prox_recheck` filter handle it (seq scan).
     // The DSL string comes from the `text` operand or the `proxquery` composite's `q`.
     if let Some(s) = const_dsl(query) {
         if crate::dsl::to_tsquery_string(&s).is_err() {
@@ -112,7 +112,7 @@ pub unsafe fn index_condition(node: *mut pg_sys::Node) -> Option<Internal> {
     Some(Internal::from(Some(pg_sys::Datum::from(result))))
 }
 
-/// `SupportRequestSimplify` for `@~@` / `ts_prox_match`: when the (constant, plain-
+/// `SupportRequestSimplify` for `@~@` / `ts_prox_recheck`: when the (constant, plain-
 /// `text`) query maps EXACTLY onto a native `tsquery` whose `@@` is ALSO the selective
 /// index probe (phrase / exact `<N>` / boolean — see
 /// [`crate::dsl::simplify_tsquery_string`]), rewrite the whole clause to a plain
@@ -134,7 +134,7 @@ pub unsafe fn simplify(node: *mut pg_sys::Node) -> Option<Internal> {
     if fcall.is_null() {
         return None;
     }
-    // `@~@` / `ts_prox_match(tsvector, text)`: arg 0 is the tsvector, arg 1 the query.
+    // `@~@` / `ts_prox_recheck(tsvector, text)`: arg 0 is the tsvector, arg 1 the query.
     let args = (*fcall).args;
     if args.is_null() || (*args).length != 2 {
         return None;
