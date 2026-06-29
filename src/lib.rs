@@ -41,7 +41,7 @@ fn ts_prox_within(v: TsVector, a: &str, b: &str, n: i32) -> bool {
     proximity::within(&v.positions(a.as_bytes()), &v.positions(b.as_bytes()), n)
 }
 
-/// Some `a` before some `b` within `n`, ordered (`a <-n> b`).
+/// Some `a` at-or-before some `b` within `n`, ordered (`a <-n> b`); a co-located pair counts.
 #[pg_extern(immutable, parallel_safe)]
 fn ts_prox_pre(v: TsVector, a: &str, b: &str, n: i32) -> bool {
     proximity::pre(&v.positions(a.as_bytes()), &v.positions(b.as_bytes()), n)
@@ -795,8 +795,9 @@ mod tests {
         assert!(b(&format!("SELECT ts_prox_recheck({tv}, 'a <0> b')")));
         // matches native tsquery exactly (the `<N> unchanged` promise).
         assert!(b(&format!("SELECT {tv} @@ to_tsquery('simple','a <0> b')")));
-        // ordered `<-0>` (strictly before, at distance ≤0) is contradictory ⇒ false.
-        assert!(!b(&format!("SELECT ts_prox_recheck({tv}, 'a <-0> b')")));
+        // ordered `<-0>` now also means same position (a co-located pair reads as
+        // ordered-adjacent), so it agrees with `<0>` / `<~0>` ⇒ true.
+        assert!(b(&format!("SELECT ts_prox_recheck({tv}, 'a <-0> b')")));
     }
 
     #[pg_test]
@@ -991,13 +992,14 @@ mod tests {
     #[pg_test]
     fn native_skeleton_is_some_only_for_expressible_shapes() {
         // Bounded within/pre/phrase over plain terms, AND/OR-combined → native.
-        for q in ["a <~2> b", "a <-3> b", "\"a b\"", "a <2> b", "a <~2> b & c",
+        // `<-0>` is now native too (= the same-position `<0>` clause), not a fallback.
+        for q in ["a <~2> b", "a <-3> b", "a <-0> b", "\"a b\"", "a <2> b", "a <~2> b & c",
                   "(a | b) <~2> c", "appl* <~2> b", "a <~2> appl*"] {
             assert!(b(&format!("SELECT ts_prox_query_native_string('{q}') IS NOT NULL")), "expected native: {q}");
         }
         // Beyond the cap, or shapes whose @@ is not exactly the recheck → fall back.
         for q in ["a <~40> b", "a <!~3> b", "a <!-3> b", "##[0-9]+##", "*ology <~2> a",
-                  "a & !b", "(a <~5> b) <~5> c", "a <-0> b"] {
+                  "a & !b", "(a <~5> b) <~5> c"] {
             assert!(b(&format!("SELECT ts_prox_query_native_string('{q}') IS NULL")), "expected fallback: {q}");
         }
     }
@@ -1829,6 +1831,16 @@ mod tests {
         assert!(b(&format!("SELECT ts_prox_recheck({sup}, $$a <~2> c$$)")));
         assert!(b(&format!("SELECT ts_prox_recheck({sup}, $$a <~2> d$$)")));
         assert!(b(&format!("SELECT ts_prox_recheck({sup}, $$a <~2> (c | d | 'c-d')$$)")));
+
+        // Ordered `<-N>` over the co-located parts (c@3, d@3): a superimposed pair reads
+        // as ordered-adjacent, so `<-N>` (any N, including `<-0>` = same position) matches
+        // it in EITHER direction — and `<!-N>` agrees the pair is near (not isolated).
+        assert!(b(&format!("SELECT ts_prox_recheck({sup}, $$c <-1> d$$)")));
+        assert!(b(&format!("SELECT ts_prox_recheck({sup}, $$d <-1> c$$)"))); // co-located ⇒ symmetric
+        assert!(b(&format!("SELECT ts_prox_recheck({sup}, $$c <-0> d$$)"))); // <-0> = same position
+        assert!(!b(&format!("SELECT ts_prox_recheck({sup}, $$c <!-1> d$$)"))); // complement: near ⇒ not isolated
+        // The `normal` layout keeps c@4 before d@5, so ordering still holds there.
+        assert!(!b(&format!("SELECT ts_prox_recheck({normal}, $$d <-1> c$$)")));
     }
 
     #[pg_test]

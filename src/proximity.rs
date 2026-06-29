@@ -30,14 +30,19 @@ pub fn within(a: &[i32], b: &[i32], n: i32) -> bool {
     false
 }
 
-/// `pre` — some `a` strictly before some `b` within `n`: `∃ i,j. 0 < bⱼ − aᵢ ≤ n`.
+/// `pre` — some `a` at-or-before some `b` within `n`: `∃ i,j. 0 ≤ bⱼ − aᵢ ≤ n`.
 ///
-/// For each `a` we only need the nearest `b` that follows it; `j` advances
+/// A co-located pair (`bⱼ = aᵢ`, `Δ = 0`) counts: only superimposition puts two distinct
+/// lexemes on one slot, and it does so by collapsing an adjacent pair (a hyphen/email/accent
+/// compound), so "same position" reads as ordered-adjacent. `<-0>` therefore means "same
+/// position" (like `<0>`/`<~0>`), not the empty window.
+///
+/// For each `a` we only need the nearest `b` at or after it; `j` advances
 /// monotonically because `a` is sorted ascending. `O(|a| + |b|)`.
 pub fn pre(a: &[i32], b: &[i32], n: i32) -> bool {
     let mut j = 0;
     for &ai in a {
-        while j < b.len() && b[j] <= ai {
+        while j < b.len() && b[j] < ai {
             j += 1;
         }
         if j < b.len() && b[j] - ai <= n {
@@ -50,8 +55,8 @@ pub fn pre(a: &[i32], b: &[i32], n: i32) -> bool {
 /// `not_within` — occurrence-level: some `a` has *no* `b` within `n` (true also when
 /// `b` is absent entirely). This is the predicate `a & !within` cannot express,
 /// because it reasons per-occurrence rather than per-document. `ordered` restricts
-/// the forbidden `b` to those *after* `a` (the `<!-N>` variant); otherwise either
-/// side counts (`<!~N>`).
+/// the forbidden `b` to those *at or after* `a` (the `<!-N>` variant — a co-located `b`
+/// counts, matching `pre`); otherwise either side counts (`<!~N>`).
 ///
 /// For each `a`, binary-search `b` for the nearest qualifying neighbour;
 /// `O(|a| · log|b|)`, short-circuiting on the first isolated `a`.
@@ -73,8 +78,8 @@ pub fn not_within(a: &[i32], b: &[i32], n: i32, ordered: bool) -> bool {
     }
     for &ai in a {
         let isolated = if ordered {
-            // No `b` in `(ai, ai + n]`.
-            let idx = b.partition_point(|&x| x <= ai); // first b strictly after ai
+            // No `b` in `[ai, ai + n]` (co-located `b` counts, matching `pre`).
+            let idx = b.partition_point(|&x| x < ai); // first b at or after ai
             !(idx < b.len() && b[idx] - ai <= n)
         } else {
             let idx = b.partition_point(|&x| x < ai);

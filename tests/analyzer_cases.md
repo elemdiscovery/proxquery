@@ -137,11 +137,16 @@ NFKC boundary).
 
 A scheme-less host decomposes (`google` finds `google.com`); a hyphen run also emits the
 hyphens-removed concatenation (`123456789` finds `123-45-6789`); a text-default symbol
-(`™`) drops without a position, so a phrase reads across it.
+(`™`) drops without a position, so a phrase reads across it. Because a hyphen run's parts
+superimpose onto one slot (`red`, `blue` both at the `red-blue` position), the ordered
+`<-N>` operator reads adjacently across them — and, the pair being co-located, in either
+direction.
 
 | label | analyzer | doc | query | expected |
 | --- | --- | --- | --- | --- |
 | `host_bare` | `prox_icu` | `visit google.com today` | `google` | `true` |
 | `host_full` | `prox_icu` | `visit google.com today` | `google.com` | `true` |
 | `hyphen_concat` | `prox_icu` | `call 123-45-6789 now` | `123456789` | `true` |
+| `hyphen_ord` | `prox_icu` | `a red-blue sky` | `red <-1> blue` | `true` |
+| `hyphen_ord_rev` | `prox_icu` | `a red-blue sky` | `blue <-1> red` | `true` |
 | `sym_phrase` | `prox_icu` | `Foo™ Bar` | `"Foo Bar"` | `true` |

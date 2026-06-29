@@ -181,13 +181,21 @@ native pushdown lowering (`ts_prox_query_native` / `ts_prox_query_exact` exact t
 | `nv9` | ` $$'well-known':1 'fact':2$$::tsvector @@ ts_prox_query_native($$'well-known'$$) ` | `true` |
 | `nv10` | ` $$'well-known':1 'fact':2$$::tsvector @@ ts_prox_query_exact($$'well-known'$$) ` | `true` |
 
-distance clamp `<0>` = same position, on a literal co-located tsvector
+distance clamp `<0>` = same position, on a literal co-located tsvector. The whole
+distance-0 family (`<~0>`, `<0>`, `<-0>`) means "same position": only superimposition puts
+two distinct lexemes on one slot, and it does so by collapsing an adjacent pair, so a
+co-located pair reads as ordered-adjacent — ordered `<-N>` (any N, either direction) matches
+it, and the `<!-N>` complement calls it near (not isolated).
 
 | label | expression | expected |
 | --- | --- | --- |
 | `z0b` | ` ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <~0> b') ` | `true` |
 | `z0c` | ` ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <0> b') ` | `true` |
-| `z0e` | ` ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <-0> b') ` | `false` |
+| `z0e` | ` ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <-0> b') ` | `true` |
+| `z0g` | ` ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <-1> b') ` | `true` |
+| `z0h` | ` ts_prox_recheck($$'a':1 'b':1$$::tsvector,'b <-1> a') ` | `true` |
+| `z0i` | ` ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <!-1> b') ` | `false` |
+| `z0j` | ` ts_prox_recheck($$'a':1 'b':1 'c':3$$::tsvector,'(a <-1> b) <~5> c') ` | `true` |
 | `z0f` | ` ts_prox_query_skeleton('a <0> b') ` | `('a' <0> 'b')` |
 
 distance saturation: a large or overflowing distance clamps to MAX (16383) — it does NOT error. The clamp is observable through the phrase-distance skeleton (within/pre lower to `&`, hiding N); `<16384>` (just over), an 8-digit value, and a value past i32 all collapse to the same `<16383>`, and a huge `<~N>` still matches (saturates, not errors).
