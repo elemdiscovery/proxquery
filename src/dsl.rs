@@ -30,11 +30,18 @@
 //! ## Compound-proximity operand rules (normalization)
 //!
 //! A proximity operand may only be *positional* (term / prefix / phrase / an OR
-//! of those / a nested proximity). `&` and `!` are **lifted out**, because
-//! `(a & b)` at one position is ~always false and `!` is not a phrase operand:
+//! of those / a nested proximity). The two non-positional booleans both **raise**
+//! ([`check_positional`], recursively — so one buried in an OR or a nested proximity
+//! is caught too):
 //!
-//! - `(a & b) <~N> c` → `(a <~N> c) & (b <~N> c)`  (distribute, lift AND)
-//! - `(!a)    <~N> b` → `!(a <~N> b)`              (lift NOT above)
+//! - `(a & b) <~N> c` → ERROR ([`AND_OPERAND_ERR`]): distributing it to
+//!   `(a <~N> c) & (b <~N> c)` would be two *independent* neighborhoods (a and b need
+//!   not be near each other — rarely intended), and the same over an exact `<N>`/`<->`
+//!   forces a and b onto one position (~always false). Spell out the conjunction, or
+//!   use a co-occurrence group `(a <~M> b) <~N> c` (a span).
+//! - `(!a)    <~N> b` → ERROR ([`NOT_OPERAND_ERR`]): "a is absent" has no position;
+//!   lifting to `!(a <~N> b)` silently flips ∃ to ¬∃. Use `!(a <~N> b)` for the
+//!   document-level negation, or `b <!~N> a` for "a b with no a nearby" (occurrence).
 //! - `(a | b) <~N> c` → kept: OR distributes into the position-set union
 //! - `"a b"   <~N> c` → kept: a phrase contributes its whole span, so proximity is
 //!   measured EDGE-TO-EDGE (nearest edge), the same as a nested group's span. Within/pre
@@ -464,42 +471,70 @@ pub fn parse(input: &str) -> Result<Node, String> {
 }
 
 // ===========================================================================
-// Normalization  (lift AND/NOT out of proximity operands; keep OR/phrase in)
+// Normalization  (reject non-positional proximity operands; keep OR/phrase in)
 // ===========================================================================
 
-pub fn normalize(node: Node) -> Node {
+// A proximity operand must be POSITIONAL — something with positions to measure distance
+// against: a term / prefix / glob / regex / phrase, an OR of positionals (their position
+// sets unioned), or a nested proximity (which resolves to a span). The two boolean
+// operators that are NOT positional both raise:
+//
+//   `&` (AND) — distributing `(a & b) <~N> c` to `(a <~N> c) & (b <~N> c)` is two
+//   *independent* neighborhoods (a and b need not be near each other — rarely intended),
+//   and over an exact `<N>`/`<->` it forces a and b onto one position (~always false).
+//
+//   `!` (NOT) — "a is absent" has no position, so it can't be "within N of c". Lifting
+//   `(!a) <~N> c` to `!(a <~N> c)` silently flips ∃ ("something near c") into ¬∃ ("a is
+//   nowhere near c"), which is usually not the intent — and the natural reading "a c with
+//   no a nearby" is the occurrence-level `c <!~N> a`, a different answer.
+//
+// The writer spells out what they mean: `(a <~N> c) & (b <~N> c)` or a co-occurrence
+// group `(a <~M> b) <~N> c`; `!(a <~N> c)` (document-level) or `c <!~N> a` (occurrence).
+const AND_OPERAND_ERR: &str =
+    "`&` (AND) cannot be a proximity operand; write the conjunction explicitly, \
+     e.g. `(a <~N> c) & (b <~N> c)`, or a co-occurrence group `(a <~M> b) <~N> c`";
+const NOT_OPERAND_ERR: &str =
+    "`!` (NOT) cannot be a proximity operand; use `!(a <~N> c)` for document-level \
+     negation, or `c <!~N> a` for an occurrence of c with no nearby a";
+
+/// Reject a non-positional proximity operand, RECURSIVELY — so an `&`/`!` buried in an
+/// OR (`(a | !b) <~N> c`) or in a nested proximity (`a <~N> (b <~N> !c)`) is caught here
+/// at normalize time, not silently mis-evaluated (or caught late) downstream.
+fn check_positional(node: &Node) -> Result<(), String> {
     match node {
-        Node::And(v) => flatten(true, v.into_iter().map(normalize).collect()),
-        Node::Or(v) => flatten(false, v.into_iter().map(normalize).collect()),
-        Node::Not(x) => Node::Not(Box::new(normalize(*x))),
-        Node::Within { a, b, n, ordered } => make_within(normalize(*a), normalize(*b), n, ordered),
-        Node::NotWithin { a, b, n, ordered } => make_not_within(normalize(*a), normalize(*b), n, ordered),
+        Node::And(_) => Err(AND_OPERAND_ERR.to_string()),
+        Node::Not(_) => Err(NOT_OPERAND_ERR.to_string()),
+        Node::Or(children) => children.iter().try_for_each(check_positional),
+        Node::Within { a, b, .. } | Node::NotWithin { a, b, .. } => {
+            check_positional(a)?;
+            check_positional(b)
+        }
+        // Term / Exact / Prefix / Glob / Regex / Phrase are positional.
+        _ => Ok(()),
+    }
+}
+
+pub fn normalize(node: Node) -> Result<Node, String> {
+    Ok(match node {
+        Node::And(v) => flatten(true, v.into_iter().map(normalize).collect::<Result<Vec<_>, _>>()?),
+        Node::Or(v) => flatten(false, v.into_iter().map(normalize).collect::<Result<Vec<_>, _>>()?),
+        Node::Not(x) => Node::Not(Box::new(normalize(*x)?)),
+        Node::Within { a, b, n, ordered } => make_within(normalize(*a)?, normalize(*b)?, n, ordered)?,
+        Node::NotWithin { a, b, n, ordered } => make_not_within(normalize(*a)?, normalize(*b)?, n, ordered)?,
         leaf => leaf,
-    }
+    })
 }
 
-fn make_within(a: Node, b: Node, n: i32, ordered: bool) -> Node {
-    match a {
-        Node::And(xs) => flatten(true, xs.into_iter().map(|x| make_within(x, b.clone(), n, ordered)).collect()),
-        Node::Not(x) => Node::Not(Box::new(make_within(*x, b, n, ordered))),
-        _ => match b {
-            Node::And(ys) => flatten(true, ys.into_iter().map(|y| make_within(a.clone(), y, n, ordered)).collect()),
-            Node::Not(y) => Node::Not(Box::new(make_within(a, *y, n, ordered))),
-            _ => Node::Within { a: Box::new(a), b: Box::new(b), n, ordered },
-        },
-    }
+fn make_within(a: Node, b: Node, n: i32, ordered: bool) -> Result<Node, String> {
+    check_positional(&a)?;
+    check_positional(&b)?;
+    Ok(Node::Within { a: Box::new(a), b: Box::new(b), n, ordered })
 }
 
-fn make_not_within(a: Node, b: Node, n: i32, ordered: bool) -> Node {
-    match a {
-        Node::And(xs) => flatten(true, xs.into_iter().map(|x| make_not_within(x, b.clone(), n, ordered)).collect()),
-        Node::Not(x) => Node::Not(Box::new(make_not_within(*x, b, n, ordered))),
-        _ => match b {
-            Node::And(ys) => flatten(true, ys.into_iter().map(|y| make_not_within(a.clone(), y, n, ordered)).collect()),
-            Node::Not(y) => Node::Not(Box::new(make_not_within(a, *y, n, ordered))),
-            _ => Node::NotWithin { a: Box::new(a), b: Box::new(b), n, ordered },
-        },
-    }
+fn make_not_within(a: Node, b: Node, n: i32, ordered: bool) -> Result<Node, String> {
+    check_positional(&a)?;
+    check_positional(&b)?;
+    Ok(Node::NotWithin { a: Box::new(a), b: Box::new(b), n, ordered })
 }
 
 fn flatten(is_and: bool, children: Vec<Node>) -> Node {
@@ -603,7 +638,7 @@ fn quote_lexeme(lex: &str) -> String {
 }
 
 pub fn to_tsquery_string(input: &str) -> Result<String, String> {
-    let node = normalize(parse(input)?);
+    let node = normalize(parse(input)?)?;
     skeleton(&node)?.ok_or_else(|| {
         "query has no positive term to drive the index; add an AND-ed positive term".to_string()
     })
@@ -642,7 +677,7 @@ pub const NATIVE_MAX_DISTANCE: i32 = 32;
 /// native-expressible within [`NATIVE_MAX_DISTANCE`] (the caller then keeps the
 /// presence + recheck path).
 pub fn native_tsquery_string(input: &str) -> Option<String> {
-    native(&normalize(parse(input).ok()?))
+    native(&normalize(parse(input).ok()?).ok()?)
 }
 
 /// The native tsquery string for the `@~@` operator's `simplify` rewrite: like
@@ -659,7 +694,7 @@ pub fn native_tsquery_string(input: &str) -> Option<String> {
 /// exact `<N>`, and boolean, whose native form IS the selective skeleton (just with the
 /// recheck dropped, since its `@@` is the index probe).
 pub fn simplify_tsquery_string(input: &str) -> Option<String> {
-    let node = normalize(parse(input).ok()?);
+    let node = normalize(parse(input).ok()?).ok()?;
     if contains_within(&node) {
         return None;
     }
@@ -864,7 +899,7 @@ fn native_resolved(node: &Node, r: Resolver) -> Option<String> {
 /// index filter and the droppability gate are one and the same logic.
 pub fn cfg_exact_droppable(input: &str, cfg: pg_sys::Oid) -> bool {
     match parse(input) {
-        Ok(node) => native_resolved(&normalize(node), Resolver::Cfg(cfg)).is_some(),
+        Ok(node) => normalize(node).is_ok_and(|n| native_resolved(&n, Resolver::Cfg(cfg)).is_some()),
         Err(_) => false,
     }
 }
@@ -973,7 +1008,7 @@ fn analyzer_skeleton(node: &Node, kind: AnalyzerKind) -> Result<Option<String>, 
 /// Analyzer-resolved tsquery string for index selection (cast `::tsquery` verbatim).
 /// Errors on a keyless query, same contract as [`to_tsquery_string`].
 pub fn analyzer_tsquery_string(input: &str, kind: AnalyzerKind) -> Result<String, String> {
-    let node = normalize(parse(input)?);
+    let node = normalize(parse(input)?)?;
     analyzer_skeleton(&node, kind)?.ok_or_else(|| {
         "query has no positive term to drive the index; add an AND-ed positive term".to_string()
     })
@@ -1303,7 +1338,7 @@ fn positions(node: &Node, v: &TsVector, r: Resolver) -> Result<Vec<i32>, String>
         // (densified, like any other operand), so the outer proximity measures against them.
         Node::NotWithin { .. } => densify_union(occurrences(node, v, r)?),
         Node::And(_) | Node::Not(_) => {
-            return Err("AND/NOT cannot be a proximity operand (normalization should have lifted it)".into())
+            return Err("AND/NOT cannot be a proximity operand (normalization should have rejected it)".into())
         }
     })
 }
@@ -1511,7 +1546,7 @@ fn occurrences(node: &Node, v: &TsVector, r: Resolver) -> Result<Vec<(i32, i32)>
         }
         Node::And(_) | Node::Not(_) => {
             return Err(
-                "AND/NOT cannot be a proximity operand (normalization should have lifted it)".into(),
+                "AND/NOT cannot be a proximity operand (normalization should have rejected it)".into(),
             )
         }
     })
