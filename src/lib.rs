@@ -500,6 +500,41 @@ mod tests {
     }
 
     #[pg_test]
+    fn not_within_fails_open_at_position_cap() {
+        // Past token 16383 a tsvector clamps every position onto the cap (16383),
+        // collapsing the tail — so "near b" can't be told from "far from b". The
+        // negative operators fail OPEN there: they surface the doc for review
+        // rather than asserting an isolation they can't verify.
+
+        // A literal position at the cap round-trips through the accessor.
+        assert_eq!(
+            ints("SELECT ts_prox_positions($$'email':16383$$::tsvector, 'email')"),
+            vec![16383]
+        );
+
+        // Avoid term ('email') at the cap, co-located with 'confidential': without
+        // the guard this reads as "near" ⇒ not isolated ⇒ false; the guard flips it
+        // open. True via the direct predicate and the DSL recheck (both the
+        // unordered <!~> and ordered <!-> negations).
+        let sat = "$$'confidential':16383 'email':16383$$::tsvector";
+        assert!(b(&format!("SELECT ts_prox_not_within({sat}, 'confidential', 'email', 3)")));
+        assert!(b(&format!("SELECT ts_prox_recheck({sat}, 'confidential <!~3> email')")));
+        assert!(b(&format!("SELECT ts_prox_recheck({sat}, 'confidential <!-3> email')")));
+
+        // Control — no saturation: a genuinely co-located pair is near, so this is
+        // NOT the fail-open path and the predicate still returns false.
+        let near = "$$'confidential':5 'email':5$$::tsvector";
+        assert!(!b(&format!("SELECT ts_prox_not_within({near}, 'confidential', 'email', 3)")));
+        assert!(!b(&format!("SELECT ts_prox_recheck({near}, 'confidential <!~3> email')")));
+
+        // Scope — the guard keys off the AVOID term, not the subject. The subject
+        // ('confidential') is at the cap but the avoid term ('email') is not, and
+        // they're near ⇒ no fail-open, still false.
+        let subj = "$$'confidential':16383 'email':16380$$::tsvector";
+        assert!(!b(&format!("SELECT ts_prox_not_within({subj}, 'confidential', 'email', 5)")));
+    }
+
+    #[pg_test]
     fn chain_pins_same_occurrence() {
         // alpha@1 xx@2 beta@3 yy@4 gamma@5.
         let v = "to_tsvector('simple','alpha xx beta yy gamma')";
@@ -2236,6 +2271,47 @@ mod tests {
     fn pure_sql_matches_extension_fuzz() {
         Spi::run(include_str!("../sql/proxquery_pure.sql")).expect("load pure-SQL port");
         Spi::run(include_str!("../sql/proxquery_fuzz_test.sql")).expect("differential fuzz test");
+    }
+
+    // Position saturation (lexemes pinned at the 16383 cap) can't be expressed in
+    // the markdown corpus — it builds tsvectors from text — so the differential
+    // check for the NOT-within fail-open guard lives here, with crafted tsvectors.
+    // Asserts the extension and the pure port agree with each other and the
+    // expected value on the same cases as `not_within_fails_open_at_position_cap`.
+    #[pg_test]
+    fn pure_sql_matches_extension_at_position_cap() {
+        Spi::run(include_str!("../sql/proxquery_pure.sql")).expect("load pure-SQL port");
+        // Discover where the extension lives (the differential runner does the same),
+        // rather than assuming `public`.
+        let ext = Spi::get_one::<String>(
+            "SELECT nsp.nspname::text FROM pg_extension e \
+             JOIN pg_namespace nsp ON nsp.oid = e.extnamespace WHERE e.extname = 'proxquery'",
+        )
+        .unwrap()
+        .expect("extension installed");
+
+        // Run `expr` under both implementations and assert both equal `expected`.
+        let both = |expr: &str, expected: bool| {
+            let e = b(&format!("SELECT {ext}.{expr}"));
+            let p = b(&format!("SELECT proxquery.{expr}"));
+            assert_eq!(e, expected, "extension disagreed: {expr}");
+            assert_eq!(p, expected, "pure port disagreed: {expr}");
+        };
+
+        // Avoid term ('email') at the cap, co-located with the subject ⇒ fail open.
+        let sat = "$$'confidential':16383 'email':16383$$::tsvector";
+        both(&format!("ts_prox_not_within({sat}, 'confidential', 'email', 3)"), true);
+        both(&format!("ts_prox_recheck({sat}, 'confidential <!~3> email')"), true);
+        both(&format!("ts_prox_recheck({sat}, 'confidential <!-3> email')"), true);
+
+        // No saturation: a genuinely co-located pair is near ⇒ still false.
+        let near = "$$'confidential':5 'email':5$$::tsvector";
+        both(&format!("ts_prox_not_within({near}, 'confidential', 'email', 3)"), false);
+        both(&format!("ts_prox_recheck({near}, 'confidential <!~3> email')"), false);
+
+        // Scope: subject at the cap but avoid term not ⇒ no fail open ⇒ still false.
+        let subj = "$$'confidential':16383 'email':16380$$::tsvector";
+        both(&format!("ts_prox_not_within({subj}, 'confidential', 'email', 5)"), false);
     }
 
     // Smoke test: every ```sql block in README.md must run without error, so a renamed

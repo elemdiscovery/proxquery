@@ -1,40 +1,64 @@
-# Builds the distributable binaries and attaches them to a GitHub Release.
+# Builds a release's artifacts: the GHCR container images AND the relocatable
+# install tarballs, from a SINGLE compile per (PG major, arch).
 #
 # Reused two ways:
 #   * called by release.yml in the same run as a release (the normal path);
-#   * run manually (workflow_dispatch) to rebuild a release's assets — pick the
-#     release tag as the workflow ref in the Actions UI.
+#   * run manually (workflow_dispatch) to rebuild/re-push a release's artifacts —
+#     pick the release tag as the workflow ref in the Actions UI.
 #
-# Each matrix leg compiles the extension via the Dockerfile's `export` stage —
-# the SAME build the container image uses — and lifts out a relocatable tarball
-# (the .so + .control + versioned .sql + install.sh) plus a .sha256, uploaded as
-# a workflow artifact; the publish job attaches them all to the Release.
+# Each matrix leg builds the Dockerfile once on a native runner (no emulation),
+# smoke-tests the image, pushes it arch-suffixed to GHCR, then lifts the install
+# tarball out of the SAME build's `export` stage (served from the layer cache, so
+# no second compile). Follow-on jobs stitch the per-arch images into multi-arch
+# manifests and attach the tarballs to the GitHub Release.
+#
+# Images pushed (multi-arch manifests):
+#   ghcr.io/elemdiscovery/proxquery:<version>-pg<NN>   immutable, per release
+#   ghcr.io/elemdiscovery/proxquery:pg<NN>             rolling latest for that major
+#   ghcr.io/elemdiscovery/proxquery:latest             -> pg17 (when push_latest)
 
 name: release-build
 
 on:
   workflow_call:
+    inputs:
+      push_latest:
+        description: "Move the rolling :pg<NN> and :latest tags"
+        required: false
+        type: boolean
+        default: true
   workflow_dispatch:
+    inputs:
+      push_latest:
+        description: "Move the rolling :pg<NN> and :latest tags"
+        required: false
+        type: boolean
+        default: true
 
 concurrency:
   group: release-build-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: write   # publish job attaches tarballs to the Release
+  packages: write   # build/manifest jobs push images to GHCR
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
   build:
     name: pg${{ matrix.pg }} ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
-    # Least privilege for the build leg: it only reads source and writes a
+    # Least privilege for the build leg: read source, push the image, and write a
     # provenance attestation. (The publish job keeps the workflow-level
     # `contents: write` it needs to attach assets to the Release.)
     permissions:
       contents: read
-      id-token: write           # OIDC identity for keyless Sigstore signing
-      attestations: write       # persist the attestation
-      artifact-metadata: write  # create the artifact storage record
+      packages: write          # push the arch-suffixed image to GHCR
+      id-token: write          # OIDC identity for keyless Sigstore signing
+      attestations: write      # persist the attestation
+      artifact-metadata: write # create the artifact storage record
     strategy:
       fail-fast: false
       matrix:
@@ -52,11 +76,36 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
-      # Compile in the Dockerfile's bookworm build stage and lift the artifacts
-      # out to ./out. Native runner per arch, so no emulation. The GHA layer cache
-      # (scoped per pg+arch) restores the apt + cargo-pgrx layers across runs; only
-      # the source compile re-runs.
-      - name: Build the extension and extract artifacts
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Resolve version
+        id: ver
+        run: echo "version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
+      # Build the runtime image and load it locally so the smoke test can boot it
+      # before we push. The GHA layer cache (scoped per pg+arch) restores the apt +
+      # cargo-pgrx layers across runs; only the source compile re-runs.
+      - name: Build the image (load locally for the smoke test)
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:${{ steps.ver.outputs.version }}-pg${{ matrix.pg }}-${{ matrix.arch }}
+          build-args: PG_MAJOR=${{ matrix.pg }}
+          cache-from: type=gha,scope=release-pg${{ matrix.pg }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-pg${{ matrix.pg }}-${{ matrix.arch }}
+
+      - name: Smoke-test, then push (arch-suffixed)
+        run: |
+          set -euo pipefail
+          TAG="${IMAGE}:${{ steps.ver.outputs.version }}-pg${{ matrix.pg }}-${{ matrix.arch }}"
+          packaging/smoke.sh "$TAG"   # gate: a broken image never gets pushed
+          docker push "$TAG"
+
+      # Lift the install artifacts out of the SAME build's `export` stage. Served
+      # from the cache the image build just populated, so this is no second compile.
+      - name: Extract the install tarball
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
@@ -64,7 +113,6 @@ jobs:
           build-args: PG_MAJOR=${{ matrix.pg }}
           outputs: type=local,dest=out
           cache-from: type=gha,scope=release-pg${{ matrix.pg }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=release-pg${{ matrix.pg }}-${{ matrix.arch }}
 
       - name: Package the tarball
         id: pkg
@@ -116,11 +164,47 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # Combine the per-arch images into multi-arch manifests and move rolling tags.
+  manifest:
+    name: manifest pg${{ matrix.pg }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    strategy:
+      matrix:
+        pg: [16, 17, 18]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Create manifests
+        run: |
+          set -euo pipefail
+          VER="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          BASE="${IMAGE}:${VER}-pg${{ matrix.pg }}"
+
+          # Immutable per-release multi-arch tag.
+          docker buildx imagetools create -t "$BASE" "${BASE}-amd64" "${BASE}-arm64"
+
+          if [ "${{ inputs.push_latest }}" = "true" ]; then
+            # Rolling per-major tag.
+            docker buildx imagetools create -t "${IMAGE}:pg${{ matrix.pg }}" "$BASE"
+            # :latest tracks pg17.
+            if [ "${{ matrix.pg }}" = "17" ]; then
+              docker buildx imagetools create -t "${IMAGE}:latest" "$BASE"
+            fi
+          fi
+
   # Gather every leg's tarball and attach them to the Release for this version.
   publish:
     name: attach to release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -135,8 +219,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          TAG="v${VERSION}"
+          TAG="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
           # release.yml's gate creates the Release (with the CHANGELOG as notes);
           # this job only attaches the built tarballs. When run manually to
           # rebuild assets, pick the release's tag as the ref — the Release must

@@ -5,6 +5,13 @@
 //! binary search — no allocation, no full-vector scan, short-circuiting. Distances
 //! are absolute lexeme gaps: adjacent tokens differ by 1, so within-`N` means `|Δ| ≤ N`.
 
+/// The largest position a `tsvector` can store. Positions live in a 14-bit field,
+/// so Postgres clamps anything past token 16383 onto it (`LIMITPOS`), and so does
+/// our accessor (`WEP_POS_MASK`). A position list whose maximum entry is `MAX_POS`
+/// therefore has a *collapsed tail* — distinct tail tokens are indistinguishable,
+/// which makes negative proximity untrustworthy; see [`not_within`].
+pub const MAX_POS: i32 = 0x3fff;
+
 /// `within` — some `a` within `n` of some `b`, either order: `∃ i,j. |aᵢ − bⱼ| ≤ n`.
 ///
 /// Two-pointer merge of the two sorted runs; `O(|a| + |b|)`.
@@ -48,11 +55,20 @@ pub fn pre(a: &[i32], b: &[i32], n: i32) -> bool {
 ///
 /// For each `a`, binary-search `b` for the nearest qualifying neighbour;
 /// `O(|a| · log|b|)`, short-circuiting on the first isolated `a`.
+///
+/// Saturation guard: when the avoid term `b` reaches the position cap (its tail
+/// collapsed onto [`MAX_POS`]), "near `b`" can no longer be told from "far from
+/// `b`", so this fails *open* — it reports the match for review rather than
+/// silently asserting an isolation it can't verify.
 pub fn not_within(a: &[i32], b: &[i32], n: i32, ordered: bool) -> bool {
     if a.is_empty() {
         return false;
     }
     if b.is_empty() {
+        return true;
+    }
+    // `b` is sorted ascending, so its last element is its maximum.
+    if b[b.len() - 1] == MAX_POS {
         return true;
     }
     for &ai in a {
