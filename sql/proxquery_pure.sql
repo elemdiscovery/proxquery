@@ -179,6 +179,10 @@ $fn$
 BEGIN
     IF coalesce(array_length(a, 1), 0) = 0 THEN RETURN false; END IF;
     IF coalesce(array_length(b, 1), 0) = 0 THEN RETURN true; END IF;
+    -- Saturation guard: the avoid term reached the position cap (16383), so its
+    -- tail collapsed and "near b" can't be trusted. Fail open (matches the Rust
+    -- `not_within`).
+    IF (SELECT max(y) FROM unnest(b) AS y) = 16383 THEN RETURN true; END IF;
     RETURN EXISTS (
         SELECT 1 FROM unnest(a) x
         WHERE NOT EXISTS (
@@ -965,9 +969,16 @@ BEGIN
                      WHERE _prox_iv_near(ia.s, ia.e, ib.s, ib.e, n, ord);
     ELSIF t = 'notwithin' THEN
         n := (node ->> 'n')::int; ord := (node ->> 'ord')::boolean;
-        RETURN QUERY SELECT ia.s, ia.e FROM _prox_occ(node -> 'a', v) AS ia
-                     WHERE NOT EXISTS (SELECT 1 FROM _prox_occ(node -> 'b', v) AS ib
-                                       WHERE _prox_iv_near(ia.s, ia.e, ib.s, ib.e, n, ord));
+        -- Saturation guard (mirrors the Rust `occurrences`): if any avoid-term
+        -- occurrence ends on the position cap (16383), its tail collapsed and
+        -- "near b" is untrustworthy — fail open, keeping every a-occurrence.
+        IF EXISTS (SELECT 1 FROM _prox_occ(node -> 'b', v) AS ib WHERE ib.e = 16383) THEN
+            RETURN QUERY SELECT ia.s, ia.e FROM _prox_occ(node -> 'a', v) AS ia;
+        ELSE
+            RETURN QUERY SELECT ia.s, ia.e FROM _prox_occ(node -> 'a', v) AS ia
+                         WHERE NOT EXISTS (SELECT 1 FROM _prox_occ(node -> 'b', v) AS ib
+                                           WHERE _prox_iv_near(ia.s, ia.e, ib.s, ib.e, n, ord));
+        END IF;
     ELSE  -- leaf: term / prefix / glob / regex (and/not raise via _prox_positions)
         RETURN QUERY SELECT u.p, u.p FROM unnest(_prox_positions(node, v)) AS u(p);
     END IF;

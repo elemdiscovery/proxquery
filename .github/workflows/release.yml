@@ -2,10 +2,9 @@
 #
 # We detect whether THIS push landed a release by comparing Cargo.toml's version
 # to the git tags — independent of how the Release PR was merged (squash, merge
-# commit, or rebase all work). We branch on that:
-#
-#   release commit  -> build the full binary matrix, attach to the v<x.y.z> tag
-#   any other commit -> build + publish the rolling `edge` pre-release
+# commit, or rebase all work). On a release commit we cut the v<x.y.z> tag +
+# GitHub Release and build the artifacts (GHCR images + install tarballs); any
+# other commit only refreshes the Release PR.
 
 name: release
 
@@ -28,7 +27,7 @@ jobs:
     # PGRX_HOME toolchain, so use pgrx's docs.rs mode: DOCS_RS=1 makes pgrx-pg-sys
     # skip bindgen and compile against its bundled bindings. This only affects
     # release-plz's internal bookkeeping build — the real artifacts are built by
-    # edge-build.yml / release-build.yml, which deliberately do NOT set this.
+    # release-build.yml, which deliberately does NOT set this.
     env:
       DOCS_RS: "1"
     concurrency:
@@ -73,7 +72,7 @@ jobs:
           TAG="v${VERSION}"
 
           # Tag already exists → this push didn't bump the version (ordinary
-          # commit). Fall through to the edge build instead.
+          # commit). Nothing to release.
           if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
             echo "${TAG} already released; nothing to do."
             echo "released=false" >> "$GITHUB_OUTPUT"
@@ -93,32 +92,22 @@ jobs:
           echo "Released ${TAG}."
           echo "released=true" >> "$GITHUB_OUTPUT"
 
-  # Release commit: full PG 16/17/18 x amd64/arm64 matrix, attached to the Release.
+  # Release commit: build the full PG 16/17/18 x amd64/arm64 matrix once, push the
+  # GHCR images, and attach the install tarballs to the Release. Non-release
+  # commits build nothing.
   build-release:
-    name: build release binaries
+    name: build release
     needs: release
     if: ${{ needs.release.outputs.released == 'true' }}
     uses: ./.github/workflows/release-build.yml
+    with:
+      push_latest: true
     secrets: inherit
-    # Caller is the ceiling for a reusable workflow's token: grant the OIDC +
-    # attestation scopes here too, or the called build job's request is denied.
+    # Caller is the ceiling for a reusable workflow's token: grant the GHCR push +
+    # OIDC + attestation scopes here too, or the called build job's request is denied.
     permissions:
       contents: write
-      id-token: write
-      attestations: write
-      artifact-metadata: write
-
-  # Every other commit: rolling edge pre-release (PG 17, amd64 + arm64).
-  build-edge:
-    name: build edge
-    needs: release
-    if: ${{ needs.release.outputs.released != 'true' }}
-    uses: ./.github/workflows/edge-build.yml
-    secrets: inherit
-    # Caller is the ceiling for a reusable workflow's token: grant the OIDC +
-    # attestation scopes here too, or the called build job's request is denied.
-    permissions:
-      contents: write
+      packages: write
       id-token: write
       attestations: write
       artifact-metadata: write

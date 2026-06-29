@@ -1,7 +1,7 @@
 #!/bin/sh
 # Boot a proxquery Docker image and verify the extension actually loads.
-# Used by .github/workflows/docker-smoke.yml (PR/main) and promote.yml (pre-push
-# gate). Fails non-zero on any compile/ABI/load break.
+# Used by .github/workflows/docker-smoke.yml (PR/main) and release-build.yml
+# (pre-push gate). Fails non-zero on any compile/ABI/load break.
 #
 # Usage: packaging/smoke.sh <image>
 set -eu

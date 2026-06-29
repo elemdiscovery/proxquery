@@ -4,7 +4,7 @@
 # Dockerfile (extension compiled against the PGDG server-dev package, loaded into
 # the official postgres:<major> image) and confirms it actually boots and runs
 # `CREATE EXTENSION`. Catches compile/ABI/glibc breaks in the image before they
-# reach `promote`. Path-filtered so it only runs when something relevant changes.
+# reach a release. Path-filtered so it only runs when something relevant changes.
 name: docker-smoke
 
 on:

@@ -109,7 +109,6 @@ cargo pgrx run pg16 --no-default-features --features pg16
 ## Releasing
 
 Releases are conventional-commit driven. release-plz keeps a Release PR up to
-date on `main`; merging it tags `v<x.y.z>` and builds the prebuilt binaries,
-while every other commit publishes a rolling `edge` pre-release. Pushing Docker
-images to GHCR is a separate manual step. The full flow and the promotion steps
-are in [docs/RELEASING.md](docs/RELEASING.md).
+date on `main`; merging it tags `v<x.y.z>`, attaches the prebuilt install
+tarballs, and pushes the Docker images to GHCR — all in one automated run. The
+full flow is in [docs/RELEASING.md](docs/RELEASING.md).

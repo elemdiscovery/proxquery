@@ -1496,10 +1496,18 @@ fn occurrences(node: &Node, v: &TsVector, r: Resolver) -> Result<Vec<(i32, i32)>
         }
         Node::NotWithin { a, b, n, ordered } => {
             let bi = occurrences(b, v, r)?;
-            occurrences(a, v, r)?
-                .into_iter()
-                .filter(|&ia| !bi.iter().any(|&ib| iv_near(ia, ib, *n, *ordered)))
-                .collect()
+            let ai = occurrences(a, v, r)?;
+            // Saturation guard (mirrors `proximity::not_within`): if any avoid-term
+            // occurrence ends on the position cap, its tail collapsed and "near b"
+            // is untrustworthy — fail open by keeping every a-occurrence so the
+            // document still surfaces for review.
+            if bi.iter().any(|&(_, e)| e == proximity::MAX_POS) {
+                ai
+            } else {
+                ai.into_iter()
+                    .filter(|&ia| !bi.iter().any(|&ib| iv_near(ia, ib, *n, *ordered)))
+                    .collect()
+            }
         }
         Node::And(_) | Node::Not(_) => {
             return Err(
