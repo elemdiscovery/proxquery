@@ -2253,12 +2253,23 @@ mod tests {
         // soundness) and the plan uses the index whenever the query carries a key.
         crate::corpus::load_analyzer_ops();
 
-        // Phase A — recheck correctness.
+        // Per-row error-catching eval, so a row with `expected = ERR` asserts the raise
+        // (a malformed query — e.g. `&`/`!` as a proximity operand). A bare SELECT would
+        // abort the whole phase on the first raise instead of recording it as 'ERR'.
+        Spi::run(
+            "CREATE OR REPLACE FUNCTION pg_temp._an_eval(d text, q text, a text) RETURNS text \
+             LANGUAGE plpgsql AS $$ BEGIN \
+               RETURN proxquery_recheck(proxquery_to_tsvector(d, a), q, a)::text; \
+             EXCEPTION WHEN OTHERS THEN RETURN 'ERR'; END $$",
+        )
+        .unwrap();
+
+        // Phase A — recheck correctness (ERR rows assert the raise).
         let mism = Spi::get_one::<String>(
             "SELECT coalesce(string_agg(label || $$: got=$$ || got || $$ want=$$ || expected, E'\\n' \
                  ORDER BY label), '') \
              FROM (SELECT label, expected, \
-                      proxquery_recheck(proxquery_to_tsvector(doc, analyzer), query, analyzer)::text AS got \
+                      pg_temp._an_eval(doc, query, analyzer) AS got \
                    FROM _prox_an) s \
              WHERE got IS DISTINCT FROM expected",
         )
@@ -2280,7 +2291,7 @@ mod tests {
                                  FROM (SELECT DISTINCT doc FROM _prox_an WHERE analyzer=%L) d, \
                                       generate_series(1,20)', a, a); \
                  CREATE INDEX ON _ai USING gin(tsv); ANALYZE _ai; \
-                 FOR q IN SELECT DISTINCT query FROM _prox_an WHERE analyzer=a ORDER BY 1 LOOP \
+                 FOR q IN SELECT DISTINCT query FROM _prox_an WHERE analyzer=a AND expected <> 'ERR' ORDER BY 1 LOOP \
                    BEGIN PERFORM ts_prox_query(proxquery(a, q)); has_key := true; \
                    EXCEPTION WHEN OTHERS THEN has_key := false; END; \
                    SET LOCAL enable_seqscan=off; SET LOCAL enable_indexscan=on; SET LOCAL enable_bitmapscan=on; \

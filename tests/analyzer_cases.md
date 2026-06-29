@@ -34,6 +34,19 @@ and a `'literal'` is exact (these rows pin both inside boolean operators).
 | `not_lit2` | `prox_icu` | `un café noir` | `noir & !'café'` | `false` |
 | `group` | `prox_icu` | `un café noir` | `(zzz \| cafe) & noir` | `true` |
 
+A proximity operand must be positional, so a boolean `&`/`!` as an operand raises through
+the analyzer path exactly as on the stock path (the rejection is in shared normalization,
+upstream of the analyzer). `|` (OR) stays a valid operand; `!` at the top level (`not_*`
+above) is fine. `expected = ERR` asserts the raise.
+
+| label | analyzer | doc | query | expected |
+| --- | --- | --- | --- | --- |
+| `prox_and_err` | `prox_icu` | `cafe noir vin` | `(cafe & noir) <~5> vin` | `ERR` |
+| `prox_not_err` | `prox_icu` | `cafe noir vin` | `(!cafe) <~5> vin` | `ERR` |
+| `prox_not_nested_err` | `prox_icu` | `cafe noir vin` | `cafe <~5> (noir <~5> !vin)` | `ERR` |
+| `prox_not_or_err` | `prox_icu` | `cafe noir vin` | `(cafe \| !noir) <~5> vin` | `ERR` |
+| `prox_or_ok` | `prox_icu` | `cafe noir vin` | `(cafe \| zzz) <~2> noir` | `true` |
+
 ## Proximity — distance / within / ordered / not-within
 
 Plain ASCII docs (no superimposition) so the position arithmetic is unambiguous:
