@@ -1,6 +1,6 @@
 [package]
 name = "proxquery"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 description = "Positional proximity predicates for tsvector full-text search"
 license = "MIT"
