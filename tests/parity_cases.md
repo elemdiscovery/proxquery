@@ -231,6 +231,13 @@ config-aware (3-arg): query terms resolved through the column's text-search conf
 | `cfg8` | ` ts_prox_recheck(to_tsvector('english','the running shoes'),'"running shoes"','english') ` | `true` |
 | `cfg9` | ` ts_prox_recheck(to_tsvector('english','the running shoes'),'walking <~2> shoes','english') ` | `false` |
 
+the non-positional-operand rule (`bgErr*`/`notErr*`) fires through the 3-arg config path too — the rejection is in shared normalization, before any config resolution.
+
+| label | expression | expected |
+| --- | --- | --- |
+| `cfgErrAnd` | ` ts_prox_recheck(to_tsvector('english','a b c'),'(a & b) <~5> c','english') ` | `ERR` |
+| `cfgErrNot` | ` ts_prox_recheck(to_tsvector('english','a b c'),'(!a) <~5> c','english') ` | `ERR` |
+
 ## Match cases
 
 Recheck pairs run as `ts_prox_recheck(to_tsvector('simple', doc), query)`.
@@ -406,6 +413,10 @@ they're still not excluded.) `<-N>` is order-sensitive — `ord_ph_rev` has the 
 | `gx_infix_left` | `fur near cat` | `f*r <~2> cat` | `true` |
 | `gx_qmark` | `the best test now` | `best <~2> te?t` | `true` |
 | `gx_qmark_miss` | `the best tense now` | `best <~2> te?t` | `false` |
+| `rx_left` | `cat and dog` | `##do.## <~2> cat` | `true` |
+| `rx_left_miss` | `cat and bird` | `##do.## <~2> cat` | `false` |
+| `or_mixed_operand` | `the study of biology` | `(stud* \| ##zzz##) <~3> biology` | `true` |
+| `or_both_sides` | `a x c` | `(a \| b) <~2> (c \| d)` | `true` |
 
 non-ASCII: accented Latin and CJK. Locale-INDEPENDENT (no uppercase to case-fold), so they agree on any CI collation. Two things are deliberately NOT asserted here because their tokenization is locale-dependent (see docs/CONFIG_AWARE.md): uppercase-accent case-folding, and emoji (a token under C, dropped under en_US.UTF-8).
 
