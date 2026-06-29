@@ -46,6 +46,38 @@ a distance must be a non-empty run of digits. Anything else — embedded space, 
 | `dbad4` | ` ts_prox_query('a <> b') ` | `ERR` |
 | `dbad5` | ` ts_prox_query('a <~> b') ` | `ERR` |
 
+a proximity operand must be POSITIONAL — something with positions to measure against (a term/prefix/glob/regex/phrase, an OR of those, or a nested proximity that resolves to a span). The two non-positional booleans both raise, on either side, on both implementations, on every proximity operator (`<~N>`, `<-N>`, `<!~N>`, and the exact `<N>`/`<->`): • `&` (AND) — we do NOT silently distribute `(a & b) <~N> c` into `(a <~N> c) & (b <~N> c)` (two *independent* neighborhoods, rarely intended; over an exact op it forces one position, ~always false). • `!` (NOT) — "a is absent" has no position; lifting `(!a) <~N> c` to `!(a <~N> c)` silently flips ∃ to ¬∃, and the natural reading is the occurrence-level `c <!~N> a` (a *different* answer). The check is RECURSIVE, so an `&`/`!` buried in an OR (`bgErr9`/`notErr4`) or in a nested proximity (`notErr3`) is caught at normalize time too, not mis-evaluated downstream. `|` (OR) by contrast IS positional (a position-set union) and stays a valid `<~N>`/`<-N>` operand (the `bg_*` / `comp_*` cases) — though the phrase/exact operators (`<->`, `<N>`) need a SINGLE atom, so they reject even an OR group. The legitimate spellings: `(a <~N> c) & (b <~N> c)` or `(a <~M> b) <~N> c`; `!(a <~N> c)` or `c <!~N> a`.
+
+| label | expression | expected |
+| --- | --- | --- |
+| `bgErr1` | ` ts_prox_recheck(to_tsvector('simple','a b c'),'(a & b) <~5> c') ` | `ERR` |
+| `bgErr2` | ` ts_prox_recheck(to_tsvector('simple','a b c'),'(a & b) <-5> c') ` | `ERR` |
+| `bgErr3` | ` ts_prox_recheck(to_tsvector('simple','a b c'),'(a & b) <!~5> c') ` | `ERR` |
+| `bgErr4` | ` ts_prox_recheck(to_tsvector('simple','a b c'),'(a & b) <2> c') ` | `ERR` |
+| `bgErr5` | ` ts_prox_recheck(to_tsvector('simple','a b c'),'c <~5> (a & b)') ` | `ERR` |
+| `bgErr6` | ` ts_prox_recheck(to_tsvector('simple','p q r s t'),'("p q" & "r s") <~2> t') ` | `ERR` |
+| `bgErr7` | ` ts_prox_query('(a & b) <~5> c') ` | `ERR` |
+| `bgErr8` | ` ts_prox_recheck(to_tsvector('simple','a b c'),'(a \| b) <-> c') ` | `ERR` |
+| `bgErr9` | ` ts_prox_recheck(to_tsvector('simple','a b c d'),'(a \| (b & c)) <~5> d') ` | `ERR` |
+| `notErr1` | ` ts_prox_recheck(to_tsvector('simple','a b c'),'(!a) <~5> c') ` | `ERR` |
+| `notErr2` | ` ts_prox_recheck(to_tsvector('simple','a b c'),'a <~5> !c') ` | `ERR` |
+| `notErr3` | ` ts_prox_recheck(to_tsvector('simple','a b c'),'a <~5> (b <~5> !c)') ` | `ERR` |
+| `notErr4` | ` ts_prox_recheck(to_tsvector('simple','a b c'),'(a \| !b) <~5> c') ` | `ERR` |
+| `notErr5` | ` ts_prox_recheck(to_tsvector('simple','a b c'),'(!a) <!~5> c') ` | `ERR` |
+| `notErr6` | ` ts_prox_query('(!a) <~5> c') ` | `ERR` |
+| `notOk1` | ` ts_prox_recheck(to_tsvector('simple','a x x x x x x b'),'!(a <~2> b)') ` | `true` |
+| `notOk2` | ` ts_prox_recheck(to_tsvector('simple','a b z z z z b'),'a <!~5> b') ` | `false` |
+| `notOk3` | ` ts_prox_recheck(to_tsvector('simple','a b z z z z z c'),'a <~5> (b <!~5> c)') ` | `true` |
+
+composition rules, pinned as IDENTITIES (`formA = formB` evaluates `true` on both ports). These state the exact rule for how each operand kind composes — distinct from the value cases above, which pin a specific doc's answer. The docs are chosen to be DISCRIMINATING: `comp_or_dist` uses `a x x c x x b` (a@1 c@4 b@7, where a and b are each >N from c but the span straddles c), so a span implementation would make the two sides disagree — the identity would break. `comp_span_ne_or` is the converse: a proximity group is a span, NOT the OR distribution, so on that same doc the two forms DIFFER (`<>` is `true`).
+
+| label | expression | expected |
+| --- | --- | --- |
+| `comp_or_dist` | ` ts_prox_recheck(to_tsvector('simple','a x x c x x b'),'(a \| b) <~2> c') = ts_prox_recheck(to_tsvector('simple','a x x c x x b'),'(a <~2> c) \| (b <~2> c)') ` | `true` |
+| `comp_or_sym` | ` ts_prox_recheck(to_tsvector('simple','a c b'),'(a \| b) <~2> c') = ts_prox_recheck(to_tsvector('simple','a c b'),'c <~2> (a \| b)') ` | `true` |
+| `comp_chain_assoc` | ` ts_prox_recheck(to_tsvector('simple','a x b x c'),'a <~2> b <~2> c') = ts_prox_recheck(to_tsvector('simple','a x b x c'),'(a <~2> b) <~2> c') ` | `true` |
+| `comp_span_ne_or` | ` ts_prox_recheck(to_tsvector('simple','a x x c x x b'),'(a <~9> b) <~2> c') <> ts_prox_recheck(to_tsvector('simple','a x x c x x b'),'(a \| b) <~2> c') ` | `true` |
+
 full pipeline: index selection AND recheck (the decomposed two-clause form)
 
 | label | expression | expected |
@@ -99,8 +131,6 @@ same-occurrence chain (ts_prox_chain)
 | `se5` | ` to_tsvector('simple','a c') @@ ts_prox_query('(a \| b) <~5> c') ` | `true` |
 | `se6` | ` to_tsvector('simple','b c') @@ ts_prox_query('(a \| b) <~5> c') ` | `true` |
 | `se7` | ` to_tsvector('simple','a') @@ ts_prox_query('(a \| b) <~5> c') ` | `false` |
-| `se8` | ` to_tsvector('simple','a b c') @@ ts_prox_query('(a & b) <~5> c') ` | `true` |
-| `se9` | ` to_tsvector('simple','a c') @@ ts_prox_query('(a & b) <~5> c') ` | `false` |
 | `se10` | ` to_tsvector('simple','confidential') @@ ts_prox_query('confidential <!~5> email') ` | `true` |
 | `se11` | ` to_tsvector('simple','email') @@ ts_prox_query('confidential <!~5> email') ` | `false` |
 | `se12` | ` to_tsvector('simple','foo bar') @@ ts_prox_query('foo & !bar') ` | `true` |
@@ -116,7 +146,6 @@ skeleton lowering (`ts_prox_query_skeleton` exact text)
 | label | expression | expected |
 | --- | --- | --- |
 | `sk1` | ` ts_prox_query_skeleton('a <~5> b') ` | `('a' & 'b')` |
-| `sk2` | ` ts_prox_query_skeleton('(a & b) <~5> c') ` | `(('a' & 'c') & ('b' & 'c'))` |
 | `sk3` | ` ts_prox_query_skeleton('"quick fox"') ` | `('quick' <-> 'fox')` |
 | `sk4` | ` ts_prox_query_skeleton('appl*') ` | `'appl':*` |
 | `sk5` | ` ts_prox_query_skeleton('a <2> b') ` | `('a' <2> 'b')` |
@@ -131,6 +160,26 @@ skeleton lowering (`ts_prox_query_skeleton` exact text)
 | `sk14` | ` ts_prox_query_skeleton('a & b \| c') ` | `(('a' & 'b') \| 'c')` |
 | `sk15` | ` ts_prox_query_skeleton('a <-> b <-> c') ` | `('a' <-> 'b' <-> 'c')` |
 | `sk16` | ` ts_prox_query_skeleton('a <!~1> b') ` | `'a'` |
+
+native pushdown lowering (`ts_prox_query_native` / `ts_prox_query_exact` exact text) — the recheck-DROPPING form, built with `tsqueryin` so the lexemes are VERBATIM (unlike the `to_tsquery`-lowered skeleton above). A single-quoted (or bare) term that contains a parser-splitting char — hyphen, apostrophe — must stay ONE lexeme and must NOT be re-tokenized into a parts-phrase; the 2-arg `simple` lexer lowercases ASCII only. The match-table can't reach this (its docs always come from `to_tsvector('simple', …)`, which lays the split parts out consecutively so a re-expanded phrase still hits), so it is pinned here as exact text and against a literal compound-only `::tsvector`.
+
+| label | expression | expected |
+| --- | --- | --- |
+| `nv1` | ` ts_prox_query_native($$'a-b-c'$$) ` | `'a-b-c'` |
+| `nv2` | ` ts_prox_query_native($$'a-b-c-d-e-f'$$) ` | `'a-b-c-d-e-f'` |
+| `nv3` | ` ts_prox_query_native($$'it''s'$$) ` | `'it''s'` |
+| `nv4` | ` ts_prox_query_native($$'a-b-c' <-> z$$) ` | `'a-b-c' <-> 'z'` |
+| `nv5` | ` ts_prox_query_native('a-b-c') ` | `'a-b-c'` |
+| `nv6` | ` ts_prox_query_native($$'Café'$$) ` | `'café'` |
+| `nv7` | ` ts_prox_query_exact($$'a-b-c'$$) ` | `'a-b-c'` |
+
+…and end-to-end against a vector that stores the compound as a SINGLE lexeme (no split parts — the `proxquery_to_tsvector` / hand-built shape): the literal matches, and the native and exact `@@` both equal the recheck (pre-fix the `to_tsquery` re-expansion missed this).
+
+| label | expression | expected |
+| --- | --- | --- |
+| `nv8` | ` ts_prox_recheck($$'well-known':1 'fact':2$$::tsvector, $$'well-known'$$) ` | `true` |
+| `nv9` | ` $$'well-known':1 'fact':2$$::tsvector @@ ts_prox_query_native($$'well-known'$$) ` | `true` |
+| `nv10` | ` $$'well-known':1 'fact':2$$::tsvector @@ ts_prox_query_exact($$'well-known'$$) ` | `true` |
 
 distance clamp `<0>` = same position, on a literal co-located tsvector
 
@@ -207,7 +256,6 @@ Recheck pairs run as `ts_prox_recheck(to_tsvector('simple', doc), query)`.
 | `g5` | `pick the best tense` | `te?t` | `false` |
 | `g6` | `we love c sharp` | `'c'` | `true` |
 | `g7` | `we love rust` | `'c'` | `false` |
-| `gr1` | `a z z z z z z z z z z b c` | `(a & b) <~5> c` | `false` |
 | `gr2` | `a z z z z z z z z z z b c` | `a & (b <~5> c)` | `true` |
 | `gr3` | `a z z z z z c` | `(a \| b) <~5> c` | `false` |
 | `gr4` | `a z z z z z c` | `a \| (b <~5> c)` | `true` |
@@ -232,8 +280,6 @@ Recheck pairs run as `ts_prox_recheck(to_tsvector('simple', doc), query)`.
 | `m13` | `discount foo price` | `price <!~5> discount` | `false` |
 | `nw_pre_b` | `a b x x a` | `a <!~1> b` | `true` |
 | `nw_pre_nob` | `a c` | `a <!~1> b` | `true` |
-| `m14` | `a c b` | `(a & b) <~2> c` | `true` |
-| `m15` | `a w w w w c b` | `(a & b) <~2> c` | `false` |
 | `m16` | `alpha x beta x gamma` | `alpha <~2> beta <~2> gamma` | `true` |
 | `m17` | `alpha x x x beta x x x gamma` | `alpha <~2> beta <~2> gamma` | `false` |
 | `m18` | `alpha beta x x x x x x beta gamma` | `alpha <~2> beta <~2> gamma` | `false` |
@@ -275,6 +321,22 @@ Recheck pairs run as `ts_prox_recheck(to_tsvector('simple', doc), query)`.
 | `span3` | `a x c x x g x x x a x c` | `(a <~2> c) <~1> g` | `false` |
 | `span4` | `a x c x x g x x x a x c` | `(a <~2> c) <~1> x` | `true` |
 | `chstrict` | `one two three four five six seven orange nine apple eleven banana` | `apple <~2> banana <~2> orange` | `true` |
+
+An `|` (OR) group is a valid proximity operand and DISTRIBUTES — `(a | b) <~N> c` ≡
+`(a <~N> c) | (b <~N> c)` (either operand independently within-N of `c`) — because OR is
+positional (a position-set union). It does NOT form a span; that's the *proximity*-group
+rule below. The headline discriminator is `bg_or_dist` vs `bg_prox_span` on the SAME doc
+`a x x c x x b` (a@1 c@4 b@7): the boolean `(a | b) <~2> c` is **false** (neither `a` nor `b`
+is within 2 of `c`), whereas the proximity group `(a <~9> b) <~2> c` is **true** (its span
+`[1,7]` contains `c`). Each OR leaf may itself be a phrase (resolved to its edge-to-edge
+span). An `&` (AND) group, by contrast, is NOT positional and raises on every proximity
+operator — it is never silently distributed (the `bgErr*` expression cases).
+
+| label | doc | query | expected |
+| --- | --- | --- | --- |
+| `bg_or_dist` | `a x x c x x b` | `(a \| b) <~2> c` | `false` |
+| `bg_prox_span` | `a x x c x x b` | `(a <~9> b) <~2> c` | `true` |
+| `bg_ph_or` | `p q x x x r s t` | `("p q" \| "r s") <~2> t` | `true` |
 
 Compound proximity operands resolve to their *span*, and the distance is measured **edge-to-edge**
 (nearest edge to nearest edge). A phrase `"a b"` spans `[start..end]`; a nested `(A <~X> B)` spans
@@ -360,6 +422,90 @@ non-ASCII: accented Latin and CJK. Locale-INDEPENDENT (no uppercase to case-fold
 | `u9` | `中文 文档 搜索` | `中文 <~2> 搜索` | `true` |
 | `u10` | `中文 文档 搜索` | `中文 <~1> 搜索` | `false` |
 | `u11` | `日本語` | `日本` | `false` |
+
+Multi-hyphen words generalize the single-hyphen rule (`cs_hyph_*` in the config
+cases): the stock parser emits the COMPOUND at one position, then EVERY part at
+consecutive positions — `a-b-c` → `a-b-c`:1 `a`:2 `b`:3 `c`:4, and `a-b-c-d-e-f`
+→ `a-b-c-d-e-f`:1 then `a`..`f`:2..7. So all the bare parts are mutually adjacent
+(`a <-> b`, `b <-> c`), the compound precedes part `a` by one, and a `"a b c"`
+phrase over the parts hits. The single-quoted whole compound (`'a-b-c'`) matches
+the compound lexeme verbatim. `<->`/`<N>` distances are pinned with boundary pairs.
+
+| label | doc | query | expected |
+| --- | --- | --- | --- |
+| `mh_term` | `a-b-c` | `'a-b-c'` | `true` |
+| `mh_ab` | `a-b-c` | `a <-> b` | `true` |
+| `mh_bc` | `a-b-c` | `b <-> c` | `true` |
+| `mh_ac0` | `a-b-c` | `a <-> c` | `false` |
+| `mh_ac1` | `a-b-c` | `a <2> c` | `true` |
+| `mh_phrase` | `a-b-c` | `"a b c"` | `true` |
+| `mh_chain` | `a-b-c` | `a <-> b <-> c` | `true` |
+| `mh_comp_far` | `a-b-c` | `'a-b-c' <-> b` | `false` |
+
+Six-part compound (`a-b-c-d-e-f` → compound:1, parts `a`..`f` at 2..7): the whole
+compound is one verbatim lexeme, the six parts form a consecutive phrase, and the
+first-to-last part distance is 5 (`a <-> f` misses, `a <5> f` hits, `<~5>` is
+symmetric). OR-ing the compound into a near-term reaches it where the bare part can't.
+
+| label | doc | query | expected |
+| --- | --- | --- | --- |
+| `mh6_term` | `a-b-c-d-e-f` | `'a-b-c-d-e-f'` | `true` |
+| `mh6_phrase` | `a-b-c-d-e-f` | `"a b c d e f"` | `true` |
+| `mh6_af0` | `a-b-c-d-e-f` | `a <-> f` | `false` |
+| `mh6_af1` | `a-b-c-d-e-f` | `a <5> f` | `true` |
+| `mh6_af_sym` | `a-b-c-d-e-f` | `a <~5> f` | `true` |
+| `mh6_or` | `a-b-c-d-e-f` | `a <~1> (b \| 'a-b-c-d-e-f')` | `true` |
+
+Multi-hyphen with surrounding context (`x a-b-c d` → `x`:1 `a-b-c`:2 `a`:3 `b`:4
+`c`:5 `d`:6): the compound at position 2 pushes the parts one slot further from `x`
+than they look (x→a = 2, not 1), while the compound itself is adjacent to `x` and
+the last part `c` is adjacent to the trailing `d`.
+
+| label | doc | query | expected |
+| --- | --- | --- | --- |
+| `mhx_x_a0` | `x a-b-c d` | `x <~1> a` | `false` |
+| `mhx_x_a1` | `x a-b-c d` | `x <~2> a` | `true` |
+| `mhx_x_comp` | `x a-b-c d` | `x <-> 'a-b-c'` | `true` |
+| `mhx_cd` | `x a-b-c d` | `c <-> d` | `true` |
+| `mhx_ad0` | `x a-b-c d` | `a <~2> d` | `false` |
+| `mhx_ad1` | `x a-b-c d` | `a <~3> d` | `true` |
+
+Longer phrases and phrase-to-phrase proximity (doc `the quick brown fox jumps over
+the lazy dog`): a 3- and 4-word phrase, a near-miss where an interloper breaks it,
+and two multi-word phrases measured edge-to-edge (near edges `fox`@4 and `lazy`@8,
+gap 4) — symmetric `<~N>` and order-sensitive `<-N>` (reverse misses).
+
+| label | doc | query | expected |
+| --- | --- | --- | --- |
+| `lp_p3` | `the quick brown fox jumps over the lazy dog` | `"quick brown fox"` | `true` |
+| `lp_p4` | `the quick brown fox jumps over the lazy dog` | `"quick brown fox jumps"` | `true` |
+| `lp_p_miss` | `the quick brown lazy fox jumps` | `"quick brown fox"` | `false` |
+| `lp_pp0` | `the quick brown fox jumps over the lazy dog` | `"quick brown fox" <~3> "lazy dog"` | `false` |
+| `lp_pp1` | `the quick brown fox jumps over the lazy dog` | `"quick brown fox" <~4> "lazy dog"` | `true` |
+| `lp_pp_ord` | `the quick brown fox jumps over the lazy dog` | `"quick brown fox" <-4> "lazy dog"` | `true` |
+| `lp_pp_rev` | `the quick brown fox jumps over the lazy dog` | `"lazy dog" <-4> "quick brown fox"` | `false` |
+| `lp_long_ph` | `one two three four five six seven` | `"two three four five six"` | `true` |
+
+Combination smoke tests — reasonable multi-operator queries a real user might write,
+each with its hit/miss twin: boolean-of-proximity (`&`, `\|`, `!`), nested proximity
+groups, a proximity span fed into not-within, and a degenerate prefix+suffix+boolean
+mix. The point is that combinations don't error and both ports agree (and that
+`ts_prox_search` equals the recheck — these all stay index-expressible).
+
+| label | doc | query | expected |
+| --- | --- | --- | --- |
+| `cmb_and` | `the quick brown fox and the lazy dog` | `(quick <~3> fox) & (lazy <~2> dog)` | `true` |
+| `cmb_and_miss` | `the quick brown fox sleeps soundly` | `(quick <~3> fox) & (lazy <~2> dog)` | `false` |
+| `cmb_or` | `wear the cat hat today` | `(quick <~5> fox) \| (cat <~2> hat)` | `true` |
+| `cmb_not` | `the quick brown fox jumps` | `(quick <~3> fox) & !cat` | `true` |
+| `cmb_not_miss` | `the quick brown fox cat` | `(quick <~3> fox) & !cat` | `false` |
+| `cmb_nest` | `a b q q c d e` | `(a <~3> b) <~5> (c <-> d)` | `true` |
+| `cmb_nest_b` | `a b q q c d e` | `((a <~3> b) <~5> (c <-> d)) & e` | `true` |
+| `cmb_nw` | `quick fox z z z z z cat` | `(quick <-3> fox) <!~5> cat` | `true` |
+| `cmb_nw_hit` | `quick fox cat here` | `(quick <-3> fox) <!~5> cat` | `false` |
+| `cmb_degen` | `study of microbiology in the lab report` | `(stud* <~3> *ology) & report & !exam` | `true` |
+| `cmb_pfx_ph` | `the running shoes on sale` | `"runn* shoes" <~3> sale` | `true` |
+| `cmb_mix` | `send the confidential report by email now` | `confidential <~2> report <!~5> email` | `false` |
 
 ## Config cases
 

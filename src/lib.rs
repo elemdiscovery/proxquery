@@ -111,13 +111,17 @@ fn ts_prox_query_native_string(query: &str) -> Option<String> {
     dsl::native_tsquery_string(query)
 }
 
-// `tsquery` form of the native skeleton, mirroring `ts_prox_query` — introspection
-// for the pushdown expansion. NULL for a non-native query.
+// `tsquery` form of the native skeleton — introspection for the pushdown expansion.
+// NULL for a non-native query. `::tsquery` (tsqueryin) takes the lexemes VERBATIM — the
+// SAME path the `@~@` C support uses (see `support::index_condition`) and the pure port's
+// `ts_prox_query_native`. NOT `to_tsquery`: that re-tokenizes the lexemes, expanding a
+// single-quoted literal like `'a-b-c'` into the phrase `'a-b-c' <-> 'a' <-> 'b' <-> 'c'`,
+// which both breaks the "@@ is EXACTLY the recheck" contract and diverges from the port.
 pgrx::extension_sql!(
     r#"
 CREATE FUNCTION ts_prox_query_native(query text) RETURNS tsquery
     LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT
-    AS $$ SELECT to_tsquery('simple', ts_prox_query_native_string($1)) $$;
+    AS $$ SELECT ts_prox_query_native_string($1)::tsquery $$;
 "#,
     name = "ts_prox_query_native_wrapper",
     requires = [ts_prox_query_native_string],
@@ -225,7 +229,7 @@ fn cached_ast(query: &str) -> Result<Rc<dsl::Node>, String> {
     {
         return Ok(node);
     }
-    let parsed = dsl::normalize(dsl::parse(query)?);
+    let parsed = dsl::normalize(dsl::parse(query)?)?;
     dsl::validate_regexes(&parsed)?; // a malformed ##regex## fails the query up front
     let parsed = Rc::new(parsed);
     PROXMATCH_AST.with(|c| *c.borrow_mut() = Some((query.to_owned(), Rc::clone(&parsed))));
@@ -601,9 +605,10 @@ mod tests {
 
     #[pg_test]
     fn skeleton_and_lift_not_within_and_negation() {
-        // (a & b) <~5> c lifts AND out → all three lexemes required.
-        assert!(selects("a b c", "(a & b) <~5> c"));
-        assert!(!selects("a c", "(a & b) <~5> c")); // missing b
+        // A boolean `&` can't be a proximity operand (it no longer silently distributes);
+        // the writer spells out the conjunction, whose skeleton still requires all three.
+        assert!(selects("a b c", "(a <~5> c) & (b <~5> c)"));
+        assert!(!selects("a c", "(a <~5> c) & (b <~5> c)")); // missing b
         // <!~N> contributes only the companion term; recheck owns the distance.
         assert!(selects("confidential", "confidential <!~5> email"));
         assert!(!selects("email", "confidential <!~5> email"));
@@ -848,10 +853,11 @@ mod tests {
     }
 
     #[pg_test]
-    fn recheck_and_lift_shares_anchor() {
-        // (a & b) <~2> c ⇒ both a and b within 2 of c.
-        assert!(proxmatch("a c b", "(a & b) <~2> c")); // a@1 c@2 b@3
-        assert!(!proxmatch("a w w w w c b", "(a & b) <~2> c")); // a is 5 from c
+    fn recheck_and_conjunction_shares_anchor() {
+        // A boolean `&` can't be a proximity operand (it raises); the explicit
+        // conjunction (a <~2> c) & (b <~2> c) anchors both a and b to the same c.
+        assert!(proxmatch("a c b", "(a <~2> c) & (b <~2> c)")); // a@1 c@2 b@3
+        assert!(!proxmatch("a w w w w c b", "(a <~2> c) & (b <~2> c)")); // a is 5 from c
     }
 
     #[pg_test]
@@ -994,6 +1000,55 @@ mod tests {
                   "a & !b", "(a <~5> b) <~5> c", "a <-0> b"] {
             assert!(b(&format!("SELECT ts_prox_query_native_string('{q}') IS NULL")), "expected fallback: {q}");
         }
+    }
+
+    #[pg_test]
+    fn native_literal_is_verbatim_across_case_accent_and_punctuation() {
+        // Regression for the `ts_prox_query_native` wrapper bug: it fed the verbatim
+        // native string through `to_tsquery('simple', …)`, which RE-TOKENIZED the
+        // lexemes — expanding a single-quoted literal `'a-b-c'` into the parts-phrase
+        // `'a-b-c' <-> 'a' <-> 'b' <-> 'c'` and folding case/accent by locale. The fix
+        // casts `::tsquery` (tsqueryin) instead — the SAME verbatim path the `@~@` C
+        // support and the pure port use — so the lexemes match the recheck's exact byte
+        // lookup. (See also the diff corpus for the cross-port `@@`-value parity.)
+        let nat = |q: &str| {
+            Spi::get_one::<String>(&format!("SELECT ts_prox_query_native($q${q}$q$)::text"))
+                .unwrap()
+                .unwrap()
+        };
+        // Hyphen / apostrophe / multi-part literals stay ONE verbatim lexeme…
+        assert_eq!(nat("'a-b-c'"), "'a-b-c'");
+        assert_eq!(nat("'a-b-c-d-e-f'"), "'a-b-c-d-e-f'");
+        assert_eq!(nat("'it''s'"), "'it''s'");
+        // …including as a proximity operand (no part-expansion bleeding in).
+        assert_eq!(nat("'a-b-c' <-> z"), "'a-b-c' <-> 'z'");
+        // Case / accent: the 2-arg `simple` DSL lexer lowercases ASCII ONLY, and the
+        // native form mirrors that EXACTLY — the same lexeme the recheck looks up.
+        assert_eq!(nat("'café'"), "'café'"); // already-lower accented: unchanged
+        assert_eq!(nat("'Café'"), "'café'"); // ASCII `C`→`c`, accent kept
+        assert_eq!(nat("'CAFÉ'"), "'cafÉ'"); // ASCII `CAF`→`caf`; uppercase `É` NOT folded
+        assert_eq!(nat("'CAFE'"), "'cafe'"); // pure ASCII fully lowercased
+        assert_eq!(nat("'A-B-C'"), "'a-b-c'"); // ASCII-lowercased hyphen literal
+
+        // The restored contract: `@@ ts_prox_query_native` EQUALS the recheck for every
+        // one of these literals — so the native path never folds case/accent where the
+        // verbatim recheck would not. (`'CAFÉ'`→`cafÉ` misses the stored `café`, matching
+        // the recheck; only `'café'`/`'Café'` hit.)
+        let doc = "to_tsvector('simple','un café noir')";
+        for q in ["'café'", "'Café'", "'CAFÉ'", "'cafe'", "'CAFE'"] {
+            let rc = b(&format!("SELECT ts_prox_recheck({doc}, $q${q}$q$)"));
+            let nat_at = b(&format!("SELECT {doc} @@ ts_prox_query_native($q${q}$q$)"));
+            assert_eq!(rc, nat_at, "native @@ must equal the recheck for literal {q}");
+        }
+
+        // End-to-end on a vector holding ONLY the compound lexeme (no split parts — as a
+        // `proxquery_to_tsvector` column or a hand-built tsvector would). The literal
+        // matches it: recheck, native `@@`, and the `@~@` operator all agree. Pre-fix the
+        // `to_tsquery` expansion made the native `@@` MISS (the parts-phrase is absent).
+        let v = "$$'a-b-c':1 'fact':2$$::tsvector";
+        assert!(b(&format!("SELECT ts_prox_recheck({v}, $q$'a-b-c'$q$)")));
+        assert!(b(&format!("SELECT {v} @@ ts_prox_query_native($q$'a-b-c'$q$)")));
+        assert!(b(&format!("SELECT {v} @~@ $q$'a-b-c'$q$")));
     }
 
     #[pg_test]
@@ -1211,10 +1266,12 @@ mod tests {
 
     #[pg_test]
     fn grouping_changes_meaning() {
-        // (a & b) <~5> c lifts the AND → BOTH within 5 of c; a & (b <~5> c) → a
-        // present AND (b within 5 of c). a far from c, b adjacent to c → they differ.
+        // The explicit conjunction (a <~5> c) & (b <~5> c) needs BOTH within 5 of c;
+        // a & (b <~5> c) needs only a present AND b within 5 of c. a far from c, b
+        // adjacent to c → they differ. (`(a & b) <~5> c` itself raises — a boolean `&`
+        // is not a proximity operand; see the `bgErr*` corpus cases.)
         let d = "a z z z z z z z z z z b c"; // a@1 b@12 c@13
-        assert!(!proxmatch(d, "(a & b) <~5> c"));
+        assert!(!proxmatch(d, "(a <~5> c) & (b <~5> c)"));
         assert!(proxmatch(d, "a & (b <~5> c)"));
 
         // (a | b) <~5> c → (a or b) within 5 of c; a | (b <~5> c) → a present OR ….

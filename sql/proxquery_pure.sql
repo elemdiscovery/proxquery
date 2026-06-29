@@ -651,7 +651,7 @@ END
 $fn$;
 
 -- ===========================================================================
--- Normalization  (lift AND/NOT out of proximity operands; keep OR/phrase in)
+-- Normalization  (reject non-positional proximity operands; keep OR/phrase in)
 -- ===========================================================================
 
 CREATE OR REPLACE FUNCTION _prox_flatten(is_and boolean, children jsonb) RETURNS jsonb
@@ -680,23 +680,38 @@ BEGIN
 END
 $fn$;
 
+-- A proximity operand must be POSITIONAL (term/prefix/glob/regex/phrase, an OR of those,
+-- or a nested proximity). The two non-positional booleans raise — recursively, so an `&`/`!`
+-- buried in an OR (`(a | !b) <~N> c`) or a nested proximity (`a <~N> (b <~N> !c)`) is caught
+-- here at normalize time, not silently mis-evaluated downstream. Mirrors the extension's
+-- `check_positional` / AND_OPERAND_ERR / NOT_OPERAND_ERR.
+CREATE OR REPLACE FUNCTION _prox_check_positional(node jsonb) RETURNS void
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE t text := node ->> 't'; child jsonb;
+BEGIN
+    IF t = 'and' THEN
+        RAISE EXCEPTION '`&` (AND) cannot be a proximity operand; write the conjunction explicitly, e.g. `(a <~N> c) & (b <~N> c)`, or a co-occurrence group `(a <~M> b) <~N> c`';
+    ELSIF t = 'not' THEN
+        RAISE EXCEPTION '`!` (NOT) cannot be a proximity operand; use `!(a <~N> c)` for document-level negation, or `c <!~N> a` for an occurrence of c with no nearby a';
+    ELSIF t = 'or' THEN
+        FOR child IN SELECT jsonb_array_elements(node -> 'c') LOOP
+            PERFORM _prox_check_positional(child);
+        END LOOP;
+    ELSIF t = 'within' OR t = 'notwithin' THEN
+        PERFORM _prox_check_positional(node -> 'a');
+        PERFORM _prox_check_positional(node -> 'b');
+    END IF;  -- term/exact/prefix/glob/regex/phrase: positional, ok
+END
+$fn$;
+
 CREATE OR REPLACE FUNCTION _prox_make_within(a jsonb, b jsonb, n int, ordered boolean) RETURNS jsonb
     LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
 $fn$
 BEGIN
-    IF a ->> 't' = 'and' THEN
-        RETURN _prox_flatten(true, (SELECT jsonb_agg(_prox_make_within(x, b, n, ordered) ORDER BY ord)
-                                    FROM jsonb_array_elements(a -> 'c') WITH ORDINALITY AS t(x, ord)));
-    ELSIF a ->> 't' = 'not' THEN
-        RETURN jsonb_build_object('t', 'not', 'x', _prox_make_within(a -> 'x', b, n, ordered));
-    ELSIF b ->> 't' = 'and' THEN
-        RETURN _prox_flatten(true, (SELECT jsonb_agg(_prox_make_within(a, y, n, ordered) ORDER BY ord)
-                                    FROM jsonb_array_elements(b -> 'c') WITH ORDINALITY AS t(y, ord)));
-    ELSIF b ->> 't' = 'not' THEN
-        RETURN jsonb_build_object('t', 'not', 'x', _prox_make_within(a, b -> 'x', n, ordered));
-    ELSE
-        RETURN jsonb_build_object('t', 'within', 'a', a, 'b', b, 'n', n, 'ord', ordered);
-    END IF;
+    PERFORM _prox_check_positional(a);
+    PERFORM _prox_check_positional(b);
+    RETURN jsonb_build_object('t', 'within', 'a', a, 'b', b, 'n', n, 'ord', ordered);
 END
 $fn$;
 
@@ -704,19 +719,9 @@ CREATE OR REPLACE FUNCTION _prox_make_not_within(a jsonb, b jsonb, n int, ordere
     LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
 $fn$
 BEGIN
-    IF a ->> 't' = 'and' THEN
-        RETURN _prox_flatten(true, (SELECT jsonb_agg(_prox_make_not_within(x, b, n, ordered) ORDER BY ord)
-                                    FROM jsonb_array_elements(a -> 'c') WITH ORDINALITY AS t(x, ord)));
-    ELSIF a ->> 't' = 'not' THEN
-        RETURN jsonb_build_object('t', 'not', 'x', _prox_make_not_within(a -> 'x', b, n, ordered));
-    ELSIF b ->> 't' = 'and' THEN
-        RETURN _prox_flatten(true, (SELECT jsonb_agg(_prox_make_not_within(a, y, n, ordered) ORDER BY ord)
-                                    FROM jsonb_array_elements(b -> 'c') WITH ORDINALITY AS t(y, ord)));
-    ELSIF b ->> 't' = 'not' THEN
-        RETURN jsonb_build_object('t', 'not', 'x', _prox_make_not_within(a, b -> 'x', n, ordered));
-    ELSE
-        RETURN jsonb_build_object('t', 'notwithin', 'a', a, 'b', b, 'n', n, 'ord', ordered);
-    END IF;
+    PERFORM _prox_check_positional(a);
+    PERFORM _prox_check_positional(b);
+    RETURN jsonb_build_object('t', 'notwithin', 'a', a, 'b', b, 'n', n, 'ord', ordered);
 END
 $fn$;
 
@@ -1030,7 +1035,7 @@ BEGIN
         RETURN coalesce((SELECT array_agg(DISTINCT p ORDER BY p)
                          FROM _prox_occ(node, v) AS o, generate_series(o.s, o.e) AS p), '{}'::int[]);
     ELSE
-        RAISE EXCEPTION 'AND/NOT cannot be a proximity operand (normalization should have lifted it)';
+        RAISE EXCEPTION 'AND/NOT cannot be a proximity operand (normalization should have rejected it)';
     END IF;
 END
 $fn$;
