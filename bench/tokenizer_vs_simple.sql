@@ -66,12 +66,13 @@ SELECT count(*) AS docs,
        pg_size_pretty(pg_relation_size('tbench_prox_gin'))   AS prox_gin
 FROM tbench;
 
--- avg server-side ms over `iters` runs, after a warmup (same harness as the sibling).
+-- avg server-side ms over `iters` runs, NO warmup (the corpus is cache-warm from the build;
+-- qualitative timings). Same 2-arg signature as the sibling scripts — report.sh loads them
+-- all into one database, so the signatures must match to avoid an overload-ambiguity error.
 CREATE OR REPLACE FUNCTION bench_ms(q text, iters int) RETURNS numeric
 LANGUAGE plpgsql AS $$
 DECLARE t0 timestamptz; t1 timestamptz; i int; sink bigint;
 BEGIN
-  EXECUTE q INTO sink;
   t0 := clock_timestamp();
   FOR i IN 1..iters LOOP EXECUTE q INTO sink; END LOOP;
   t1 := clock_timestamp();

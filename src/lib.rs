@@ -1456,6 +1456,94 @@ mod tests {
     }
 
     #[pg_test]
+    fn tsvector_source_variants() {
+        // proxquery operates on a `tsvector`; it must not care HOW that tsvector is obtained.
+        // Build the SAME data four ways and confirm every access form (`@~@`, `ts_prox_search`,
+        // the explicit two-clause) returns the SAME rows from each:
+        //   A. a stored `tsvector` column (the classic manual / trigger-maintained pattern)
+        //   B. a `GENERATED ALWAYS AS (to_tsvector(...)) STORED` column
+        //   C. a `text` column with a FUNCTIONAL gin index on `to_tsvector(...)` (never stored)
+        //   D. a `text` column, tsvector computed on the fly, NO index (seq scan)
+        // Smoke-level: identical data ⇒ identical tsvectors ⇒ identical results if it works at
+        // all. Also asserts the indexed forms (A/B/C) take a Bitmap Index Scan, confirming the
+        // `@~@` support function's index pushdown works for an EXPRESSION index, not just a Var.
+        Spi::run(
+            "CREATE TEMP TABLE src(id serial primary key, body text); \
+             INSERT INTO src(body) SELECT d FROM unnest(ARRAY[ \
+                'the quick brown fox', 'a quick red fox', 'lazy brown dog', \
+                'quick brown bear', 'the fox is quick', 'quick a b c d fox']) AS d, generate_series(1,20)",
+        ).unwrap();
+        // A: stored tsvector column. B: generated stored column. C: text + functional index. D: text, no index.
+        Spi::run("CREATE TEMP TABLE va AS SELECT id, to_tsvector('simple', body) AS tsv FROM src; \
+                  CREATE INDEX ON va USING gin(tsv); ANALYZE va").unwrap();
+        Spi::run("CREATE TEMP TABLE vb(id int, body text, \
+                    tsv tsvector GENERATED ALWAYS AS (to_tsvector('simple', body)) STORED); \
+                  INSERT INTO vb(id, body) SELECT id, body FROM src; \
+                  CREATE INDEX ON vb USING gin(tsv); ANALYZE vb").unwrap();
+        Spi::run("CREATE TEMP TABLE vc AS SELECT id, body FROM src; \
+                  CREATE INDEX vc_fx ON vc USING gin(to_tsvector('simple', body)); ANALYZE vc").unwrap();
+        Spi::run("CREATE TEMP TABLE vd AS SELECT id, body FROM src; ANALYZE vd").unwrap();
+
+        let ids = |from_where: &str| -> Vec<i32> {
+            Spi::get_one::<Vec<i32>>(&format!(
+                "SELECT coalesce(array_agg(id ORDER BY id), '{{}}'::int[]) FROM {from_where}"
+            )).unwrap().unwrap()
+        };
+
+        // The chained 3-`<~>` query CANNOT collapse to an index-only plan (its skeleton is
+        // the non-exact `the & quick & brown & fox`), so the second-level recheck is mandatory
+        // on every source — for the functional index (C) and the no-index source (D) that means
+        // the recheck recomputes `to_tsvector('simple', body)` from the heap text. The droppable
+        // shapes (boolean / phrase) cover the index-only collapse path.
+        for q in [
+            "the <~3> quick <~3> brown <~3> fox", // 3 within-ops: recheck mandatory, can't collapse
+            "quick & fox", "quick <~2> fox", "\"quick brown\"", "quick <!~3> fox",
+        ] {
+            // Ground truth: the stored column via the bare recheck (no index, no @@).
+            let want = ids(&format!("va WHERE ts_prox_recheck(tsv, '{q}')"));
+            assert!(!want.is_empty(), "test-data sanity: [{q}] should match some rows");
+            for f in [
+                // A — stored column
+                format!("va WHERE tsv @~@ '{q}'"),
+                format!("va WHERE ts_prox_search(tsv, '{q}')"),
+                format!("va WHERE tsv @@ ts_prox_query('{q}') AND ts_prox_recheck(tsv, '{q}')"),
+                // B — generated stored column
+                format!("vb WHERE tsv @~@ '{q}'"),
+                format!("vb WHERE ts_prox_search(tsv, '{q}')"),
+                // C — functional index (tsvector computed by the expression index)
+                format!("vc WHERE to_tsvector('simple', body) @~@ '{q}'"),
+                format!("vc WHERE ts_prox_search(to_tsvector('simple', body), '{q}')"),
+                format!("vc WHERE to_tsvector('simple', body) @@ ts_prox_query('{q}') AND ts_prox_recheck(to_tsvector('simple', body), '{q}')"),
+                // D — on the fly, no index
+                format!("vd WHERE to_tsvector('simple', body) @~@ '{q}'"),
+                format!("vd WHERE ts_prox_search(to_tsvector('simple', body), '{q}')"),
+            ] {
+                assert_eq!(ids(&f), want, "tsvector source/access form disagreed for [{q}]: {f}");
+            }
+        }
+
+        // The indexed sources must actually USE the index (Bitmap Index Scan) — including the
+        // functional/expression index, which exercises the support fn on a non-Var leftarg.
+        Spi::run("SET enable_seqscan = off").unwrap();
+        Spi::run(
+            "CREATE FUNCTION src_plan_has(qry text, pat text) RETURNS bool AS $$ \
+             DECLARE line text; hit bool := false; \
+             BEGIN FOR line IN EXECUTE 'EXPLAIN ' || qry LOOP IF line LIKE pat THEN hit := true; END IF; END LOOP; \
+             RETURN hit; END $$ LANGUAGE plpgsql",
+        ).unwrap();
+        for (tbl, pred) in [
+            ("va", "tsv @~@ 'quick <~2> fox'"),
+            ("vb", "tsv @~@ 'quick <~2> fox'"),
+            ("vc", "to_tsvector('simple', body) @~@ 'quick <~2> fox'"),
+        ] {
+            assert!(
+                b(&format!("SELECT src_plan_has($q$SELECT count(*) FROM {tbl} WHERE {pred}$q$, '%Bitmap Index Scan%')")),
+                "{tbl}: @~@ must use the GIN index",
+            );
+        }
+    }
+
+    #[pg_test]
     fn config_aware_user_defined_config() {
         // A user-defined config works exactly like a built-in — proxquery only ever
         // passes the regconfig you name into `to_tsvector`. (Custom config, no contrib

@@ -70,7 +70,9 @@ INSERT INTO phase_t VALUES ('setup (extension + vocab + queries)', clock_timesta
 INSERT INTO phase_t VALUES ('corpus (generate + GIN)', clock_timestamp());
 
 -- ================================================================= benchmark
--- avg server-side ms over `iters` runs, after a warmup that also primes caches.
+-- avg server-side ms over `iters` runs. NO warmup: the corpus is already cache-warm from the
+-- build (and the count/indexed probes that run first), and these timings are qualitative — a
+-- smoke + parity check, not a perf baseline — so a per-query priming run isn't worth its cost.
 -- `q` MUST be a fully-formed query with the DSL string embedded as a LITERAL (callers
 -- build it with format(... %L ...)). Plain `EXECUTE q` re-plans the literal on every run
 -- with no plan cache, so each run is a custom plan where `ts_prox_search` inlines and its
@@ -81,7 +83,6 @@ CREATE OR REPLACE FUNCTION bench_ms(q text, iters int) RETURNS numeric
 LANGUAGE plpgsql AS $$
 DECLARE t0 timestamptz; t1 timestamptz; i int; sink bigint;
 BEGIN
-  EXECUTE q INTO sink;
   t0 := clock_timestamp();
   FOR i IN 1..iters LOOP EXECUTE q INTO sink; END LOOP;
   t1 := clock_timestamp();
@@ -112,16 +113,17 @@ BEGIN
     EXECUTE format('SELECT count(*) FROM corpus WHERE body_tsv @@ public.ts_prox_query(%L)', r.q) INTO cand;
     EXECUTE format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q) INTO matc;
     exop := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q), it);
+    seqms := NULL;
     IF do_seq THEN
-      -- Same `@~@` query with the index DISABLED: the positional recheck runs over EVERY
-      -- row (a full seq scan) — the brute-force baseline the GIN index accelerates, and the
-      -- timing counterpart of the index-vs-seq-scan correctness test. Off by default (and on
-      -- the large tier): a whole-corpus recheck per query would dominate the run.
+      -- Same `@~@` query with the index DISABLED: the positional recheck runs over EVERY row
+      -- (a full seq scan) — the brute-force baseline the GIN index accelerates, and the timing
+      -- counterpart of the index-vs-seq-scan correctness test. Always ONE run (this column is
+      -- qualitative — an order-of-magnitude index speedup, not a precise per-query metric), and
+      -- not multiplied by `iters`. Off by default (and on the large tier), where a whole-corpus
+      -- recheck per query would dominate.
       SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off;
-      seqms := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q), it);
+      seqms := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q), 1);
       SET LOCAL enable_indexscan = on;  SET LOCAL enable_bitmapscan = on;
-    ELSE
-      seqms := NULL;
     END IF;
     IF do_pure THEN
       -- The consolidated `ts_prox_search` is the recommended portable form (it inlines to
