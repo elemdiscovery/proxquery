@@ -70,21 +70,19 @@ INSERT INTO phase_t VALUES ('setup (extension + vocab + queries)', clock_timesta
 INSERT INTO phase_t VALUES ('corpus (generate + GIN)', clock_timestamp());
 
 -- ================================================================= benchmark
--- avg server-side ms over `iters` runs, after an optional warmup that primes caches.
+-- avg server-side ms over `iters` runs. NO warmup: the corpus is already cache-warm from the
+-- build (and the count/indexed probes that run first), and these timings are qualitative — a
+-- smoke + parity check, not a perf baseline — so a per-query priming run isn't worth its cost.
 -- `q` MUST be a fully-formed query with the DSL string embedded as a LITERAL (callers
 -- build it with format(... %L ...)). Plain `EXECUTE q` re-plans the literal on every run
 -- with no plan cache, so each run is a custom plan where `ts_prox_search` inlines and its
 -- recheck folds — i.e. we time the real index-served plan. Do NOT switch to `EXECUTE ...
 -- USING $1` or `PREPARE`: a parameterized/generic plan can't const-fold the query and
 -- silently stops the inlining/fold, which would make the timings measure the wrong plan.
--- `warmup` defaults on (a per-query priming run); the seq-scan baseline passes false — the
--- corpus is already cache-warm from the build + the indexed measurements, so its own warmup
--- would just be a second full-table scan for no benefit.
-CREATE OR REPLACE FUNCTION bench_ms(q text, iters int, warmup boolean DEFAULT true) RETURNS numeric
+CREATE OR REPLACE FUNCTION bench_ms(q text, iters int) RETURNS numeric
 LANGUAGE plpgsql AS $$
 DECLARE t0 timestamptz; t1 timestamptz; i int; sink bigint;
 BEGIN
-  IF warmup THEN EXECUTE q INTO sink; END IF;
   t0 := clock_timestamp();
   FOR i IN 1..iters LOOP EXECUTE q INTO sink; END LOOP;
   t1 := clock_timestamp();
@@ -119,13 +117,12 @@ BEGIN
     IF do_seq THEN
       -- Same `@~@` query with the index DISABLED: the positional recheck runs over EVERY row
       -- (a full seq scan) — the brute-force baseline the GIN index accelerates, and the timing
-      -- counterpart of the index-vs-seq-scan correctness test. Run over the full query set but
-      -- ONE un-warmed timed run each (the column is qualitative — an order-of-magnitude index
-      -- speedup, not a precise per-query metric): the corpus is already cache-warm from the
-      -- build + the indexed measurements, and a second scan would only triple the cost. Off by
-      -- default (and on the large tier), where a whole-corpus recheck per query would dominate.
+      -- counterpart of the index-vs-seq-scan correctness test. Always ONE run (this column is
+      -- qualitative — an order-of-magnitude index speedup, not a precise per-query metric), and
+      -- not multiplied by `iters`. Off by default (and on the large tier), where a whole-corpus
+      -- recheck per query would dominate.
       SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off;
-      seqms := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q), 1, false);
+      seqms := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q), 1);
       SET LOCAL enable_indexscan = on;  SET LOCAL enable_bitmapscan = on;
     END IF;
     IF do_pure THEN

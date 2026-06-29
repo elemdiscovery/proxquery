@@ -57,7 +57,14 @@ commit_parsers = [
     # Also kept, in their own sections.
     { message = "^docs",   group = "documentation" },
 
-    # Mark as breaking if you want to mention it
+    # Ad-hoc override: force an otherwise-skipped commit into the changelog by
+    # adding a "Changelog: include" trailer to the commit message. No breaking
+    # flag required — mirrors protect_breaking_commits, but opt-in per commit.
+    # Must sit above the skip rules: git-cliff is first-match-wins per commit.
+    # cSpell: disable-next-line
+    { footer = "^[Cc]hangelog: ?include", group = "changed" },
+
+    # Add a "Changelog: include" trailer) to mention it
     { message = "^test",   group = "testing", skip = true },
 
     # Development noise — dropped.

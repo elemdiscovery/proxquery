@@ -97,13 +97,13 @@ jobs:
       PGRX_VERSION: 0.19.1
       # Read by bench/report.sh. Main by-shape table: small large-bench tier (varied,
       # frequency-skewed query mix). NDOCS/ITERS feed the supplementary tokenizer +
-      # scaling sections. Small corpus + few iters — correctness + smoke, not stable
-      # timings.
+      # scaling sections. Small corpus + ONE un-warmed run per query — this is a
+      # correctness + smoke + parity check, NOT a stable perf baseline.
       SMALL_MB: 64
       NQUERIES: 160
-      LB_ITERS: 2
+      LB_ITERS: 1
       NDOCS: 10000
-      ITERS: 3
+      ITERS: 1
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0

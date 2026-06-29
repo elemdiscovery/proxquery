@@ -10,18 +10,18 @@
 #
 # Tunables (env):
 #   main by-shape table (large-bench small tier): SMALL_MB (32), NQUERIES (120),
-#     LB_ITERS (2), SEED (0.42), QSEED (0.137)
-#   supplementary sections: NDOCS (20000), WLEN (40), ITERS (5), SDOCS (2000)
+#     LB_ITERS (1), SEED (0.42), QSEED (0.137)
+#   supplementary sections: NDOCS (20000), WLEN (40), ITERS (1), SDOCS (2000)
 #   MAINT_DB (postgres)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Main results table: the frequency-skewed large-bench query generator at a small
 # corpus (varied terms across all 14 shapes + a real selectivity spread).
-SMALL_MB="${SMALL_MB:-32}"; NQUERIES="${NQUERIES:-120}"; LB_ITERS="${LB_ITERS:-2}"
+SMALL_MB="${SMALL_MB:-32}"; NQUERIES="${NQUERIES:-120}"; LB_ITERS="${LB_ITERS:-1}"
 SEED="${SEED:-0.42}"; QSEED="${QSEED:-0.137}"
 # Supplementary sections (tokenizer overhead, length scaling) keep their own corpora.
-NDOCS="${NDOCS:-20000}"; WLEN="${WLEN:-40}"; ITERS="${ITERS:-5}"; SDOCS="${SDOCS:-2000}"
+NDOCS="${NDOCS:-20000}"; WLEN="${WLEN:-40}"; ITERS="${ITERS:-1}"; SDOCS="${SDOCS:-2000}"
 MAINT_DB="${MAINT_DB:-postgres}"
 BENCH_DB="${BENCH_DB:-proxquery_bench_$$}"
 OUT_DIR="$ROOT/bench/reports"; mkdir -p "$OUT_DIR"
@@ -123,7 +123,8 @@ scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs s
   echo
   echo "## Results — by query shape"
   echo
-  echo "Average server-side ms/query over ${LB_ITERS} runs (after a warmup), over a"
+  echo "Average server-side ms/query over ${LB_ITERS} run(s), no warmup (corpus already"
+  echo "cache-warm) — qualitative, over a"
   echo "deterministic COCA-frequency corpus and a generated query mix — so each shape is"
   echo "exercised across a real spread of term frequencies and selectivities (\`avg_cand\`"
   echo "= rows the \`@@\` skeleton selects, \`avg_match\` = rows that actually match)."
