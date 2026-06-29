@@ -133,8 +133,10 @@ scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs s
   echo
   echo "- \`ext_op_ms\` — extension single operator \`tsv @~@ q\` (GIN-index-served)"
   echo "- \`ext_seq_ms\` — the SAME \`@~@\` query with the index disabled (recheck over every"
-  echo "  row, a full seq scan) — the brute-force baseline; identical rows, just unaccelerated"
-  echo "- \`index_speedup\` — \`ext_seq_ms / ext_op_ms\` (how much the GIN index buys)"
+  echo "  row, a full seq scan) — the brute-force baseline; identical rows, just unaccelerated."
+  echo "  One un-warmed run per query (qualitative — an order-of-magnitude index speedup, not a"
+  echo "  precise metric); the corpus is already cache-warm from the indexed measurements"
+  echo "- \`index_speedup\` — \`ext_seq_ms / ext_op_ms\` (what the GIN index buys)"
   echo "- \`ext_search_ms\` — extension via the consolidated \`ts_prox_search(tsv, q)\`"
   echo "- \`pure_search_ms\` — pure-SQL port via the same \`ts_prox_search\`"
   echo "- \`slowdown\` — \`pure_search_ms / ext_search_ms\`"
