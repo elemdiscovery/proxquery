@@ -166,10 +166,11 @@ CREATE OR REPLACE FUNCTION _prox_arr_within(a int[], b int[], n int) RETURNS boo
     LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
 $fn$ SELECT EXISTS (SELECT 1 FROM unnest(a) x, unnest(b) y WHERE abs(x - y) <= n) $fn$;
 
--- pre: some a strictly before some b within n  (∃ 0 < bⱼ − aᵢ ≤ n).
+-- pre: some a at-or-before some b within n  (∃ 0 ≤ bⱼ − aᵢ ≤ n). A co-located pair
+-- (Δ=0, only superimposition produces it) counts, so `<-0>` = same position (like `<0>`).
 CREATE OR REPLACE FUNCTION _prox_arr_pre(a int[], b int[], n int) RETURNS boolean
     LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
-$fn$ SELECT EXISTS (SELECT 1 FROM unnest(a) x, unnest(b) y WHERE y - x > 0 AND y - x <= n) $fn$;
+$fn$ SELECT EXISTS (SELECT 1 FROM unnest(a) x, unnest(b) y WHERE y - x >= 0 AND y - x <= n) $fn$;
 
 -- not_within: occurrence-level — some a has no qualifying b (true if b absent).
 -- ordered ⇒ the forbidden b lies after a, within n; else either side.
@@ -187,7 +188,7 @@ BEGIN
         SELECT 1 FROM unnest(a) x
         WHERE NOT EXISTS (
             SELECT 1 FROM unnest(b) y
-            WHERE CASE WHEN ordered THEN (y > x AND y - x <= n)
+            WHERE CASE WHEN ordered THEN (y >= x AND y - x <= n)
                        ELSE abs(x - y) <= n END));
 END
 $fn$;
@@ -208,7 +209,7 @@ $fn$
             SELECT least(x, min(y)) AS lo, greatest(x, max(y)) AS hi
             FROM unnest(a) AS x
             JOIN unnest(b) AS y
-              ON CASE WHEN ordered THEN (y > x AND y - x <= n)
+              ON CASE WHEN ordered THEN (y >= x AND y - x <= n)
                       ELSE abs(x - y) <= n END
             GROUP BY x
         ) spans
@@ -944,11 +945,12 @@ BEGIN
 END
 $fn$;
 
--- `b` edge-to-edge within `n` of `a` (overlap ⇒ 0), or — when `ord` — strictly AFTER `a`
--- within `n`. Intervals are (s,e); for point operands this is the plain |Δ| ≤ n / 0 < Δ ≤ n.
+-- `b` edge-to-edge within `n` of `a` (overlap ⇒ 0), or — when `ord` — AT OR AFTER `a`
+-- within `n`. Intervals are (s,e); for point operands this is the plain |Δ| ≤ n / 0 ≤ Δ ≤ n
+-- (a co-located pair counts, matching `_prox_arr_pre`).
 CREATE OR REPLACE FUNCTION _prox_iv_near(a_s int, a_e int, b_s int, b_e int, n int, ord boolean) RETURNS boolean
     LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
-$fn$ SELECT CASE WHEN ord THEN b_s > a_e AND b_s - a_e <= n
+$fn$ SELECT CASE WHEN ord THEN b_s >= a_e AND b_s - a_e <= n
                  ELSE b_s <= a_e + n AND a_s <= b_e + n END $fn$;
 
 -- Occurrence intervals (s,e) of a proximity operand — ONE per match, NOT densified — so
@@ -1112,7 +1114,7 @@ $fn$ SELECT to_tsquery('simple', ts_prox_query_skeleton(query)) $fn$;
 -- slow per-row positional recheck can be SKIPPED entirely (it is most of the port's
 -- cost). within/pre lower to an OR over exact gaps:
 --   a <~n> b  ≡  OR_{k=0..n} (a <k> b | b <k> a)   (either order, |Δ| ≤ n)
---   a <-n> b  ≡  OR_{k=1..n} (a <k> b)             (ordered, 0 < Δ ≤ n)
+--   a <-n> b  ≡  OR_{k=0..n} (a <k> b)             (ordered, 0 ≤ Δ ≤ n; <0> = same position)
 -- Only shapes that map EXACTLY are accepted; everything else (glob, regex, not-
 -- within, document NOT, nested/phrase proximity operands, or a distance past 32 —
 -- the extension's NATIVE_MAX_DISTANCE) returns NULL and keeps the presence skeleton +
@@ -1209,12 +1211,13 @@ BEGIN
     ELSIF t = 'within' THEN
         n := (node ->> 'n')::int;
         ord := (node ->> 'ord')::boolean;
-        IF n > 32 OR (ord AND n < 1) THEN RETURN NULL; END IF;   -- 32 = NATIVE_MAX_DISTANCE
+        IF n > 32 THEN RETURN NULL; END IF;   -- 32 = NATIVE_MAX_DISTANCE
         a := _prox_native_operand(node -> 'a');
         b := _prox_native_operand(node -> 'b');
         IF a IS NULL OR b IS NULL THEN RETURN NULL; END IF;
         IF ord THEN
-            FOR k IN 1 .. n LOOP
+            -- k=0 is the `<0>` same-position clause (a co-located pair reads as ordered-adjacent).
+            FOR k IN 0 .. n LOOP
                 clauses := array_append(clauses, a || ' <' || k || '> ' || b);
             END LOOP;
         ELSE

@@ -84,7 +84,7 @@ pub enum Node {
     And(Vec<Node>),
     Or(Vec<Node>),
     Not(Box<Node>),
-    /// `<~N>` (either order) or, when `ordered`, `<-N>` (a before b). Both ≤N.
+    /// `<~N>` (either order) or, when `ordered`, `<-N>` (a at-or-before b; co-located counts). Both ≤N.
     Within { a: Box<Node>, b: Box<Node>, n: i32, ordered: bool },
     /// `<!~N>` (either order) or, when `ordered`, `<!-N>` (no b after a within N).
     /// Occurrence-level: some `a` with no qualifying `b`.
@@ -98,8 +98,8 @@ fn parse_distance(digits: &str) -> Result<i32, String> {
         return Err(format!("expected a distance, got `{digits}`"));
     }
     // Clamp to [0, MAX]. `0` is kept (not raised to 1): native tsquery `<0>` means
-    // "same position", and the proximity ops follow suit (`within(·,0)` = same
-    // position; `pre(·,0)` is unsatisfiable). Overflow saturates to MAX.
+    // "same position", and the proximity ops follow suit (`within(·,0)` and `pre(·,0)`
+    // both = same position). Overflow saturates to MAX.
     Ok(digits.parse::<i32>().unwrap_or(MAX_DISTANCE).clamp(0, MAX_DISTANCE))
 }
 
@@ -654,7 +654,7 @@ pub fn to_tsquery_string(input: &str) -> Result<String, String> {
 // (the planner support fn marks the index condition non-lossy). within/pre lower to
 // an OR over exact gaps, which is exactly the proximity predicate:
 //   a <~n> b  ≡  OR_{k=0..n} (a <k> b | b <k> a)   (either order, |Δ| ≤ n)
-//   a <-n> b  ≡  OR_{k=1..n} (a <k> b)             (ordered, 0 < Δ ≤ n)
+//   a <-n> b  ≡  OR_{k=0..n} (a <k> b)             (ordered, 0 ≤ Δ ≤ n; <0> = same position)
 // Only shapes that map EXACTLY are accepted; everything else (glob, regex,
 // not-within, document NOT, nested/phrase proximity operands, or a distance past
 // `NATIVE_MAX_DISTANCE`) returns None and keeps the presence-skeleton + recheck.
@@ -766,14 +766,14 @@ fn native(node: &Node) -> Option<String> {
         }
         Node::Within { a, b, n, ordered } => {
             let n = *n;
-            // Ordered <-0> is unsatisfiable (0 < Δ ≤ 0); let the recheck return false.
-            if n > NATIVE_MAX_DISTANCE || (*ordered && n < 1) {
+            if n > NATIVE_MAX_DISTANCE {
                 return None;
             }
             let (a, b) = (native_operand(a)?, native_operand(b)?);
             let mut clauses = Vec::new();
             if *ordered {
-                for k in 1..=n {
+                // k=0 is the `<0>` same-position clause (a co-located pair reads as ordered-adjacent).
+                for k in 0..=n {
                     clauses.push(format!("{a} <{k}> {b}"));
                 }
             } else {
@@ -1473,12 +1473,12 @@ fn phrase_positions(atoms: &[Atom], gaps: &[i32], v: &TsVector, r: Resolver) -> 
     span
 }
 
-/// `b` is edge-to-edge within `n` of `a` (overlap ⇒ 0), or — when `ordered` — strictly AFTER
+/// `b` is edge-to-edge within `n` of `a` (overlap ⇒ 0), or — when `ordered` — AT OR AFTER
 /// `a` within `n`. Intervals are `(start, end)`; for point operands this reduces to the plain
-/// `|Δ| ≤ n` (unordered) / `0 < Δ ≤ n` (ordered).
+/// `|Δ| ≤ n` (unordered) / `0 ≤ Δ ≤ n` (ordered — a co-located pair counts, see [`proximity::pre`]).
 fn iv_near(a: (i32, i32), b: (i32, i32), n: i32, ordered: bool) -> bool {
     if ordered {
-        b.0 > a.1 && b.0 - a.1 <= n
+        b.0 >= a.1 && b.0 - a.1 <= n
     } else {
         b.0 <= a.1 + n && a.0 <= b.1 + n
     }
@@ -1563,11 +1563,11 @@ fn within_span(a: &[i32], b: &[i32], n: i32, ordered: bool) -> Vec<i32> {
     // position's qualifying partners are contiguous in sorted `b`, so the leftmost
     // and rightmost of them (with the position itself) bound its interval. The same
     // `[min(pa,b[first]) … max(pa,b[last−1])]` formula serves both orders, since for
-    // the ordered case every qualifying `b` is `> pa`.
+    // the ordered case every qualifying `b` is `>= pa`.
     let mut intervals: Vec<(i32, i32)> = Vec::new();
     for &pa in a {
         let (first, last) = if ordered {
-            (b.partition_point(|&x| x <= pa), b.partition_point(|&x| x <= pa + n)) // (pa, pa+n]
+            (b.partition_point(|&x| x < pa), b.partition_point(|&x| x <= pa + n)) // [pa, pa+n]
         } else {
             (b.partition_point(|&x| x < pa - n), b.partition_point(|&x| x <= pa + n)) // [pa−n, pa+n]
         };
