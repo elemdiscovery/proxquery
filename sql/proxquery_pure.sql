@@ -211,18 +211,6 @@ $fn$
     ) d
 $fn$;
 
--- The isolated a positions — those with no qualifying b (what a nested
--- not-within contributes when composed).
-CREATE OR REPLACE FUNCTION _prox_not_within_participants(a int[], b int[], n int, ordered boolean) RETURNS int[]
-    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
-$fn$
-    SELECT coalesce(array_agg(x ORDER BY x), '{}'::int[])
-    FROM unnest(a) x
-    WHERE NOT EXISTS (SELECT 1 FROM unnest(b) y
-                      WHERE CASE WHEN ordered THEN (y > x AND y - x <= n)
-                                 ELSE abs(x - y) <= n END)
-$fn$;
-
 -- ===========================================================================
 -- Public positional predicate functions
 -- ===========================================================================
@@ -926,6 +914,66 @@ $fn$;
 -- Recheck evaluation  (positional semantics on a tsvector)
 -- ===========================================================================
 
+-- END position of each phrase match (last atom's position for a satisfying occurrence). A
+-- match's span is [end − Σgaps … end]; `_prox_positions` densifies it, `_prox_occ` pairs it
+-- with the start. Atoms are term/prefix/glob nodes, resolved by `_prox_positions`.
+CREATE OR REPLACE FUNCTION _prox_phrase_ends(node jsonb, v tsvector) RETURNS int[]
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE atoms jsonb := node -> 'atoms'; gaps jsonb := node -> 'gaps';
+        reach int[]; cur int[]; g int; i int;
+BEGIN
+    reach := _prox_positions(atoms -> 0, v);
+    IF coalesce(array_length(reach, 1), 0) = 0 THEN RETURN '{}'; END IF;
+    FOR i IN 1 .. jsonb_array_length(atoms) - 1 LOOP
+        cur := _prox_positions(atoms -> i, v);
+        g := (gaps ->> (i - 1))::int;
+        reach := ARRAY(SELECT cc FROM unnest(cur) cc WHERE (cc - g) = ANY(reach) ORDER BY cc);
+        IF coalesce(array_length(reach, 1), 0) = 0 THEN RETURN '{}'; END IF;
+    END LOOP;
+    RETURN reach;
+END
+$fn$;
+
+-- `b` edge-to-edge within `n` of `a` (overlap ⇒ 0), or — when `ord` — strictly AFTER `a`
+-- within `n`. Intervals are (s,e); for point operands this is the plain |Δ| ≤ n / 0 < Δ ≤ n.
+CREATE OR REPLACE FUNCTION _prox_iv_near(a_s int, a_e int, b_s int, b_e int, n int, ord boolean) RETURNS boolean
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$ SELECT CASE WHEN ord THEN b_s > a_e AND b_s - a_e <= n
+                 ELSE b_s <= a_e + n AND a_s <= b_e + n END $fn$;
+
+-- Occurrence intervals (s,e) of a proximity operand — ONE per match, NOT densified — so
+-- not-within reasons per WHOLE occurrence: a phrase/group is "near" b when ANY part of its span
+-- is within n. (within/pre use the densified `_prox_positions` instead.) Mirrors `dsl::occurrences`.
+CREATE OR REPLACE FUNCTION _prox_occ(node jsonb, v tsvector) RETURNS TABLE(s int, e int)
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE t text := node ->> 't'; total int; n int; ord boolean; c jsonb; ends int[];
+BEGIN
+    IF t = 'phrase' THEN
+        ends := _prox_phrase_ends(node, v);
+        SELECT coalesce(sum(x::int), 0) INTO total FROM jsonb_array_elements_text(node -> 'gaps') AS gg(x);
+        RETURN QUERY SELECT u.p - total, u.p FROM unnest(ends) AS u(p);
+    ELSIF t = 'or' THEN
+        FOR c IN SELECT value FROM jsonb_array_elements(node -> 'c') AS x(value) LOOP
+            RETURN QUERY SELECT o.s, o.e FROM _prox_occ(c, v) AS o;
+        END LOOP;
+    ELSIF t = 'within' THEN
+        n := (node ->> 'n')::int; ord := (node ->> 'ord')::boolean;
+        RETURN QUERY SELECT DISTINCT LEAST(ia.s, ib.s), GREATEST(ia.e, ib.e)
+                     FROM _prox_occ(node -> 'a', v) AS ia, _prox_occ(node -> 'b', v) AS ib
+                     WHERE _prox_iv_near(ia.s, ia.e, ib.s, ib.e, n, ord);
+    ELSIF t = 'notwithin' THEN
+        n := (node ->> 'n')::int; ord := (node ->> 'ord')::boolean;
+        RETURN QUERY SELECT ia.s, ia.e FROM _prox_occ(node -> 'a', v) AS ia
+                     WHERE NOT EXISTS (SELECT 1 FROM _prox_occ(node -> 'b', v) AS ib
+                                       WHERE _prox_iv_near(ia.s, ia.e, ib.s, ib.e, n, ord));
+    ELSE  -- leaf: term / prefix / glob / regex (and/not raise via _prox_positions)
+        RETURN QUERY SELECT u.p, u.p FROM unnest(_prox_positions(node, v)) AS u(p);
+    END IF;
+END
+$fn$;
+
 CREATE OR REPLACE FUNCTION _prox_positions(node jsonb, v tsvector) RETURNS int[]
     LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
 $fn$
@@ -937,6 +985,7 @@ DECLARE
     cur int[];
     res int[] := '{}';
     g int;
+    total int;
     i int;
     c jsonb;
 BEGIN
@@ -949,17 +998,13 @@ BEGIN
     ELSIF t = 'regex' THEN
         RETURN _prox_pos_regex(v, node ->> 'v');
     ELSIF t = 'phrase' THEN
-        atoms := node -> 'atoms';
-        gaps := node -> 'gaps';
-        reach := _prox_positions(atoms -> 0, v);
+        reach := _prox_phrase_ends(node, v);
         IF coalesce(array_length(reach, 1), 0) = 0 THEN RETURN '{}'; END IF;
-        FOR i IN 1 .. jsonb_array_length(atoms) - 1 LOOP
-            cur := _prox_positions(atoms -> i, v);
-            g := (gaps ->> (i - 1))::int;
-            reach := ARRAY(SELECT cc FROM unnest(cur) cc WHERE (cc - g) = ANY(reach) ORDER BY cc);
-            IF coalesce(array_length(reach, 1), 0) = 0 THEN RETURN '{}'; END IF;
-        END LOOP;
-        RETURN reach;
+        -- `reach` holds each match's END position; densify to the whole span [end−Σgaps .. end]
+        -- so a phrase proximity operand measures EDGE-TO-EDGE, like a nested group's span.
+        SELECT coalesce(sum(x::int), 0) INTO total FROM jsonb_array_elements_text(node -> 'gaps') AS e(x);
+        IF total = 0 THEN RETURN reach; END IF;
+        RETURN ARRAY(SELECT DISTINCT s FROM unnest(reach) AS u(e), generate_series(u.e - total, u.e) AS s ORDER BY s);
     ELSIF t = 'or' THEN
         FOR c IN SELECT value FROM jsonb_array_elements(node -> 'c') AS x(value) LOOP
             res := res || _prox_positions(c, v);
@@ -969,8 +1014,10 @@ BEGIN
         RETURN _prox_within_span(_prox_positions(node -> 'a', v), _prox_positions(node -> 'b', v),
                                  (node ->> 'n')::int, (node ->> 'ord')::boolean);
     ELSIF t = 'notwithin' THEN
-        RETURN _prox_not_within_participants(_prox_positions(node -> 'a', v), _prox_positions(node -> 'b', v),
-                                             (node ->> 'n')::int, (node ->> 'ord')::boolean);
+        -- A not-within as a within-operand contributes its isolated occurrences' spans,
+        -- densified (like any other operand), so the outer proximity measures against them.
+        RETURN coalesce((SELECT array_agg(DISTINCT p ORDER BY p)
+                         FROM _prox_occ(node, v) AS o, generate_series(o.s, o.e) AS p), '{}'::int[]);
     ELSE
         RAISE EXCEPTION 'AND/NOT cannot be a proximity operand (normalization should have lifted it)';
     END IF;
@@ -1007,8 +1054,9 @@ BEGIN
             RETURN _prox_arr_within(pa, pb, (node ->> 'n')::int);
         END IF;
     ELSIF t = 'notwithin' THEN
-        RETURN _prox_arr_not_within(_prox_positions(node -> 'a', v), _prox_positions(node -> 'b', v),
-                                    (node ->> 'n')::int, (node ->> 'ord')::boolean);
+        -- Occurrence-level: some WHOLE occurrence of `a` has no `b` within `n` (after it, if
+        -- ordered). `_prox_occ` already returns just those isolated occurrences, so any row matches.
+        RETURN EXISTS (SELECT 1 FROM _prox_occ(node, v));
     ELSE  -- term / prefix / glob / regex / phrase
         RETURN coalesce(array_length(_prox_positions(node, v), 1), 0) > 0;
     END IF;

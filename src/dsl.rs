@@ -36,7 +36,10 @@
 //! - `(a & b) <~N> c` → `(a <~N> c) & (b <~N> c)`  (distribute, lift AND)
 //! - `(!a)    <~N> b` → `!(a <~N> b)`              (lift NOT above)
 //! - `(a | b) <~N> c` → kept: OR distributes into the position-set union
-//! - `"a b"   <~N> c` → kept: the phrase's positions are its end positions
+//! - `"a b"   <~N> c` → kept: a phrase contributes its whole span, so proximity is
+//!   measured EDGE-TO-EDGE (nearest edge), the same as a nested group's span. Within/pre
+//!   use the densified span ([`positions`]); not-within reasons per whole occurrence
+//!   ([`occurrences`]) so a phrase touching `c` with one end counts as near.
 
 /// A phrase/distance element. A phrase matches per-atom on position sets, so an
 /// atom may be a wildcard (`"*ology class"`): the glob contributes the positions
@@ -1249,9 +1252,10 @@ pub fn eval_match(node: &Node, v: &TsVector, r: Resolver) -> Result<bool, String
                 proximity::within(&pa, &pb, *n)
             }
         }
-        Node::NotWithin { a, b, n, ordered } => {
-            proximity::not_within(&positions(a, v, r)?, &positions(b, v, r)?, *n, *ordered)
-        }
+        // Occurrence-level: true iff some WHOLE occurrence of `a` has no `b` within `n`
+        // (after it, if ordered). `occurrences` already filters `a` to those isolated ones,
+        // so a non-empty result is the match.
+        Node::NotWithin { .. } => !occurrences(node, v, r)?.is_empty(),
         Node::Term(_)
         | Node::Exact(_)
         | Node::Prefix(_)
@@ -1295,9 +1299,9 @@ fn positions(node: &Node, v: &TsVector, r: Resolver) -> Result<Vec<i32>, String>
         Node::Within { a, b, n, ordered } => {
             within_span(&positions(a, v, r)?, &positions(b, v, r)?, *n, *ordered)
         }
-        Node::NotWithin { a, b, n, ordered } => {
-            not_within_participants(&positions(a, v, r)?, &positions(b, v, r)?, *n, *ordered)
-        }
+        // As a within-operand, a not-within contributes its isolated occurrences' spans
+        // (densified, like any other operand), so the outer proximity measures against them.
+        Node::NotWithin { .. } => densify_union(occurrences(node, v, r)?),
         Node::And(_) | Node::Not(_) => {
             return Err("AND/NOT cannot be a proximity operand (normalization should have lifted it)".into())
         }
@@ -1403,7 +1407,10 @@ fn atom_positions(a: &Atom, v: &TsVector, r: Resolver) -> Vec<i32> {
 }
 
 /// End positions of an exact-gap sequence: `atoms[i+1]` exactly `gaps[i]` after `atoms[i]`.
-fn phrase_positions(atoms: &[Atom], gaps: &[i32], v: &TsVector, r: Resolver) -> Vec<i32> {
+/// END position of each phrase match (the last atom's position for a satisfying occurrence).
+/// A match's span is `[end − Σgaps … end]`; callers densify ([`phrase_positions`]) or pair
+/// with the start ([`occurrences`]) as needed.
+fn phrase_ends(atoms: &[Atom], gaps: &[i32], v: &TsVector, r: Resolver) -> Vec<i32> {
     let mut reach = atom_positions(&atoms[0], v, r);
     for (atom, &g) in atoms[1..].iter().zip(gaps) {
         let cur = atom_positions(atom, v, r);
@@ -1415,22 +1422,91 @@ fn phrase_positions(atoms: &[Atom], gaps: &[i32], v: &TsVector, r: Resolver) -> 
     reach
 }
 
-/// Is there a partner for `p` in `others` satisfying the (possibly ordered)
-/// distance `n`? `p_is_left` only matters when `ordered`.
-fn has_partner(p: i32, others: &[i32], n: i32, ordered: bool, p_is_left: bool) -> bool {
-    if others.is_empty() {
-        return false;
+fn phrase_positions(atoms: &[Atom], gaps: &[i32], v: &TsVector, r: Resolver) -> Vec<i32> {
+    let reach = phrase_ends(atoms, gaps, v, r);
+    // A phrase occupies the span from its start (`end − Σgaps`) to its end. Densify to the
+    // whole span so that as a proximity operand it measures EDGE-TO-EDGE (nearest edge of the
+    // phrase to the other operand), the same way a nested proximity group's span behaves. A
+    // single-atom phrase (no gaps) is just its own positions.
+    let total: i32 = gaps.iter().sum();
+    if total == 0 {
+        return reach;
     }
-    if !ordered {
-        let idx = others.partition_point(|&x| x < p);
-        (idx < others.len() && others[idx] - p <= n) || (idx > 0 && p - others[idx - 1] <= n)
-    } else if p_is_left {
-        let idx = others.partition_point(|&x| x <= p);
-        idx < others.len() && others[idx] - p <= n
+    let mut span: Vec<i32> = reach.iter().flat_map(|&e| (e - total)..=e).collect();
+    span.sort_unstable();
+    span.dedup();
+    span
+}
+
+/// `b` is edge-to-edge within `n` of `a` (overlap ⇒ 0), or — when `ordered` — strictly AFTER
+/// `a` within `n`. Intervals are `(start, end)`; for point operands this reduces to the plain
+/// `|Δ| ≤ n` (unordered) / `0 < Δ ≤ n` (ordered).
+fn iv_near(a: (i32, i32), b: (i32, i32), n: i32, ordered: bool) -> bool {
+    if ordered {
+        b.0 > a.1 && b.0 - a.1 <= n
     } else {
-        let idx = others.partition_point(|&x| x < p);
-        idx > 0 && p - others[idx - 1] <= n
+        b.0 <= a.1 + n && a.0 <= b.1 + n
     }
+}
+
+/// Covering intervals of satisfying (a,b) pairs — the occurrences of a within/pre group when it
+/// is itself a proximity operand (e.g. the `(a <~5> b)` in `(a <~5> b) <!~3> d`).
+fn within_intervals(a: &[(i32, i32)], b: &[(i32, i32)], n: i32, ordered: bool) -> Vec<(i32, i32)> {
+    let mut out = Vec::new();
+    for &ia in a {
+        for &ib in b {
+            if iv_near(ia, ib, n, ordered) {
+                out.push((ia.0.min(ib.0), ia.1.max(ib.1)));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Occurrence intervals `(start, end)` of a proximity operand — ONE per match, NOT densified —
+/// so `not_within` reasons per WHOLE occurrence: a phrase/group is "near" `b` when ANY part of
+/// its span is within `n` (i.e. some `b` in `[start − n … end + n]`), not when one edge happens
+/// to be isolated. (`within`/`pre` use the densified [`positions`] — nearest-edge — instead,
+/// which is equivalent for them.) Sorted by start.
+fn occurrences(node: &Node, v: &TsVector, r: Resolver) -> Result<Vec<(i32, i32)>, String> {
+    Ok(match node {
+        Node::Term(_) | Node::Exact(_) | Node::Prefix(_) | Node::Glob { .. } | Node::Regex(_) => {
+            positions(node, v, r)?.into_iter().map(|p| (p, p)).collect()
+        }
+        Node::Phrase { atoms, gaps } => {
+            let total: i32 = gaps.iter().sum();
+            let mut iv: Vec<(i32, i32)> =
+                phrase_ends(atoms, gaps, v, r).into_iter().map(|e| (e - total, e)).collect();
+            iv.sort_unstable();
+            iv
+        }
+        Node::Or(children) => {
+            let mut iv = Vec::new();
+            for c in children {
+                iv.extend(occurrences(c, v, r)?);
+            }
+            iv.sort_unstable();
+            iv.dedup();
+            iv
+        }
+        Node::Within { a, b, n, ordered } => {
+            within_intervals(&occurrences(a, v, r)?, &occurrences(b, v, r)?, *n, *ordered)
+        }
+        Node::NotWithin { a, b, n, ordered } => {
+            let bi = occurrences(b, v, r)?;
+            occurrences(a, v, r)?
+                .into_iter()
+                .filter(|&ia| !bi.iter().any(|&ib| iv_near(ia, ib, *n, *ordered)))
+                .collect()
+        }
+        Node::And(_) | Node::Not(_) => {
+            return Err(
+                "AND/NOT cannot be a proximity operand (normalization should have lifted it)".into(),
+            )
+        }
+    })
 }
 
 /// The region a `within`/`pre` contributes when it is itself a proximity operand:
@@ -1478,10 +1554,4 @@ fn densify_union(mut intervals: Vec<(i32, i32)>) -> Vec<i32> {
     }
     out.extend(lo..=hi);
     out
-}
-
-/// The isolated `a` positions — those with no qualifying `b` (the occurrences a
-/// nested not-within contributes).
-fn not_within_participants(a: &[i32], b: &[i32], n: i32, ordered: bool) -> Vec<i32> {
-    a.iter().copied().filter(|&pa| !has_partner(pa, b, n, ordered, true)).collect()
 }

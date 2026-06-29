@@ -130,6 +130,7 @@ skeleton lowering (`ts_prox_query_skeleton` exact text)
 | `sk13` | ` ts_prox_query_skeleton('((a <~5> b) <~10> c) <!~3> d') ` | `(('a' & 'b') & 'c')` |
 | `sk14` | ` ts_prox_query_skeleton('a & b \| c') ` | `(('a' & 'b') \| 'c')` |
 | `sk15` | ` ts_prox_query_skeleton('a <-> b <-> c') ` | `('a' <-> 'b' <-> 'c')` |
+| `sk16` | ` ts_prox_query_skeleton('a <!~1> b') ` | `'a'` |
 
 distance clamp `<0>` = same position, on a literal co-located tsvector
 
@@ -229,6 +230,8 @@ Recheck pairs run as `ts_prox_recheck(to_tsvector('simple', doc), query)`.
 | `m11` | `price foo discount` | `price <!-5> discount` | `false` |
 | `m12` | `discount foo price` | `price <!-5> discount` | `true` |
 | `m13` | `discount foo price` | `price <!~5> discount` | `false` |
+| `nw_pre_b` | `a b x x a` | `a <!~1> b` | `true` |
+| `nw_pre_nob` | `a c` | `a <!~1> b` | `true` |
 | `m14` | `a c b` | `(a & b) <~2> c` | `true` |
 | `m15` | `a w w w w c b` | `(a & b) <~2> c` | `false` |
 | `m16` | `alpha x beta x gamma` | `alpha <~2> beta <~2> gamma` | `true` |
@@ -272,6 +275,75 @@ Recheck pairs run as `ts_prox_recheck(to_tsvector('simple', doc), query)`.
 | `span3` | `a x c x x g x x x a x c` | `(a <~2> c) <~1> g` | `false` |
 | `span4` | `a x c x x g x x x a x c` | `(a <~2> c) <~1> x` | `true` |
 | `chstrict` | `one two three four five six seven orange nine apple eleven banana` | `apple <~2> banana <~2> orange` | `true` |
+
+Compound proximity operands resolve to their *span*, and the distance is measured **edge-to-edge**
+(nearest edge to nearest edge). A phrase `"a b"` spans `[start..end]`; a nested `(A <~X> B)` spans
+the `[min..max]` it covers per occurrence. So `(A <~X> B) <~Y> (C <~Z> D)` matches when the two
+spans come within Y of each other (overlapping spans ⇒ distance 0), while a failed inner threshold
+(X or Z) drops the whole match. An inner threshold only *gates* its pair — it never widens the span,
+which is always the matched tokens' actual `[min..max]`. So a loose inner `<~10>` over adjacent
+tokens still yields a 1-wide span (`gg_inner_gate`), whereas tokens that are genuinely far apart (but
+still within the inner threshold) really do span that range and can reach the other group
+(`gg_inner_span`). `<~Y>` is symmetric. Phrase-vs-phrase: in `alpha beta x gamma delta` the near
+edges are `beta@2` and `gamma@4` (gap 2), so `<~2>` hits and `<~1>` misses — only the *nearest* edge
+of each phrase needs to fall in the window, not its far end.
+
+| label | doc | query | expected |
+| --- | --- | --- | --- |
+| `pp_hit` | `alpha beta x gamma delta` | `"alpha beta" <~2> "gamma delta"` | `true` |
+| `pp_miss` | `alpha beta x gamma delta` | `"alpha beta" <~1> "gamma delta"` | `false` |
+| `pp_rev` | `alpha beta x gamma delta` | `"gamma delta" <~2> "alpha beta"` | `true` |
+| `pt_left` | `x a b` | `x <~1> "a b"` | `true` |
+| `pt_left0` | `x a b` | `x <~0> "a b"` | `false` |
+| `gg_hit` | `a b q q q c d` | `(a <~1> b) <~4> (c <~1> d)` | `true` |
+| `gg_miss` | `a b q q q c d` | `(a <~1> b) <~3> (c <~1> d)` | `false` |
+| `gg_inner` | `a b q q q c q d` | `(a <~1> b) <~4> (c <~1> d)` | `false` |
+| `gg_overlap` | `a c b d` | `(a <~3> b) <~1> (c <~3> d)` | `true` |
+| `gg_inner_gate` | `a b q q q c d` | `(a <~1> b) <~3> (c <~10> d)` | `false` |
+| `gg_inner_gate_hit` | `a b q q q c d` | `(a <~1> b) <~4> (c <~10> d)` | `true` |
+| `gg_inner_span` | `a b c q q q q q q q d` | `(a <~1> b) <~3> (c <~10> d)` | `true` |
+
+Not-within with a compound operand reasons per WHOLE occurrence (this is the non-obvious one):
+`A <!~N> B` is true when some occurrence of `A` has NO `B` within N of *any part of its span*. So a
+phrase/group `A` is "near" `B` if its **nearest** edge is within N — touching `B` with one end counts
+as near (the whole occurrence is not isolated), even though its far end is beyond N. (For a plain
+term operand this is the familiar per-position rule — a term is its own span.) `email a b`: the
+phrase `"a b"` spans `[2,3]`; `email@1` is within 1 of the near edge `a@2`, so `"a b" <!~1> email` is
+**false** — NOT "no email near", because the phrase touches the email.
+
+| label | doc | query | expected |
+| --- | --- | --- | --- |
+| `nw_touch_start` | `email a b` | `"a b" <!~1> email` | `false` |
+| `nw_touch_end` | `a b email` | `"a b" <!~1> email` | `false` |
+| `nw_far` | `a b z z z z email` | `"a b" <!~2> email` | `true` |
+| `nw_absent` | `a b c` | `"a b" <!~3> email` | `true` |
+| `nw_grp_far` | `x a b y z email` | `(a <~1> b) <!~2> email` | `true` |
+| `nw_grp_touch` | `a b email` | `(a <~1> b) <!~1> email` | `false` |
+
+Operator combinations — proximity results combined at the document (boolean) level, ordered
+`<-N>`/`<!-N>` over compound operands, and a regex as a proximity operand. (The prefilter drops the
+negated/keyless side, so `!(prox)` and `##re##` ride on the recheck; the index-path test confirms
+they're still not excluded.) `<-N>` is order-sensitive — `ord_ph_rev` has the phrases reversed.
+
+| label | doc | query | expected |
+| --- | --- | --- | --- |
+| `bp_and` | `a b c d` | `(a <~2> b) & (c <~2> d)` | `true` |
+| `bp_and_miss` | `a b q c q q q d` | `(a <~2> b) & (c <~2> d)` | `false` |
+| `bp_or` | `z only here` | `(a <~2> b) \| z` | `true` |
+| `bp_not` | `z a q q b` | `z & !(a <~2> b)` | `true` |
+| `bp_not_miss` | `z a b` | `z & !(a <~2> b)` | `false` |
+| `ord_ph` | `a b x c d` | `"a b" <-2> "c d"` | `true` |
+| `ord_ph_rev` | `c d x a b` | `"a b" <-2> "c d"` | `false` |
+| `ord_grp` | `a b x c d` | `(a <~1> b) <-2> (c <~1> d)` | `true` |
+| `ord_nw_after` | `a b email` | `"a b" <!-2> email` | `false` |
+| `ord_nw_before` | `email a b` | `"a b" <!-2> email` | `true` |
+| `rx_prox` | `cat and dog` | `cat <~2> ##do.##` | `true` |
+| `rx_prox_miss` | `cat and bird` | `cat <~2> ##do.##` | `false` |
+| `gx_infix` | `the cat has fur` | `cat <~2> f*r` | `true` |
+| `gx_infix_miss` | `the cat sat down` | `cat <~2> f*r` | `false` |
+| `gx_infix_left` | `fur near cat` | `f*r <~2> cat` | `true` |
+| `gx_qmark` | `the best test now` | `best <~2> te?t` | `true` |
+| `gx_qmark_miss` | `the best tense now` | `best <~2> te?t` | `false` |
 
 non-ASCII: accented Latin and CJK. Locale-INDEPENDENT (no uppercase to case-fold), so they agree on any CI collation. Two things are deliberately NOT asserted here because their tokenization is locale-dependent (see docs/CONFIG_AWARE.md): uppercase-accent case-folding, and emoji (a token under C, dropped under en_US.UTF-8).
 
