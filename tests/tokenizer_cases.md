@@ -45,6 +45,14 @@ Hyphenated: superimpose compound + parts + the hyphens-removed concatenation at 
 | `th_accent` | `prox_icu` | `Café-Bar` | `'café-bar':1 'cafe-bar':1 'café':1 'cafe':1 'bar':1 'cafébar':1 'cafebar':1` |
 | `th_ssn` | `prox_icu` | `123-45-6789` | `'123-45-6789':1 '123':1 '45':1 '6789':1 '123456789':1` |
 
+Ampersand: a `&` run (`R&D`, `P&L`, `S&P`) is the SAME tailoring as a hyphen run — UAX#29 breaks on `&` and stock `to_tsvector` drops it (splitting the parts to separate positions), so we re-join the unit and superimpose compound + parts + the `&`-removed concatenation at ONE position (`R&D`→`r&d`,`r`,`d`,`rd`). NB the DSL lexes `&` as AND, so a bare `R&D` query is `R & D`; the unit is reached via the literal `'R&D'` or the concatenation `rd`.
+
+| label | analyzer | input | expected |
+| --- | --- | --- | --- |
+| `tamp_rd` | `prox_icu` | `we did R&D` | `'we':1 'did':2 'r&d':3 'r':3 'd':3 'rd':3` |
+| `tamp_pl` | `prox_icu` | `the P&L now` | `'the':1 'p&l':2 'p':2 'l':2 'pl':2 'now':3` |
+| `tamp_multi` | `prox_icu` | `R&D&X` | `'r&d&x':1 'r':1 'd':1 'x':1 'rdx':1` |
+
 Emails: full address + local + full host + host labels EXCEPT the TLD, all superimposed at the email's single position.
 
 | label | analyzer | input | expected |

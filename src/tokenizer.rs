@@ -430,31 +430,14 @@ fn tokenize_region(region: &str, a: &Analyzer, out: &mut Vec<(String, i32)>, pos
             i += 3;
             continue;
         }
-        // Hyphen run: word (`-` word)+. UAX#29 breaks on the hyphen, so we re-join the
-        // run here. The index superimposes compound + parts; the query keeps just the
-        // compound (specific).
-        if i + 2 < segs.len() && segs[i + 1] == "-" && is_word_like(segs[i + 2]) {
-            let mut whole = String::from(seg);
-            let mut parts = vec![seg];
-            let mut j = i + 1;
-            while j + 1 < segs.len() && segs[j] == "-" && is_word_like(segs[j + 1]) {
-                whole.push('-');
-                whole.push_str(segs[j + 1]);
-                parts.push(segs[j + 1]);
-                j += 2;
-            }
-            *pos += 1;
-            emit_sub(out, &whole, *pos, a, query);
-            if !query {
-                for part in &parts {
-                    emit_sub(out, part, *pos, a, query);
-                }
-                // Also the hyphens-removed concatenation, so the closed-compound spelling
-                // matches: `co-operate`→`cooperate`, `e-mail`→`email`, `123-45-6789`→
-                // `123456789`. (The hyphen branch always has ≥2 parts.)
-                emit_sub(out, &whole.replace('-', ""), *pos, a, query);
-            }
-            i = j;
+        // Hyphen or ampersand run: word (SEP word)+ with SEP ∈ {`-`, `&`}. UAX#29 breaks on
+        // these connectors, so we re-join the run and superimpose compound + parts + the
+        // connector-removed concatenation. The query keeps just the compound. NB `-` is a
+        // DSL word char so `a-b-c` stays one query term, but `&` is the AND operator — a
+        // bare `R&D` *query* lexes as `R & D`, so the unit is reached via the literal
+        // `'R&D'` (→ the `r&d` compound) or the concatenation `RD`.
+        if i + 2 < segs.len() && matches!(segs[i + 1], "-" | "&") && is_word_like(segs[i + 2]) {
+            i = emit_joined_run(out, &segs, i, segs[i + 1], a, query, pos);
             continue;
         }
         // Plain word. On the index side a scheme-less host superimposes its labels except
@@ -479,6 +462,41 @@ fn tokenize_region(region: &str, a: &Analyzer, out: &mut Vec<(String, i32)>, pos
         }
         i += 1;
     }
+}
+
+/// Emit a connector-joined run `word (SEP word)+` — the hyphen and `&` tailorings. The
+/// index side superimposes the compound, each part, and the connector-removed
+/// concatenation at one position (`co-operate`→`cooperate`+parts; `R&D`→`r&d`,`r`,`d`,`rd`);
+/// the query side keeps only the compound. `sep` is the one-char connector segment
+/// (`"-"` / `"&"`). Returns the segment index just past the run.
+fn emit_joined_run(
+    out: &mut Vec<(String, i32)>,
+    segs: &[&str],
+    i: usize,
+    sep: &str,
+    a: &Analyzer,
+    query: bool,
+    pos: &mut i32,
+) -> usize {
+    let sep_char = sep.chars().next().unwrap();
+    let mut whole = String::from(segs[i]);
+    let mut parts = vec![segs[i]];
+    let mut j = i + 1;
+    while j + 1 < segs.len() && segs[j] == sep && is_word_like(segs[j + 1]) {
+        whole.push(sep_char);
+        whole.push_str(segs[j + 1]);
+        parts.push(segs[j + 1]);
+        j += 2;
+    }
+    *pos += 1;
+    emit_sub(out, &whole, *pos, a, query);
+    if !query {
+        for part in &parts {
+            emit_sub(out, part, *pos, a, query);
+        }
+        emit_sub(out, &whole.replace(sep_char, ""), *pos, a, query);
+    }
+    j
 }
 
 /// First byte index of an `http://`/`https://` URL not glued to a preceding word.

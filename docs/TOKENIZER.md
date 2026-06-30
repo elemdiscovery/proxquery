@@ -77,6 +77,10 @@ SELECT … WHERE tsv @~@ proxquery('prox_icu:english_stem', 'run');
 - **Hyphenated words.** `café-bar` → the compound and each part (`café-bar`, `cafe-bar`,
   `café`, `cafe`, `bar`) all at one position. Searching the compound or any part
   matches, and a neighbor is adjacent to the whole word.
+- **Ampersand units.** `R&D` → the compound, parts, and run-together form (`r&d`, `r`,
+  `d`, `rd`) at one position — the hyphen treatment for `R&D`/`P&L`/`S&P`. Because `&` is
+  the query AND operator, a bare `R&D` query means `R & D`; match the unit precisely with
+  the literal `'R&D'` or the concatenation `rd`.
 - **Emails.** `a@b.com` → `a@b.com`, `a`, `b.com`, `b` (full + local + host + labels,
   no bare TLD), superimposed.
 - **URLs.** `https://x.com/p?q=1` → the full URL + host (`x.com`, `x`); paths/queries
