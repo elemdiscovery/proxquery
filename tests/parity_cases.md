@@ -8,26 +8,26 @@ Conventions: each value is wrapped in `` ` `` (so `*`, `<~N>`, `&` aren't interp
 
 Portable `ts_prox_*` expressions evaluated as `(<expression>)::text` under each implementation (skeletons, positions, predicates, `@@` selection, errors, and literal-tsvector cases).
 
-| label | expression | expected |
-| --- | --- | --- |
-| `err1` | `ts_prox_query('*ology')` | `ERR` |
-| `err2` | `ts_prox_recheck(to_tsvector('simple','a b'),'(a <~5> b')` | `ERR` |
-| `err3` | `ts_prox_recheck(to_tsvector('simple','a b'),'a <!5> b')` | `ERR` |
-| `err4` | `ts_prox_recheck(to_tsvector('simple','a b'),'a &')` | `ERR` |
-| `err5` | `ts_prox_recheck(to_tsvector('simple','alpha beta'),'##[##')` | `ERR` |
-| `err6` | `ts_prox_recheck(to_tsvector('simple','alpha beta'),'alpha \| ##[##')` | `ERR` |
-| `err7` | `ts_prox_query('!foo')` | `ERR` |
-| `err8` | `ts_prox_recheck(to_tsvector('simple','a b'),'')` | `ERR` |
-| `bst1` | `ts_prox_recheck(to_tsvector('simple','something here'),'something *')` | `ERR` |
+| label  | expression                                                              | expected |
+| ------ | ----------------------------------------------------------------------- | -------- |
+| `err1` | `ts_prox_query('*ology')`                                               | `ERR`    |
+| `err2` | `ts_prox_recheck(to_tsvector('simple','a b'),'(a <~5> b')`              | `ERR`    |
+| `err3` | `ts_prox_recheck(to_tsvector('simple','a b'),'a <!5> b')`               | `ERR`    |
+| `err4` | `ts_prox_recheck(to_tsvector('simple','a b'),'a &')`                    | `ERR`    |
+| `err5` | `ts_prox_recheck(to_tsvector('simple','alpha beta'),'##[##')`           | `ERR`    |
+| `err6` | `ts_prox_recheck(to_tsvector('simple','alpha beta'),'alpha \| ##[##')`  | `ERR`    |
+| `err7` | `ts_prox_query('!foo')`                                                 | `ERR`    |
+| `err8` | `ts_prox_recheck(to_tsvector('simple','a b'),'')`                       | `ERR`    |
+| `bst1` | `ts_prox_recheck(to_tsvector('simple','something here'),'something *')` | `ERR`    |
 
 Single quote is the literal-term delimiter: a raw apostrophe (`it's`) opens a literal that never closes, and `''` is an empty literal — both must raise.
 
-| label | expression | expected |
-| --- | --- | --- |
-| `litErr1` | `ts_prox_recheck(to_tsvector('simple','a b'), $$it's here$$)` | `ERR` |
-| `litErr2` | `ts_prox_query($$''$$)` | `ERR` |
+| label     | expression                                                    | expected |
+| --------- | ------------------------------------------------------------- | -------- |
+| `litErr1` | `ts_prox_recheck(to_tsvector('simple','a b'), $$it's here$$)` | `ERR`    |
+| `litErr2` | `ts_prox_query($$''$$)`                                       | `ERR`    |
 
-A distance must be a non-empty run of digits. Anything else — embedded space, trailing junk, a sign, or empty — raises on BOTH implementations (no silent coercion to a default distance). `<-N>` stays the legitimate ordered operator; only a malformed body errors.
+A distance must be a non-empty run of digits. Anything else — embedded space, trailing junk, a sign, or empty — raises on both implementations (no silent coercion to a default distance). `<-N>` stays the legitimate ordered operator; only a malformed body errors.
 
 | label   | expression                   | expected |
 | ------- | ---------------------------- | -------- |
@@ -44,7 +44,7 @@ A proximity operand is positional — something with positions to measure agains
 
 The check is recursive, so an `&`/`!` buried in an OR (`bgErr9`/`notErr4`) or in a nested proximity (`notErr3`) is caught at normalize time too, not mis-evaluated downstream.
 
-`|` (OR), by contrast, is positional, so it stays a valid proximity operand on EVERY operator. An OR group has positions — the union of its branches' positions — so over the within operators (`<~N>`/`<-N>`) it simply distributes: `(a | b) <~N> c` is true iff `a` is within N of `c` _or_ `b` is within N of `c` (it does NOT form a span over the branches; see `bg_*` / `comp_*`). The exact/phrase operators (`<->`, `<N>`) also take an OR operand — they distribute it at parse time into an OR of plain phrases (`(a | b) <-> c` → `(a <-> c) | (b <-> c)`, the `pho_*` / `comp_phrase_or*` cases), including OR branches that are themselves phrases (`("p q" | "r s") <-> t`). The only operands they reject are the non-positional booleans and the things that have no contiguous phrase form: `&`, `!`, a regex, or a nested-proximity span (the `bgErr*` / `phErr_*` cases).
+`|` (OR), by contrast, is positional, so it stays a valid proximity operand on every operator. An OR group has positions — the union of its branches' positions — so over the within operators (`<~N>`/`<-N>`) it simply distributes: `(a | b) <~N> c` is true iff `a` is within N of `c` or `b` is within N of `c` (it does not form a span over the branches; see `bg_*` / `comp_*`). The exact/phrase operators (`<->`, `<N>`) also take an OR operand — they distribute it at parse time into an OR of plain phrases (`(a | b) <-> c` → `(a <-> c) | (b <-> c)`, the `pho_*` / `comp_phrase_or*` cases), including OR branches that are themselves phrases (`("p q" | "r s") <-> t`). The only operands they reject are the non-positional booleans and the things that have no contiguous phrase form: `&`, `!`, a regex, or a nested-proximity span (the `bgErr*` / `phErr_*` cases).
 
 The legitimate spellings: `(a <~N> c) & (b <~N> c)` or `(a <~M> b) <~N> c`; `!(a <~N> c)` or `c <!~N> a`.
 
@@ -74,7 +74,7 @@ The legitimate spellings: `(a <~N> c) & (b <~N> c)` or `(a <~M> b) <~N> c`; `!(a
 | `notOk2` | `ts_prox_recheck(to_tsvector('simple','a b z z z z b'),'a <!~5> b')` | `false` |
 | `notOk3` | `ts_prox_recheck(to_tsvector('simple','a b z z z z z c'),'a <~5> (b <!~5> c)')` | `true` |
 
-Composition rules, pinned as identities (`formA = formB` evaluates `true` on both ports). These state the exact rule for how each operand kind composes — distinct from the value cases above, which pin a specific doc's answer. The docs are chosen to be discriminating: `comp_or_dist` uses `a x x c x x b` (a@1 c@4 b@7, where a and b are each >N from c but the span straddles c), so a span implementation would make the two sides disagree — the identity would break. `comp_span_ne_or` is the converse: a proximity group is a span, NOT the OR distribution, so on that same doc the two forms differ (`<>` is `true`). The `comp_phrase_or*` identities pin the same distribution shape for the exact/phrase operators on every position an OR can appear — left, right (`comp_phrase_or_right`), both sides as a cross product (`comp_phrase_or_both`), mid-chain (`comp_phrase_or_chain`), an OR branch that is itself a phrase (`comp_phrase_or_branch`), and composed under a within operand (`comp_phrase_or_in_within`, which chains both distribution rules). Unlike the unordered within operators (`comp_or_sym`), `<->`/`<N>` are ORDERED, so they do NOT commute: `comp_phrase_not_commute` and `comp_phrase_or_not_commute` pin that operand-swap differs (`<>` is `true`) — i.e. distribution preserves each operand's side, it does not symmetrize.
+Composition rules, pinned as identities (`formA = formB` evaluates `true` on both ports). These state the exact rule for how each operand kind composes — distinct from the value cases above, which pin a specific doc's answer. The docs are chosen to be discriminating: `comp_or_dist` uses `a x x c x x b` (a@1 c@4 b@7, where a and b are each >N from c but the span straddles c), so a span implementation would make the two sides disagree — the identity would break. `comp_span_ne_or` is the converse: a proximity group is a span, not the OR distribution, so on that same doc the two forms differ (`<>` is `true`). The `comp_phrase_or*` identities pin the same distribution shape for the exact/phrase operators on every position an OR can appear — left, right (`comp_phrase_or_right`), both sides as a cross product (`comp_phrase_or_both`), mid-chain (`comp_phrase_or_chain`), an OR branch that is itself a phrase (`comp_phrase_or_branch`), and composed under a within operand (`comp_phrase_or_in_within`, which chains both distribution rules). Unlike the unordered within operators (`comp_or_sym`), `<->`/`<N>` are ordered, so they do not commute: `comp_phrase_not_commute` and `comp_phrase_or_not_commute` pin that operand-swap differs (`<>` is `true`) — i.e. distribution preserves each operand's side, it does not symmetrize.
 
 | label | expression | expected |
 | --- | --- | --- |
@@ -93,7 +93,7 @@ Composition rules, pinned as identities (`formA = formB` evaluates `true` on bot
 | `comp_phrase_not_commute` | `ts_prox_recheck(to_tsvector('simple','a b'),'a <-> b') <> ts_prox_recheck(to_tsvector('simple','a b'),'b <-> a')` | `true` |
 | `comp_phrase_or_not_commute` | `ts_prox_recheck(to_tsvector('simple','a b'),'(a \| x) <-> b') <> ts_prox_recheck(to_tsvector('simple','a b'),'b <-> (a \| x)')` | `true` |
 
-Full pipeline: index selection AND recheck (the decomposed two-clause form).
+Full pipeline: index selection and recheck (the decomposed two-clause form).
 
 | label | expression | expected |
 | --- | --- | --- |
@@ -179,7 +179,7 @@ Skeleton lowering (`ts_prox_query_skeleton` exact text).
 | `sk18` | `ts_prox_query_skeleton('(a \| b) <2> c')` | `(('a' <2> 'c') \| ('b' <2> 'c'))` |
 | `sk19` | `ts_prox_query_skeleton('("p q" \| "r s") <-> t')` | `(('p' <-> 'q' <-> 't') \| ('r' <-> 's' <-> 't'))` |
 
-Native pushdown lowering (`ts_prox_query_native` / `ts_prox_query_exact` exact text) — the recheck-DROPPING form, built with `tsqueryin` so the lexemes are VERBATIM (unlike the `to_tsquery`-lowered skeleton above). A single-quoted (or bare) term that contains a parser-splitting char — hyphen, apostrophe — must stay ONE lexeme and must NOT be re-tokenized into a parts-phrase; the 2-arg `simple` lexer lowercases ASCII only. The match-table can't reach this (its docs always come from `to_tsvector('simple', …)`, which lays the split parts out consecutively so a re-expanded phrase still hits), so it is pinned here as exact text and against a literal compound-only `::tsvector`.
+Native pushdown lowering (`ts_prox_query_native` / `ts_prox_query_exact` exact text) — the recheck-dropping form, built with `tsqueryin` so the lexemes are verbatim (unlike the `to_tsquery`-lowered skeleton above). A single-quoted (or bare) term that contains a parser-splitting char — hyphen, apostrophe — must stay one lexeme and must not be re-tokenized into a parts-phrase; the 2-arg `simple` lexer lowercases ASCII only. The match-table can't reach this (its docs always come from `to_tsvector('simple', …)`, which lays the split parts out consecutively so a re-expanded phrase still hits), so it is pinned here as exact text and against a literal compound-only `::tsvector`.
 
 | label | expression                                | expected          |
 | ----- | ----------------------------------------- | ----------------- |
@@ -191,7 +191,7 @@ Native pushdown lowering (`ts_prox_query_native` / `ts_prox_query_exact` exact t
 | `nv6` | `ts_prox_query_native($$'Café'$$)`        | `'café'`          |
 | `nv7` | `ts_prox_query_exact($$'a-b-c'$$)`        | `'a-b-c'`         |
 
-…and end-to-end against a vector that stores the compound as a SINGLE lexeme (no split parts — the `proxquery_to_tsvector` / hand-built shape): the literal matches, and the native and exact `@@` both equal the recheck (pre-fix the `to_tsquery` re-expansion missed this).
+…and end-to-end against a vector that stores the compound as a single lexeme (no split parts — the `proxquery_to_tsvector` / hand-built shape): the literal matches, and the native and exact `@@` both equal the recheck (pre-fix the `to_tsquery` re-expansion missed this).
 
 | label | expression | expected |
 | --- | --- | --- |
@@ -201,34 +201,34 @@ Native pushdown lowering (`ts_prox_query_native` / `ts_prox_query_exact` exact t
 
 Distance clamp `<0>` = same position, on a literal co-located tsvector. The whole distance-0 family (`<~0>`, `<0>`, `<-0>`) means "same position": only superimposition puts two distinct lexemes on one slot, and it does so by collapsing an adjacent pair, so a co-located pair reads as ordered-adjacent — ordered `<-N>` (any N, either direction) matches it, and the `<!-N>` complement calls it near (not isolated).
 
-| label | expression | expected |
-| --- | --- | --- |
-| `z0b` | `ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <~0> b')` | `true` |
-| `z0c` | `ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <0> b')` | `true` |
-| `z0e` | `ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <-0> b')` | `true` |
-| `z0g` | `ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <-1> b')` | `true` |
-| `z0h` | `ts_prox_recheck($$'a':1 'b':1$$::tsvector,'b <-1> a')` | `true` |
-| `z0i` | `ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <!-1> b')` | `false` |
-| `z0j` | `ts_prox_recheck($$'a':1 'b':1 'c':3$$::tsvector,'(a <-1> b) <~5> c')` | `true` |
-| `z0f` | `ts_prox_query_skeleton('a <0> b')` | `('a' <0> 'b')` |
+| label | expression                                                             | expected        |
+| ----- | ---------------------------------------------------------------------- | --------------- |
+| `z0b` | `ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <~0> b')`                | `true`          |
+| `z0c` | `ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <0> b')`                 | `true`          |
+| `z0e` | `ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <-0> b')`                | `true`          |
+| `z0g` | `ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <-1> b')`                | `true`          |
+| `z0h` | `ts_prox_recheck($$'a':1 'b':1$$::tsvector,'b <-1> a')`                | `true`          |
+| `z0i` | `ts_prox_recheck($$'a':1 'b':1$$::tsvector,'a <!-1> b')`               | `false`         |
+| `z0j` | `ts_prox_recheck($$'a':1 'b':1 'c':3$$::tsvector,'(a <-1> b) <~5> c')` | `true`          |
+| `z0f` | `ts_prox_query_skeleton('a <0> b')`                                    | `('a' <0> 'b')` |
 
-Distance range: a distance is an integer in `[0, 16384]` — the same range as native tsquery's phrase operator. `<16384>` is the inclusive maximum; anything larger RAISES (matching `to_tsquery`'s _"between zero and 16384 inclusive"_ error), the same as the other malformed-distance cases (`dbad*`) — there is no silent clamp. The rule is uniform across the proximity operators (`<~N>`/`<-N>` raise on an over-range distance too, not just the exact `<N>`/`<->`). `0` is kept (same position). Pathological inputs longer than any fixed-width integer are checked in the `pure_sql_matches_extension_distance_overflow` Rust test, off this spec.
+Distance range: a distance is an integer in `[0, 16384]` — the same range as native tsquery's phrase operator. `<16384>` is the inclusive maximum; anything larger raises (matching `to_tsquery`'s "between zero and 16384 inclusive" error), the same as the other malformed-distance cases (`dbad*`) — there is no silent clamp. The rule is uniform across the proximity operators (`<~N>`/`<-N>` raise on an over-range distance too, not just the exact `<N>`/`<->`). `0` is kept (same position). Pathological inputs longer than any fixed-width integer are checked in the `pure_sql_matches_extension_distance_overflow` Rust test, off this spec.
 
-| label | expression | expected |
-| --- | --- | --- |
-| `dsat1` | `ts_prox_query_skeleton('a <16383> b')` | `('a' <16383> 'b')` |
-| `dsat2` | `ts_prox_query_skeleton('a <16384> b')` | `('a' <16384> 'b')` |
-| `dsat3` | `ts_prox_query('a <16385> b')` | `ERR` |
-| `dsat4` | `ts_prox_query('a <99999999> b')` | `ERR` |
-| `dsat5` | `ts_prox_recheck(to_tsvector('simple','a x b'),'a <~16385> b')` | `ERR` |
+| label   | expression                                                      | expected            |
+| ------- | --------------------------------------------------------------- | ------------------- |
+| `dsat1` | `ts_prox_query_skeleton('a <16383> b')`                         | `('a' <16383> 'b')` |
+| `dsat2` | `ts_prox_query_skeleton('a <16384> b')`                         | `('a' <16384> 'b')` |
+| `dsat3` | `ts_prox_query('a <16385> b')`                                  | `ERR`               |
+| `dsat4` | `ts_prox_query('a <99999999> b')`                               | `ERR`               |
+| `dsat5` | `ts_prox_recheck(to_tsvector('simple','a x b'),'a <~16385> b')` | `ERR`               |
 
 single-quoted literal terms (the `''` escape; no operator/glob meaning) matched verbatim against a literal tsvector — shared DSL behavior on both implementations. `'it''s'` resolves to the lexeme it's; an apostrophe-stripped/prefix tsvector misses.
 
-| label | expression | expected |
-| --- | --- | --- |
-| `litq1` | `ts_prox_recheck($$'it''s':1$$::tsvector, $$'it''s'$$)` | `true` |
-| `litq2` | `ts_prox_recheck($$'its':1 'it':2$$::tsvector, $$'it''s'$$)` | `false` |
-| `litq3` | `ts_prox_recheck($$'a*b':1$$::tsvector, $$'a*b'$$)` | `true` |
+| label   | expression                                                   | expected |
+| ------- | ------------------------------------------------------------ | -------- |
+| `litq1` | `ts_prox_recheck($$'it''s':1$$::tsvector, $$'it''s'$$)`      | `true`   |
+| `litq2` | `ts_prox_recheck($$'its':1 'it':2$$::tsvector, $$'it''s'$$)` | `false`  |
+| `litq3` | `ts_prox_recheck($$'a*b':1$$::tsvector, $$'a*b'$$)`          | `true`   |
 
 For non-ASCII surface coverage: position accessor, prefix scan, skeleton lowering. Locale-robust (no uppercase accents); see docs/CONFIG_AWARE.md for the uppercase-accent / config-aware lexing discussion.
 
@@ -239,7 +239,7 @@ For non-ASCII surface coverage: position accessor, prefix scan, skeleton lowerin
 | `uc3` | `ts_prox_query_skeleton('中文 <~2> 搜索')` | `('中文' & '搜索')` |
 | `uc4` | `ts_prox_positions_prefix(to_tsvector('simple','café cafétéria caffeine'),'café')` | `{1,2}` |
 
-Config-aware (3-arg): query terms resolved through the column's text-search config via to_tsvector(cfg, term). Built-in 'english' (stemming) keeps these locale-independent and runnable on both implementations. The 2-arg simple forms are unchanged; the headline is a SURFACE query term matching a stored STEM.
+Config-aware (3-arg): query terms resolved through the column's text-search config via to_tsvector(cfg, term). Built-in 'english' (stemming) keeps these locale-independent and runnable on both implementations. The 2-arg simple forms are unchanged; the headline is a surface query term matching a stored stem.
 
 | label | expression | expected |
 | --- | --- | --- |
@@ -351,7 +351,7 @@ Recheck pairs run as `ts_prox_recheck(to_tsvector('simple', doc), query)`.
 | `span4` | `a x c x x g x x x a x c` | `(a <~2> c) <~1> x` | `true` |
 | `chstrict` | `one two three four five six seven orange nine apple eleven banana` | `apple <~2> banana <~2> orange` | `true` |
 
-An `|` (OR) group is a valid proximity operand and DISTRIBUTES — `(a | b) <~N> c` ≡ `(a <~N> c) | (b <~N> c)` (either operand independently within-N of `c`) — because OR is positional (a position-set union). It does NOT form a span; that's the _proximity_-group rule below. The headline discriminator is `bg_or_dist` vs `bg_prox_span` on the SAME doc `a x x c x x b` (a@1 c@4 b@7): the boolean `(a | b) <~2> c` is **false** (neither `a` nor `b` is within 2 of `c`), whereas the proximity group `(a <~9> b) <~2> c` is **true** (its span `[1,7]` contains `c`). Each OR leaf may itself be a phrase (resolved to its edge-to-edge span). The exact/phrase operators `<->`/`<N>` accept an OR operand too, but distribute it at parse time into an OR of plain phrases (`(a | b) <-> c` ≡ `(a <-> c) | (b <-> c)`; see the `pho_*` value cases and `comp_phrase_or*` identities). An `&` (AND) group, by contrast, is NOT positional and raises on every proximity operator — it is never silently distributed (the `bgErr*` expression cases).
+An `|` (OR) group is a valid proximity operand and distributes — `(a | b) <~N> c` ≡ `(a <~N> c) | (b <~N> c)` (either operand independently within-N of `c`) — because OR is positional (a position-set union). It does not form a span; that's the proximity-group rule below. The headline discriminator is `bg_or_dist` vs `bg_prox_span` on the same doc `a x x c x x b` (a@1 c@4 b@7): the boolean `(a | b) <~2> c` is false (neither `a` nor `b` is within 2 of `c`), whereas the proximity group `(a <~9> b) <~2> c` is true (its span `[1,7]` contains `c`). Each OR leaf may itself be a phrase (resolved to its edge-to-edge span). The exact/phrase operators `<->`/`<N>` accept an OR operand too, but distribute it at parse time into an OR of plain phrases (`(a | b) <-> c` ≡ `(a <-> c) | (b <-> c)`; see the `pho_*` value cases and `comp_phrase_or*` identities). An `&` (AND) group, by contrast, is not positional and raises on every proximity operator — it is never silently distributed (the `bgErr*` expression cases).
 
 | label          | doc               | query                     | expected |
 | -------------- | ----------------- | ------------------------- | -------- |
@@ -379,24 +379,24 @@ The exact/phrase operators (`<->`, `<N>`) take an OR operand too, distributing i
 | `pho_prefix`       | `apple c`   | `(appl* \| b) <-> c`     | `true`   |
 | `pho_glob`         | `biology c` | `(*ology \| b) <-> c`    | `true`   |
 
-Compound proximity operands resolve to their _span_, and the distance is measured **edge-to-edge** (nearest edge to nearest edge). A phrase `"a b"` spans `[start..end]`; a nested `(A <~X> B)` spans the `[min..max]` it covers per occurrence. So `(A <~X> B) <~Y> (C <~Z> D)` matches when the two spans come within Y of each other (overlapping spans ⇒ distance 0), while a failed inner threshold (X or Z) drops the whole match. An inner threshold only _gates_ its pair — it never widens the span, which is always the matched tokens' actual `[min..max]`. So a loose inner `<~10>` over adjacent tokens still yields a 1-wide span (`gg_inner_gate`), whereas tokens that are genuinely far apart (but still within the inner threshold) really do span that range and can reach the other group (`gg_inner_span`). `<~Y>` is symmetric. Phrase-vs-phrase: in `alpha beta x gamma delta` the near edges are `beta@2` and `gamma@4` (gap 2), so `<~2>` hits and `<~1>` misses — only the _nearest_ edge of each phrase needs to fall in the window, not its far end.
+Compound proximity operands resolve to their span, and the distance is measured edge-to-edge (nearest edge to nearest edge). A phrase `"a b"` spans `[start..end]`; a nested `(A <~X> B)` spans the `[min..max]` it covers per occurrence. So `(A <~X> B) <~Y> (C <~Z> D)` matches when the two spans come within Y of each other (overlapping spans ⇒ distance 0), while a failed inner threshold (X or Z) drops the whole match. An inner threshold only gates its pair — it never widens the span, which is always the matched tokens' actual `[min..max]`. So a loose inner `<~10>` over adjacent tokens still yields a 1-wide span (`gg_inner_gate`), whereas tokens that are genuinely far apart (but still within the inner threshold) really do span that range and can reach the other group (`gg_inner_span`). `<~Y>` is symmetric. Phrase-vs-phrase: in `alpha beta x gamma delta` the near edges are `beta@2` and `gamma@4` (gap 2), so `<~2>` hits and `<~1>` misses — only the nearest edge of each phrase needs to fall in the window, not its far end.
 
-| label | doc | query | expected |
-| --- | --- | --- | --- |
-| `pp_hit` | `alpha beta x gamma delta` | `"alpha beta" <~2> "gamma delta"` | `true` |
-| `pp_miss` | `alpha beta x gamma delta` | `"alpha beta" <~1> "gamma delta"` | `false` |
-| `pp_rev` | `alpha beta x gamma delta` | `"gamma delta" <~2> "alpha beta"` | `true` |
-| `pt_left` | `x a b` | `x <~1> "a b"` | `true` |
-| `pt_left0` | `x a b` | `x <~0> "a b"` | `false` |
-| `gg_hit` | `a b q q q c d` | `(a <~1> b) <~4> (c <~1> d)` | `true` |
-| `gg_miss` | `a b q q q c d` | `(a <~1> b) <~3> (c <~1> d)` | `false` |
-| `gg_inner` | `a b q q q c q d` | `(a <~1> b) <~4> (c <~1> d)` | `false` |
-| `gg_overlap` | `a c b d` | `(a <~3> b) <~1> (c <~3> d)` | `true` |
-| `gg_inner_gate` | `a b q q q c d` | `(a <~1> b) <~3> (c <~10> d)` | `false` |
-| `gg_inner_gate_hit` | `a b q q q c d` | `(a <~1> b) <~4> (c <~10> d)` | `true` |
-| `gg_inner_span` | `a b c q q q q q q q d` | `(a <~1> b) <~3> (c <~10> d)` | `true` |
+| label               | doc                        | query                             | expected |
+| ------------------- | -------------------------- | --------------------------------- | -------- |
+| `pp_hit`            | `alpha beta x gamma delta` | `"alpha beta" <~2> "gamma delta"` | `true`   |
+| `pp_miss`           | `alpha beta x gamma delta` | `"alpha beta" <~1> "gamma delta"` | `false`  |
+| `pp_rev`            | `alpha beta x gamma delta` | `"gamma delta" <~2> "alpha beta"` | `true`   |
+| `pt_left`           | `x a b`                    | `x <~1> "a b"`                    | `true`   |
+| `pt_left0`          | `x a b`                    | `x <~0> "a b"`                    | `false`  |
+| `gg_hit`            | `a b q q q c d`            | `(a <~1> b) <~4> (c <~1> d)`      | `true`   |
+| `gg_miss`           | `a b q q q c d`            | `(a <~1> b) <~3> (c <~1> d)`      | `false`  |
+| `gg_inner`          | `a b q q q c q d`          | `(a <~1> b) <~4> (c <~1> d)`      | `false`  |
+| `gg_overlap`        | `a c b d`                  | `(a <~3> b) <~1> (c <~3> d)`      | `true`   |
+| `gg_inner_gate`     | `a b q q q c d`            | `(a <~1> b) <~3> (c <~10> d)`     | `false`  |
+| `gg_inner_gate_hit` | `a b q q q c d`            | `(a <~1> b) <~4> (c <~10> d)`     | `true`   |
+| `gg_inner_span`     | `a b c q q q q q q q d`    | `(a <~1> b) <~3> (c <~10> d)`     | `true`   |
 
-Not-within with a compound operand reasons per WHOLE occurrence (this is the non-obvious one): `A <!~N> B` is true when some occurrence of `A` has NO `B` within N of _any part of its span_. So a phrase/group `A` is "near" `B` if its **nearest** edge is within N — touching `B` with one end counts as near (the whole occurrence is not isolated), even though its far end is beyond N. (For a plain term operand this is the familiar per-position rule — a term is its own span.) `email a b`: the phrase `"a b"` spans `[2,3]`; `email@1` is within 1 of the near edge `a@2`, so `"a b" <!~1> email` is **false** — NOT "no email near", because the phrase touches the email.
+Not-within with a compound operand reasons per whole occurrence (this is the non-obvious one): `A <!~N> B` is true when some occurrence of `A` has no `B` within N of any part of its span. So a phrase/group `A` is "near" `B` if its nearest edge is within N — touching `B` with one end counts as near (the whole occurrence is not isolated), even though its far end is beyond N. (For a plain term operand this is the familiar per-position rule — a term is its own span.) `email a b`: the phrase `"a b"` spans `[2,3]`; `email@1` is within 1 of the near edge `a@2`, so `"a b" <!~1> email` is false — not "no email near", because the phrase touches the email.
 
 | label            | doc                 | query                    | expected |
 | ---------------- | ------------------- | ------------------------ | -------- |
@@ -409,31 +409,31 @@ Not-within with a compound operand reasons per WHOLE occurrence (this is the non
 
 Operator combinations — proximity results combined at the document (boolean) level, ordered `<-N>`/`<!-N>` over compound operands, and a regex as a proximity operand. (The prefilter drops the negated/keyless side, so `!(prox)` and `##re##` ride on the recheck; the index-path test confirms they're still not excluded.) `<-N>` is order-sensitive — `ord_ph_rev` has the phrases reversed.
 
-| label | doc | query | expected |
-| --- | --- | --- | --- |
-| `bp_and` | `a b c d` | `(a <~2> b) & (c <~2> d)` | `true` |
-| `bp_and_miss` | `a b q c q q q d` | `(a <~2> b) & (c <~2> d)` | `false` |
-| `bp_or` | `z only here` | `(a <~2> b) \| z` | `true` |
-| `bp_not` | `z a q q b` | `z & !(a <~2> b)` | `true` |
-| `bp_not_miss` | `z a b` | `z & !(a <~2> b)` | `false` |
-| `ord_ph` | `a b x c d` | `"a b" <-2> "c d"` | `true` |
-| `ord_ph_rev` | `c d x a b` | `"a b" <-2> "c d"` | `false` |
-| `ord_grp` | `a b x c d` | `(a <~1> b) <-2> (c <~1> d)` | `true` |
-| `ord_nw_after` | `a b email` | `"a b" <!-2> email` | `false` |
-| `ord_nw_before` | `email a b` | `"a b" <!-2> email` | `true` |
-| `rx_prox` | `cat and dog` | `cat <~2> ##do.##` | `true` |
-| `rx_prox_miss` | `cat and bird` | `cat <~2> ##do.##` | `false` |
-| `gx_infix` | `the cat has fur` | `cat <~2> f*r` | `true` |
-| `gx_infix_miss` | `the cat sat down` | `cat <~2> f*r` | `false` |
-| `gx_infix_left` | `fur near cat` | `f*r <~2> cat` | `true` |
-| `gx_qmark` | `the best test now` | `best <~2> te?t` | `true` |
-| `gx_qmark_miss` | `the best tense now` | `best <~2> te?t` | `false` |
-| `rx_left` | `cat and dog` | `##do.## <~2> cat` | `true` |
-| `rx_left_miss` | `cat and bird` | `##do.## <~2> cat` | `false` |
-| `or_mixed_operand` | `the study of biology` | `(stud* \| ##zzz##) <~3> biology` | `true` |
-| `or_both_sides` | `a x c` | `(a \| b) <~2> (c \| d)` | `true` |
+| label              | doc                    | query                             | expected |
+| ------------------ | ---------------------- | --------------------------------- | -------- |
+| `bp_and`           | `a b c d`              | `(a <~2> b) & (c <~2> d)`         | `true`   |
+| `bp_and_miss`      | `a b q c q q q d`      | `(a <~2> b) & (c <~2> d)`         | `false`  |
+| `bp_or`            | `z only here`          | `(a <~2> b) \| z`                 | `true`   |
+| `bp_not`           | `z a q q b`            | `z & !(a <~2> b)`                 | `true`   |
+| `bp_not_miss`      | `z a b`                | `z & !(a <~2> b)`                 | `false`  |
+| `ord_ph`           | `a b x c d`            | `"a b" <-2> "c d"`                | `true`   |
+| `ord_ph_rev`       | `c d x a b`            | `"a b" <-2> "c d"`                | `false`  |
+| `ord_grp`          | `a b x c d`            | `(a <~1> b) <-2> (c <~1> d)`      | `true`   |
+| `ord_nw_after`     | `a b email`            | `"a b" <!-2> email`               | `false`  |
+| `ord_nw_before`    | `email a b`            | `"a b" <!-2> email`               | `true`   |
+| `rx_prox`          | `cat and dog`          | `cat <~2> ##do.##`                | `true`   |
+| `rx_prox_miss`     | `cat and bird`         | `cat <~2> ##do.##`                | `false`  |
+| `gx_infix`         | `the cat has fur`      | `cat <~2> f*r`                    | `true`   |
+| `gx_infix_miss`    | `the cat sat down`     | `cat <~2> f*r`                    | `false`  |
+| `gx_infix_left`    | `fur near cat`         | `f*r <~2> cat`                    | `true`   |
+| `gx_qmark`         | `the best test now`    | `best <~2> te?t`                  | `true`   |
+| `gx_qmark_miss`    | `the best tense now`   | `best <~2> te?t`                  | `false`  |
+| `rx_left`          | `cat and dog`          | `##do.## <~2> cat`                | `true`   |
+| `rx_left_miss`     | `cat and bird`         | `##do.## <~2> cat`                | `false`  |
+| `or_mixed_operand` | `the study of biology` | `(stud* \| ##zzz##) <~3> biology` | `true`   |
+| `or_both_sides`    | `a x c`                | `(a \| b) <~2> (c \| d)`          | `true`   |
 
-For non-ASCII: accented Latin and CJK. Locale-INDEPENDENT (no uppercase to case-fold), so they agree on any CI collation. Two things are deliberately NOT asserted here because their tokenization is locale-dependent (see docs/CONFIG_AWARE.md): uppercase-accent case-folding, and emoji (a token under C, dropped under en_US.UTF-8).
+For non-ASCII: accented Latin and CJK. Locale-independent (no uppercase to case-fold), so they agree on any CI collation. Two things are deliberately not asserted here because their tokenization is locale-dependent (see docs/CONFIG_AWARE.md): uppercase-accent case-folding, and emoji (a token under C, dropped under en_US.UTF-8).
 
 | label | doc                 | query            | expected |
 | ----- | ------------------- | ---------------- | -------- |
@@ -449,7 +449,7 @@ For non-ASCII: accented Latin and CJK. Locale-INDEPENDENT (no uppercase to case-
 | `u10` | `中文 文档 搜索`    | `中文 <~1> 搜索` | `false`  |
 | `u11` | `日本語`            | `日本`           | `false`  |
 
-Multi-hyphen words generalize the single-hyphen rule (`cs_hyph_*` in the config cases): the stock parser emits the COMPOUND at one position, then EVERY part at consecutive positions — `a-b-c` → `a-b-c`:1 `a`:2 `b`:3 `c`:4, and `a-b-c-d-e-f` → `a-b-c-d-e-f`:1 then `a`..`f`:2..7. So all the bare parts are mutually adjacent (`a <-> b`, `b <-> c`), the compound precedes part `a` by one, and a `"a b c"` phrase over the parts hits. The single-quoted whole compound (`'a-b-c'`) matches the compound lexeme verbatim. `<->`/`<N>` distances are pinned with boundary pairs.
+Multi-hyphen words generalize the single-hyphen rule (`cs_hyph_*` in the config cases): the stock parser emits the compound at one position, then every part at consecutive positions — `a-b-c` → `a-b-c`:1 `a`:2 `b`:3 `c`:4, and `a-b-c-d-e-f` → `a-b-c-d-e-f`:1 then `a`..`f`:2..7. So all the bare parts are mutually adjacent (`a <-> b`, `b <-> c`), the compound precedes part `a` by one, and a `"a b c"` phrase over the parts hits. The single-quoted whole compound (`'a-b-c'`) matches the compound lexeme verbatim. `<->`/`<N>` distances are pinned with boundary pairs.
 
 | label         | doc     | query           | expected |
 | ------------- | ------- | --------------- | -------- |
@@ -524,7 +524,7 @@ The 3-arg config-aware recheck `ts_prox_recheck(to_tsvector(cfg, doc), query, cf
 | `cs_acc_miss`  | `simple` | `bien pare ici` | `*ré` | `false`  |
 | `cs_acc_miss2` | `simple` | `bien paré ici` | `*re` | `false`  |
 
-For simple: the 3-arg path folds a glob run through `cfg`, so an uppercase non-ASCII run is Unicode-lowercased (the 2-arg lexer is ASCII-only) — but the accent is preserved (folds CASE, not accent), so `*É` matches `café`, not `cafe`.
+For simple: the 3-arg path folds a glob run through `cfg`, so an uppercase non-ASCII run is Unicode-lowercased (the 2-arg lexer is ASCII-only) — but the accent is preserved (folds case, not accent), so `*É` matches `café`, not `cafe`.
 
 | label         | config   | doc            | query | expected |
 | ------------- | -------- | -------------- | ----- | -------- |
@@ -533,11 +533,11 @@ For simple: the 3-arg path folds a glob run through `cfg`, so an uppercase non-A
 
 ASCII globs are unaffected by the fold (regression guard for plain-ASCII users).
 
-| label | config | doc | query | expected |
-| --- | --- | --- | --- | --- |
-| `cs_ascii_g` | `simple` | `pick the best test` | `te?t` | `true` |
-| `cs_ascii_p` | `simple` | `this text is confidential` | `con*ial` | `true` |
-| `cs_ascii_pm` | `simple` | `this text is public` | `con*ial` | `false` |
+| label         | config   | doc                         | query     | expected |
+| ------------- | -------- | --------------------------- | --------- | -------- |
+| `cs_ascii_g`  | `simple` | `pick the best test`        | `te?t`    | `true`   |
+| `cs_ascii_p`  | `simple` | `this text is confidential` | `con*ial` | `true`   |
+| `cs_ascii_pm` | `simple` | `this text is public`       | `con*ial` | `false`  |
 
 The verbatim fallback: a run that resolves to 0 or >1 lexemes (punctuated / host / alphanumeric) is kept as-is, so the glob behaves exactly as the 2-arg path would.
 
@@ -548,19 +548,19 @@ The verbatim fallback: a run that resolves to 0 or >1 lexemes (punctuated / host
 
 Phrase-embedded glob atoms fold too (the phrase atom is a glob node).
 
-| label | config | doc | query | expected |
-| --- | --- | --- | --- | --- |
-| `cs_ph_hit` | `simple` | `the biology class` | `"*ology class"` | `true` |
-| `cs_ph_miss` | `simple` | `the geography class` | `"*ology class"` | `false` |
+| label        | config   | doc                   | query            | expected |
+| ------------ | -------- | --------------------- | ---------------- | -------- |
+| `cs_ph_hit`  | `simple` | `the biology class`   | `"*ology class"` | `true`   |
+| `cs_ph_miss` | `simple` | `the geography class` | `"*ology class"` | `false`  |
 
-Hyphenated words: the parser emits the compound AND each part at CONSECUTIVE positions (`café-bar` → `café-bar`:2 `café`:3 `bar`:4), so the parts are adjacent to their neighbors. On plain `simple` proximity stays ACCENT-SENSITIVE: only the accented spelling of the part is adjacent to `bar` (config decides, as with globs).
+Hyphenated words: the parser emits the compound and each part at consecutive positions (`café-bar` → `café-bar`:2 `café`:3 `bar`:4), so the parts are adjacent to their neighbors. On plain `simple` proximity stays accent-sensitive: only the accented spelling of the part is adjacent to `bar` (config decides, as with globs).
 
 | label        | config   | doc                 | query          | expected |
 | ------------ | -------- | ------------------- | -------------- | -------- |
 | `cs_hw_hit`  | `simple` | `le café-bar ferme` | `café <-> bar` | `true`   |
 | `cs_hw_miss` | `simple` | `le café-bar ferme` | `cafe <-> bar` | `false`  |
 
-Hyphenated position arithmetic: the parser emits the COMPOUND and each PART at consecutive positions, so `a b-c d` → a:1 b-c:2 b:3 c:4 d:5. The compound sitting at position 2 pushes the parts one slot further from `a` than they look — a→b = 2 (NOT 1), a→c = 3, a→d = 4 — while the two parts b,c are adjacent. Distances are pinned with boundary pairs (within N-1 misses, within N hits); `<~N>` is symmetric within distance, `<->` is ordered-adjacent (distance exactly 1).
+Hyphenated position arithmetic: the parser emits the compound and each part at consecutive positions, so `a b-c d` → a:1 b-c:2 b:3 c:4 d:5. The compound sitting at position 2 pushes the parts one slot further from `a` than they look — a→b = 2 (not 1), a→c = 3, a→d = 4 — while the two parts b,c are adjacent. Distances are pinned with boundary pairs (within N-1 misses, within N hits); `<~N>` is symmetric within distance, `<->` is ordered-adjacent (distance exactly 1).
 
 | label         | config   | doc       | query      | expected |
 | ------------- | -------- | --------- | ---------- | -------- |
@@ -579,14 +579,14 @@ The two parts are adjacent (the headline answer): `b <-> c` hits, the reverse mi
 | `cs_hyph_cb`   | `simple` | `a b-c d` | `c <-> b` | `false`  |
 | `cs_hyph_ab_a` | `simple` | `a b-c d` | `a <-> b` | `false`  |
 
-Matching a hyphenated word as an OR of its forms. doc `a b c-d` → a:1 b:2 c-d:3 c:4 d:5. The bare PARTS are too far for `a <~2> …` (c is distance 3, d is 4), but the COMPOUND `c-d` sits at distance 2 — so OR-ing the compound in makes the proximity hit. This is the no-C way to "find `a` near the hyphenated word": lean on the compound lexeme, which the parser already places at the word's own position. (`c-d` lexes as a single term even unquoted, since `-` is a word char; the single quotes are just the explicit escape hatch for terms with special characters.)
+Matching a hyphenated word as an OR of its forms. doc `a b c-d` → a:1 b:2 c-d:3 c:4 d:5. The bare parts are too far for `a <~2> …` (c is distance 3, d is 4), but the compound `c-d` sits at distance 2 — so OR-ing the compound in makes the proximity hit. This is the no-C way to "find `a` near the hyphenated word": lean on the compound lexeme, which the parser already places at the word's own position. (`c-d` lexes as a single term even unquoted, since `-` is a word char; the single quotes are just the explicit escape hatch for terms with special characters.)
 
-| label | config | doc | query | expected |
-| --- | --- | --- | --- | --- |
-| `cs_cd_part_c` | `simple` | `a b c-d` | `a <~2> c` | `false` |
-| `cs_cd_part_d` | `simple` | `a b c-d` | `a <~2> d` | `false` |
-| `cs_cd_compound` | `simple` | `a b c-d` | `a <~2> 'c-d'` | `true` |
-| `cs_cd_or` | `simple` | `a b c-d` | `a <~2> (c \| d \| 'c-d')` | `true` |
+| label            | config   | doc       | query                      | expected |
+| ---------------- | -------- | --------- | -------------------------- | -------- |
+| `cs_cd_part_c`   | `simple` | `a b c-d` | `a <~2> c`                 | `false`  |
+| `cs_cd_part_d`   | `simple` | `a b c-d` | `a <~2> d`                 | `false`  |
+| `cs_cd_compound` | `simple` | `a b c-d` | `a <~2> 'c-d'`             | `true`   |
+| `cs_cd_or`       | `simple` | `a b c-d` | `a <~2> (c \| d \| 'c-d')` | `true`   |
 
 and the plain boolean AND of a term with a hyphenated term works today.
 
@@ -615,89 +615,89 @@ Accent-folding contrast (needs contrib `unaccent`): same queries that stay accen
 
 An unaccented query glob matches the accented (folded) stored lexeme too.
 
-| label | config | doc | query | expected |
-| --- | --- | --- | --- | --- |
-| `cu_plain` | `public.simple_unaccent` | `bien paré ici` | `*re` | `true` |
-| `cu_phrase` | `public.simple_unaccent` | `un paré noir` | `"*ré noir"` | `true` |
-| `cu_fb` | `public.simple_unaccent` | `x foo.bar baz` | `foo.bar*` | `true` |
-| `cu_miss` | `public.simple_unaccent` | `un thé noir` | `caf?` | `false` |
+| label       | config                   | doc             | query        | expected |
+| ----------- | ------------------------ | --------------- | ------------ | -------- |
+| `cu_plain`  | `public.simple_unaccent` | `bien paré ici` | `*re`        | `true`   |
+| `cu_phrase` | `public.simple_unaccent` | `un paré noir`  | `"*ré noir"` | `true`   |
+| `cu_fb`     | `public.simple_unaccent` | `x foo.bar baz` | `foo.bar*`   | `true`   |
+| `cu_miss`   | `public.simple_unaccent` | `un thé noir`   | `caf?`       | `false`  |
 
-Plain TERM searches: `CAFÉ` is stored as the lexeme `cafe`, so it is found by any accent/case spelling — `cafe`, `café`, `CAFÉ` — and vice versa. (Term and prefix resolution already folded; these pin the headline accent behavior.)
+Plain term searches: `CAFÉ` is stored as the lexeme `cafe`, so it is found by any accent/case spelling — `cafe`, `café`, `CAFÉ` — and vice versa. (Term and prefix resolution already folded; these pin the headline accent behavior.)
 
-| label | config | doc | query | expected |
-| --- | --- | --- | --- | --- |
-| `cu_term_low` | `public.simple_unaccent` | `un CAFÉ noir` | `cafe` | `true` |
-| `cu_term_acc` | `public.simple_unaccent` | `un CAFÉ noir` | `café` | `true` |
-| `cu_term_up` | `public.simple_unaccent` | `un CAFÉ noir` | `CAFÉ` | `true` |
-| `cu_term_rev` | `public.simple_unaccent` | `un café noir` | `CAFÉ` | `true` |
-| `cu_term_miss` | `public.simple_unaccent` | `un CAFÉ noir` | `thé` | `false` |
-| `cu_prox_hit` | `public.simple_unaccent` | `un CAFÉ noir` | `cafe <-> noir` | `true` |
-| `cu_prox_miss` | `public.simple_unaccent` | `CAFÉ un deux noir` | `cafe <~1> noir` | `false` |
+| label          | config                   | doc                 | query            | expected |
+| -------------- | ------------------------ | ------------------- | ---------------- | -------- |
+| `cu_term_low`  | `public.simple_unaccent` | `un CAFÉ noir`      | `cafe`           | `true`   |
+| `cu_term_acc`  | `public.simple_unaccent` | `un CAFÉ noir`      | `café`           | `true`   |
+| `cu_term_up`   | `public.simple_unaccent` | `un CAFÉ noir`      | `CAFÉ`           | `true`   |
+| `cu_term_rev`  | `public.simple_unaccent` | `un café noir`      | `CAFÉ`           | `true`   |
+| `cu_term_miss` | `public.simple_unaccent` | `un CAFÉ noir`      | `thé`            | `false`  |
+| `cu_prox_hit`  | `public.simple_unaccent` | `un CAFÉ noir`      | `cafe <-> noir`  | `true`   |
+| `cu_prox_miss` | `public.simple_unaccent` | `CAFÉ un deux noir` | `cafe <~1> noir` | `false`  |
 
 CJK is preserved (unaccent is a no-op on non-Latin letters), so terms, proximity, and even globs work under this config exactly as under `simple`.
 
-| label | config | doc | query | expected |
-| --- | --- | --- | --- | --- |
-| `cu_cjk_term` | `public.simple_unaccent` | `中文 文档 搜索` | `中文` | `true` |
-| `cu_cjk_prox` | `public.simple_unaccent` | `中文 文档 搜索` | `中文 <~2> 搜索` | `true` |
-| `cu_cjk_miss` | `public.simple_unaccent` | `中文 文档 搜索` | `中文 <~1> 搜索` | `false` |
-| `cu_cjk_glob` | `public.simple_unaccent` | `中文 文档 搜索` | `中?` | `true` |
+| label         | config                   | doc              | query            | expected |
+| ------------- | ------------------------ | ---------------- | ---------------- | -------- |
+| `cu_cjk_term` | `public.simple_unaccent` | `中文 文档 搜索` | `中文`           | `true`   |
+| `cu_cjk_prox` | `public.simple_unaccent` | `中文 文档 搜索` | `中文 <~2> 搜索` | `true`   |
+| `cu_cjk_miss` | `public.simple_unaccent` | `中文 文档 搜索` | `中文 <~1> 搜索` | `false`  |
+| `cu_cjk_glob` | `public.simple_unaccent` | `中文 文档 搜索` | `中?`            | `true`   |
 
-Emoji are dropped by the FTS _parser_ (Unicode symbols, not letters) under any UTF-8 ctype (C.UTF-8, en_US.UTF-8, ICU) — so they never become lexemes: a bare `😀` query matches nothing, while the surrounding words stay searchable and, since the emoji takes no position, adjacent (`rapport <-> final`). This is parser behavior governed by the database `lc_ctype`, not a proxquery or unaccent limitation, and is identical under plain `simple`. (The pathological bare `C` locale instead glues multibyte runs into one token and breaks case folding, so non-ASCII FTS needs a UTF-8 ctype regardless — the same assumption the existing CJK corpus cases already rely on.)
+Emoji are dropped by the FTS parser (Unicode symbols, not letters) under any UTF-8 ctype (C.UTF-8, en_US.UTF-8, ICU) — so they never become lexemes: a bare `😀` query matches nothing, while the surrounding words stay searchable and, since the emoji takes no position, adjacent (`rapport <-> final`). This is parser behavior governed by the database `lc_ctype`, not a proxquery or unaccent limitation, and is identical under plain `simple`. (The pathological bare `C` locale instead glues multibyte runs into one token and breaks case folding, so non-ASCII FTS needs a UTF-8 ctype regardless — the same assumption the existing CJK corpus cases already rely on.)
 
-| label | config | doc | query | expected |
-| --- | --- | --- | --- | --- |
-| `cu_emoji_adj` | `public.simple_unaccent` | `rapport 😀 final` | `rapport <-> final` | `true` |
-| `cu_emoji_word` | `public.simple_unaccent` | `rapport 😀 final` | `rapport` | `true` |
-| `cu_emoji_term` | `public.simple_unaccent` | `rapport 😀 final` | `😀` | `false` |
+| label           | config                   | doc                | query               | expected |
+| --------------- | ------------------------ | ------------------ | ------------------- | -------- |
+| `cu_emoji_adj`  | `public.simple_unaccent` | `rapport 😀 final` | `rapport <-> final` | `true`   |
+| `cu_emoji_word` | `public.simple_unaccent` | `rapport 😀 final` | `rapport`           | `true`   |
+| `cu_emoji_term` | `public.simple_unaccent` | `rapport 😀 final` | `😀`                | `false`  |
 
 The expanded mapping covers the letters+digits word types (numword, numhword, hword_numpart) on top of the all-letter ones, so accents fold on alphanumeric tokens too — `café2` is stored as `cafe2` (it was kept as `café2` when only asciiword/word/hword/hword_part were mapped). Term, reverse-spelling, proximity, and a miss all confirm the close of that gap.
 
-| label | config | doc | query | expected |
-| --- | --- | --- | --- | --- |
-| `cu_num_term` | `public.simple_unaccent` | `un café2 noir` | `cafe2` | `true` |
-| `cu_num_acc` | `public.simple_unaccent` | `un café2 noir` | `café2` | `true` |
-| `cu_num_prox` | `public.simple_unaccent` | `un café2 noir` | `cafe2 <-> noir` | `true` |
-| `cu_num_miss` | `public.simple_unaccent` | `un thé2 noir` | `cafe2` | `false` |
+| label         | config                   | doc             | query            | expected |
+| ------------- | ------------------------ | --------------- | ---------------- | -------- |
+| `cu_num_term` | `public.simple_unaccent` | `un café2 noir` | `cafe2`          | `true`   |
+| `cu_num_acc`  | `public.simple_unaccent` | `un café2 noir` | `café2`          | `true`   |
+| `cu_num_prox` | `public.simple_unaccent` | `un café2 noir` | `cafe2 <-> noir` | `true`   |
+| `cu_num_miss` | `public.simple_unaccent` | `un thé2 noir`  | `cafe2`          | `false`  |
 
 The numhword compound: `mp3-café` folds whole-token to `mp3-cafe`; its parts `mp3`/`café` land at the next positions (so `mp3 <-> cafe` is adjacent).
 
-| label | config | doc | query | expected |
-| --- | --- | --- | --- | --- |
-| `cu_nhw_term` | `public.simple_unaccent` | `un mp3-café ok` | `cafe` | `true` |
-| `cu_nhw_prox` | `public.simple_unaccent` | `un mp3-café ok` | `mp3 <-> cafe` | `true` |
+| label         | config                   | doc              | query          | expected |
+| ------------- | ------------------------ | ---------------- | -------------- | -------- |
+| `cu_nhw_term` | `public.simple_unaccent` | `un mp3-café ok` | `cafe`         | `true`   |
+| `cu_nhw_prox` | `public.simple_unaccent` | `un mp3-café ok` | `mp3 <-> cafe` | `true`   |
 
-Hyphenated-word proximity & phrases under accent folding. `café-bar` → `café-bar`:2 `café`:3 `bar`:4 (compound + parts at CONSECUTIVE positions), so: • unaccented adjacency / phrase reach the folded parts,
+Hyphenated-word proximity & phrases under accent folding. `café-bar` → `café-bar`:2 `café`:3 `bar`:4 (compound + parts at consecutive positions), so: • unaccented adjacency / phrase reach the folded parts,
 
-| label | config | doc | query | expected |
-| --- | --- | --- | --- | --- |
-| `cu_hw_adj` | `public.simple_unaccent` | `le café-bar ferme` | `cafe <-> bar` | `true` |
-| `cu_hw_phrase` | `public.simple_unaccent` | `le café-bar ferme` | `"cafe bar"` | `true` |
-| `cu_hw_acc` | `public.simple_unaccent` | `le café-bar ferme` | `"café bar"` | `true` |
-| `cu_hw_span` | `public.simple_unaccent` | `le café-bar ferme` | `"cafe bar ferme"` | `true` |
+| label          | config                   | doc                 | query              | expected |
+| -------------- | ------------------------ | ------------------- | ------------------ | -------- |
+| `cu_hw_adj`    | `public.simple_unaccent` | `le café-bar ferme` | `cafe <-> bar`     | `true`   |
+| `cu_hw_phrase` | `public.simple_unaccent` | `le café-bar ferme` | `"cafe bar"`       | `true`   |
+| `cu_hw_acc`    | `public.simple_unaccent` | `le café-bar ferme` | `"café bar"`       | `true`   |
+| `cu_hw_span`   | `public.simple_unaccent` | `le café-bar ferme` | `"cafe bar ferme"` | `true`   |
 
 • `<->` is ordered (reverse misses) while `<~N>` is symmetric within distance,
 
-| label | config | doc | query | expected |
-| --- | --- | --- | --- | --- |
-| `cu_hw_rev` | `public.simple_unaccent` | `le café-bar ferme` | `bar <-> cafe` | `false` |
-| `cu_hw_near` | `public.simple_unaccent` | `le café-bar ferme` | `ferme <~2> cafe` | `true` |
-| `cu_hw_near0` | `public.simple_unaccent` | `le café-bar ferme` | `cafe <~1> ferme` | `false` |
+| label         | config                   | doc                 | query             | expected |
+| ------------- | ------------------------ | ------------------- | ----------------- | -------- |
+| `cu_hw_rev`   | `public.simple_unaccent` | `le café-bar ferme` | `bar <-> cafe`    | `false`  |
+| `cu_hw_near`  | `public.simple_unaccent` | `le café-bar ferme` | `ferme <~2> cafe` | `true`   |
+| `cu_hw_near0` | `public.simple_unaccent` | `le café-bar ferme` | `cafe <~1> ferme` | `false`  |
 
-• the COMPOUND occupies the position between `le` and the `café` part, so `le` and `café` are NOT adjacent — a phrase across that boundary misses.
+• the compound occupies the position between `le` and the `café` part, so `le` and `café` are not adjacent — a phrase across that boundary misses.
 
-| label | config | doc | query | expected |
-| --- | --- | --- | --- | --- |
-| `cu_hw_gap` | `public.simple_unaccent` | `le café-bar ferme` | `"le cafe"` | `false` |
+| label       | config                   | doc                 | query       | expected |
+| ----------- | ------------------------ | ------------------- | ----------- | -------- |
+| `cu_hw_gap` | `public.simple_unaccent` | `le café-bar ferme` | `"le cafe"` | `false`  |
 
 A single-quoted literal `'…'` resolves through the config exactly like a bare term — the accent/stem-exactness is analyzer-only (there's no superimposed index here to be exact against). So under `simple` it stays accent-sensitive (`'café'` matches `café`, not `cafe`), and under `simple_unaccent` it folds (`'café'` matches both spellings).
 
-| label | config | doc | query | expected |
-| --- | --- | --- | --- | --- |
-| `lit_simple_acc` | `simple` | `un café noir` | `'café'` | `true` |
-| `lit_simple_miss` | `simple` | `un cafe noir` | `'café'` | `false` |
-| `lit_unacc_plain` | `public.simple_unaccent` | `un café noir` | `'café'` | `true` |
-| `lit_unacc_fold` | `public.simple_unaccent` | `un cafe noir` | `'café'` | `true` |
+| label             | config                   | doc            | query    | expected |
+| ----------------- | ------------------------ | -------------- | -------- | -------- |
+| `lit_simple_acc`  | `simple`                 | `un café noir` | `'café'` | `true`   |
+| `lit_simple_miss` | `simple`                 | `un cafe noir` | `'café'` | `false`  |
+| `lit_unacc_plain` | `public.simple_unaccent` | `un café noir` | `'café'` | `true`   |
+| `lit_unacc_fold`  | `public.simple_unaccent` | `un cafe noir` | `'café'` | `true`   |
 
 Recheck-drop fold under a config (the 3-arg `ts_prox_query_exact` / `ts_prox_search`): boolean / phrase / term queries shed the per-row recheck even under `simple_unaccent`, because each term resolves through the config — a single lexeme, or an OR of lexemes for a parser-split compound (`café-bar` → `bar`/`cafe`/`cafe-bar`), whose `@@` matches exactly as the recheck unions positions. The differential `cfg-exact` probe asserts both ports agree on which queries are droppable and that `@@ exact` equals the recheck. (Docs hold the whole compound, so the probe and the recheck coincide.)
 
@@ -712,10 +712,10 @@ Recheck-drop fold under a config (the 3-arg `ts_prox_query_exact` / `ts_prox_sea
 
 Same fold on a built-in stemming config (`english`, no contrib needed): a stemmed term folds 1:1 (`running` → `run`) so boolean / phrase queries drop the recheck; a stopword term (`the`) resolves to nothing, so `ts_prox_query_exact` stays NULL and the recheck is kept — exercising the gate's stopword branch on both ports.
 
-| label | config | doc | query | expected |
-| --- | --- | --- | --- | --- |
-| `ce_drop_bool` | `english` | `the running shoes` | `running & shoes` | `true` |
-| `ce_drop_phrase` | `english` | `the running shoes` | `"running shoes"` | `true` |
-| `ce_drop_stem_miss` | `english` | `the walking shoes` | `running & shoes` | `false` |
-| `ce_keep_stopword` | `english` | `the running shoes` | `the & running` | `false` |
-| `ce_keep_within` | `english` | `the running shoes` | `running <~2> shoes` | `true` |
+| label               | config    | doc                 | query                | expected |
+| ------------------- | --------- | ------------------- | -------------------- | -------- |
+| `ce_drop_bool`      | `english` | `the running shoes` | `running & shoes`    | `true`   |
+| `ce_drop_phrase`    | `english` | `the running shoes` | `"running shoes"`    | `true`   |
+| `ce_drop_stem_miss` | `english` | `the walking shoes` | `running & shoes`    | `false`  |
+| `ce_keep_stopword`  | `english` | `the running shoes` | `the & running`      | `false`  |
+| `ce_keep_within`    | `english` | `the running shoes` | `running <~2> shoes` | `true`   |

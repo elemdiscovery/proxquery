@@ -1,0 +1,14 @@
+{
+  "name": "proxquery-tooling",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Dev tooling.",
+  "packageManager": "pnpm@11.9.0",
+  "scripts": {
+    "format": "oxfmt \"**/*.md\"",
+    "format:check": "oxfmt --check \"**/*.md\""
+  },
+  "devDependencies": {
+    "oxfmt": "0.56.0"
+  }
+}
