@@ -608,6 +608,12 @@ and the plain boolean AND of a term with a hyphenated term works today.
 | --- | --- | --- | --- | --- |
 | `cs_cd_and` | `simple` | `a b c-d` | `a & 'c-d'` | `true` |
 
+On plain `simple`, `&` is dropped with no compound lexeme (the parts split to their own positions — `we did R&D` → `we did r d`), so an `R&D` search degrades to the boolean `r & d` and still finds the doc — just loosely (any doc with `r` and `d`). The precise unit needs the custom tokenizer's `r&d` compound.
+
+| label | config | doc | query | expected |
+| --- | --- | --- | --- | --- |
+| `cs_amp_and` | `simple` | `we did R&D` | `R&D` | `true` |
+
 Accent-folding contrast (needs contrib `unaccent`): same queries that stay accent-sensitive on `simple` now strip accents on `simple_unaccent`. Best-effort — skipped wholesale if unaccent isn't installed, so contrib-less CI still passes. Wildcards fold their literal runs to the unaccented form (the new feature).
 
 | label | config | doc | query | expected |

@@ -150,3 +150,21 @@ direction.
 | `hyphen_ord` | `prox_icu` | `a red-blue sky` | `red <-1> blue` | `true` |
 | `hyphen_ord_rev` | `prox_icu` | `a red-blue sky` | `blue <-1> red` | `true` |
 | `sym_phrase` | `prox_icu` | `Foo™ Bar` | `"Foo Bar"` | `true` |
+
+## Ampersand units (`R&D`, `P&L`)
+
+A `&` run superimposes its compound + parts + concatenation onto one slot (see the tokenizer
+corpus), so the literal `'R&D'` finds the unit precisely (the `r&d` compound), the
+concatenation `rd` finds it, and the bare parts `r`/`d` find it. A bare `R&D` *query* is the
+boolean `r & d` (the DSL reads `&` as AND) — looser, so it also matches a doc with `r` and `d`
+apart, where the precise literal `'R&D'` correctly misses.
+
+| label | analyzer | doc | query | expected |
+| --- | --- | --- | --- | --- |
+| `amp_lit` | `prox_icu` | `we did R&D` | `'R&D'` | `true` |
+| `amp_concat` | `prox_icu` | `we did R&D` | `rd` | `true` |
+| `amp_part` | `prox_icu` | `we did R&D` | `r` | `true` |
+| `amp_and` | `prox_icu` | `we did R&D` | `R&D` | `true` |
+| `amp_pl_lit` | `prox_icu` | `the P&L now` | `'P&L'` | `true` |
+| `amp_lit_spec` | `prox_icu` | `r and d` | `'R&D'` | `false` |
+| `amp_and_loose` | `prox_icu` | `r and d` | `R&D` | `true` |
