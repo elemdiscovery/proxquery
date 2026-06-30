@@ -88,6 +88,14 @@ jobs:
           ' CHANGELOG.md > notes.md || true
           [ -s notes.md ] || printf 'Release %s\n' "$TAG" > notes.md
 
+          # Point at the GHCR images (pushed by release-build.yml) without
+          # touching the generated CHANGELOG — append a footer to the notes only.
+          {
+            printf '\n---\n'
+            printf '**Container images:** `ghcr.io/%s:%s-pg16` · `-pg17` · `-pg18`\n' \
+              "$GITHUB_REPOSITORY" "$VERSION"
+          } >> notes.md
+
           gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md
           echo "Released ${TAG}."
           echo "released=true" >> "$GITHUB_OUTPUT"
