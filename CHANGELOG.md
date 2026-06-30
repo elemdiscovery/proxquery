@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/elemdiscovery/proxquery/compare/v0.4.3...v0.5.0) - 2026-06-30
+
+### Added
+
+- Added custom tokenization for `&` in the custom tokenizer similar to `-`.
+- [**breaking**] ordered proximity <-N>/<!-N> now matches superimposed (co-located) lexemes
+
+### Fixed
+
+- Error on over large proximity parameter instead of silently cap … ([#30](https://github.com/elemdiscovery/proxquery/pull/30))
+
 ## [0.4.3](https://github.com/elemdiscovery/proxquery/compare/v0.4.2...v0.4.3) - 2026-06-29
 
 ### Fixed
