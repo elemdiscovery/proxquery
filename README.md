@@ -78,24 +78,24 @@ Ranking results isn't a goal of this extension, but `ts_prox_query(q)` returns a
 
 The DSL is a superset of `tsquery`. Native `tsquery` syntax works unchanged; the `<…>` proximity operators are the additions.
 
-| Syntax | Meaning |
-| --- | --- |
-| `a & b` | both terms (AND) |
-| `a \| b` | either term (OR) |
-| `!a` | term absent (NOT) |
-| `( )` | grouping |
-| `appl*` | prefix (`:*` works too) |
-| `*ology` | suffix |
-| `f*r` | infix |
-| `te?t` | single character (`?`) |
-| `##re##` | regex, whole lexeme |
-| `'café'` | literal term |
-| `"a b c"` | phrase (adjacent words) |
-| `a <-> b` | `b` immediately after `a` |
-| `a <N> b` | `b` exactly `N` words after `a` |
-| `a <~N> b` | within `N` words, either order |
-| `a <-N> b` | `a` before `b`, within `N` words |
-| `a <!~N> b` | an `a` with no `b` within `N` words |
+| Syntax      | Meaning                                      |
+| ----------- | -------------------------------------------- |
+| `a & b`     | both terms (AND)                             |
+| `a \| b`    | either term (OR)                             |
+| `!a`        | term absent (NOT)                            |
+| `( )`       | grouping                                     |
+| `appl*`     | prefix (`:*` works too)                      |
+| `*ology`    | suffix                                       |
+| `f*r`       | infix                                        |
+| `te?t`      | single character (`?`)                       |
+| `##re##`    | regex, whole lexeme                          |
+| `'café'`    | literal term                                 |
+| `"a b c"`   | phrase (adjacent words)                      |
+| `a <-> b`   | `b` immediately after `a`                    |
+| `a <N> b`   | `b` exactly `N` words after `a`              |
+| `a <~N> b`  | within `N` words, either order               |
+| `a <-N> b`  | `a` before `b`, within `N` words             |
+| `a <!~N> b` | an `a` with no `b` within `N` words          |
 | `a <!-N> b` | an `a` with no `b` within the next `N` words |
 
 A few comments:
@@ -170,12 +170,12 @@ SELECT id, body FROM docs WHERE tsv @~@ proxquery('prox_icu', '''café'' <-> noi
 
 The built-in analyzers:
 
-| Analyzer | Notes |
-| --- | --- |
-| `prox_icu` | default; ICU library segmentation, folds case and accents, keeps emoji |
-| `prox_unicode` | Same as default but unicode segmentation (per character CJK) |
-| `prox_icu_accent` | accent-sensitive (`café` ≠ `cafe`) |
-| `prox_icu_no_emoji` | drops emoji instead of indexing them |
+| Analyzer            | Notes                                                                  |
+| ------------------- | ---------------------------------------------------------------------- |
+| `prox_icu`          | default; ICU library segmentation, folds case and accents, keeps emoji |
+| `prox_unicode`      | Same as default but unicode segmentation (per character CJK)           |
+| `prox_icu_accent`   | accent-sensitive (`café` ≠ `cafe`)                                     |
+| `prox_icu_no_emoji` | drops emoji instead of indexing them                                   |
 
 You can combine the custom analyzers with built-in dictionaries, with `:dict`, e.g. `prox_icu:english_stem`.
 

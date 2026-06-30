@@ -781,7 +781,7 @@ mod tests {
 
     #[pg_test]
     fn within_zero_is_same_position() {
-        // Distances clamp to [0, 16383]; `0` is kept (not raised to 1). `<~0>` /
+        // Distances range over [0, 16384]; `0` is kept (not raised to 1). `<~0>` /
         // `<0>` mean SAME position (distance 0), matching native tsquery `<0>`.
         // Distinct lexemes never share a position, so on normal text `<0>` is false —
         // and crucially it is NOT silently adjacency (which is how it'd behave if 0
@@ -2392,6 +2392,79 @@ mod tests {
         // Scope: subject at the cap but avoid term not ⇒ no fail open ⇒ still false.
         let subj = "$$'confidential':16383 'email':16380$$::tsvector";
         both(&format!("ts_prox_not_within({subj}, 'confidential', 'email', 5)"), false);
+    }
+
+    // Distance range at the extreme. A distance is an integer in [0, 16384] (native
+    // tsquery's phrase range); over that RAISES — no clamp, no wrap, no panic. The
+    // readable boundary cases (16384 ok, 16385/8-digit raise) live in the markdown corpus
+    // (`dsat1`..`dsat5`); the pathological "longer than any fixed-width integer" inputs
+    // live here, off the user-facing spec. The point is that NO integer width survives:
+    // Rust `parse::<i32>()` errors on overflow (→ same range error), and the pure port
+    // rejects on digit length before any cast — so if either is later widened (i64 / u128
+    // / …) without a range check, these trip. A 32-digit value still fits in u128, so we
+    // go past u128 (40 digits) and beyond. Checked under BOTH implementations.
+    #[pg_test]
+    fn pure_sql_matches_extension_distance_overflow() {
+        Spi::run(include_str!("../sql/proxquery_pure.sql")).expect("load pure-SQL port");
+        let ext = Spi::get_one::<String>(
+            "SELECT nsp.nspname::text FROM pg_extension e \
+             JOIN pg_namespace nsp ON nsp.oid = e.extnamespace WHERE e.extname = 'proxquery'",
+        )
+        .unwrap()
+        .expect("extension installed");
+        // Helper: does running `stmt` raise? (a plpgsql subtransaction, so each call is
+        // isolated and a caught error doesn't poison the outer transaction).
+        Spi::run(
+            "CREATE FUNCTION pg_temp.raises(stmt text) RETURNS boolean LANGUAGE plpgsql AS \
+             $$ BEGIN EXECUTE stmt; RETURN false; EXCEPTION WHEN OTHERS THEN RETURN true; END $$",
+        )
+        .unwrap();
+        let raises = |stmt: &str| b(&format!("SELECT pg_temp.raises($q${stmt}$q$)"));
+
+        // The inclusive max (16384) is accepted by both impls and lowers to that phrase.
+        for schema in [ext.as_str(), "proxquery"] {
+            let s = Spi::get_one::<String>(&format!(
+                "SELECT {schema}.ts_prox_query_skeleton('a <16384> b')"
+            ))
+            .unwrap()
+            .unwrap();
+            assert_eq!(s, "('a' <16384> 'b')", "{schema} rejected the inclusive max <16384>");
+        }
+
+        // Anything past the max raises — across every integer-width boundary and beyond —
+        // in BOTH impls (skeleton path, i.e. the exact `<N>` operator).
+        for digits in [
+            "16385",                                     // just over the inclusive max
+            "2147483648",                                // i32::MAX + 1
+            "9223372036854775808",                       // i64::MAX + 1
+            "18446744073709551616",                      // u64::MAX + 1
+            "9999999999999999999999999999999999999999",  // 40 digits, > u128::MAX
+            &"9".repeat(128),                            // absurd length: must not choke
+        ] {
+            let q = format!("a <{digits}> b");
+            assert!(
+                raises(&format!("SELECT {ext}.ts_prox_query_skeleton('{q}')")),
+                "extension accepted over-range <{digits}>"
+            );
+            assert!(
+                raises(&format!("SELECT proxquery.ts_prox_query_skeleton('{q}')")),
+                "pure port accepted over-range <{digits}>"
+            );
+        }
+
+        // The within operator shares the same range, so an over-range `<~N>` raises too
+        // (rather than feeding a huge N into the recheck) — both impls.
+        let q = "a <~9999999999999999999999999999999999999999> b";
+        assert!(
+            raises(&format!("SELECT {ext}.ts_prox_recheck(to_tsvector('simple','a x b'), '{q}')")),
+            "extension accepted over-range <~N>"
+        );
+        assert!(
+            raises(&format!(
+                "SELECT proxquery.ts_prox_recheck(to_tsvector('simple','a x b'), '{q}')"
+            )),
+            "pure port accepted over-range <~N>"
+        );
     }
 
     // Smoke test: every ```sql block in README.md must run without error, so a renamed
