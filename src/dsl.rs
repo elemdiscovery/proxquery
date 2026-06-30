@@ -42,7 +42,10 @@
 //! - `(!a)    <~N> b` → ERROR ([`NOT_OPERAND_ERR`]): "a is absent" has no position;
 //!   lifting to `!(a <~N> b)` silently flips ∃ to ¬∃. Use `!(a <~N> b)` for the
 //!   document-level negation, or `b <!~N> a` for "a b with no a nearby" (occurrence).
-//! - `(a | b) <~N> c` → kept: OR distributes into the position-set union
+//! - `(a | b) <~N> c` → kept: OR distributes into the position-set union. The exact/phrase
+//!   operators `<->`/`<N>` take an OR operand too, but distribute it at PARSE time into an
+//!   `Or` of plain phrases (`(a | b) <-> c` → `(a <-> c) | (b <-> c)`, see [`extend_phrase`]),
+//!   so each branch stays a contiguous atom-run.
 //! - `"a b"   <~N> c` → kept: a phrase contributes its whole span, so proximity is
 //!   measured EDGE-TO-EDGE (nearest edge), the same as a nested group's span. Within/pre
 //!   use the densified span ([`positions`]); not-within reasons per whole occurrence
@@ -91,16 +94,24 @@ pub enum Node {
     NotWithin { a: Box<Node>, b: Box<Node>, n: i32, ordered: bool },
 }
 
-const MAX_DISTANCE: i32 = 16383;
+/// Inclusive max distance — native `tsquery`'s phrase-operator limit. Postgres raises
+/// on a phrase distance above this ("…between zero and 16384 inclusive"), so we follow
+/// suit on every proximity operator rather than silently clamping.
+const MAX_DISTANCE: i32 = 16384;
 
 fn parse_distance(digits: &str) -> Result<i32, String> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(format!("expected a distance, got `{digits}`"));
     }
-    // Clamp to [0, MAX]. `0` is kept (not raised to 1): native tsquery `<0>` means
-    // "same position", and the proximity ops follow suit (`within(·,0)` and `pre(·,0)`
-    // both = same position). Overflow saturates to MAX.
-    Ok(digits.parse::<i32>().unwrap_or(MAX_DISTANCE).clamp(0, MAX_DISTANCE))
+    // Range is [0, MAX], matching native tsquery's phrase operator — out of range RAISES
+    // (no silent clamp), like Postgres. `0` is kept (not raised to 1): `<0>` means "same
+    // position", and the proximity ops follow suit (`within(·,0)` / `pre(·,0)` too). A
+    // value that overflows `i32` necessarily exceeds MAX, so the parse failure folds into
+    // the same range error.
+    match digits.parse::<i32>() {
+        Ok(n) if n <= MAX_DISTANCE => Ok(n),
+        _ => Err(format!("distance must be between 0 and {MAX_DISTANCE}, got `{digits}`")),
+    }
 }
 
 // ===========================================================================
@@ -408,17 +419,29 @@ impl Parser {
     }
 }
 
-fn phrase_node(atoms: Vec<Atom>) -> Node {
-    if atoms.len() == 1 {
-        return match atoms.into_iter().next().unwrap() {
-            Atom::Term(t) => Node::Term(t),
-            Atom::Exact(t) => Node::Exact(t),
-            Atom::Prefix(p) => Node::Prefix(p),
-            Atom::Glob { glob, prefix } => Node::Glob { glob, prefix },
-        };
+fn atom_to_node(a: Atom) -> Node {
+    match a {
+        Atom::Term(t) => Node::Term(t),
+        Atom::Exact(t) => Node::Exact(t),
+        Atom::Prefix(p) => Node::Prefix(p),
+        Atom::Glob { glob, prefix } => Node::Glob { glob, prefix },
     }
-    let gaps = vec![1; atoms.len() - 1];
-    Node::Phrase { atoms, gaps }
+}
+
+/// Build a phrase node from atoms + explicit gaps, collapsing a single atom back to
+/// its bare leaf node (a one-atom "phrase" has no adjacency to check).
+fn phrase_node_with_gaps(atoms: Vec<Atom>, gaps: Vec<i32>) -> Node {
+    if atoms.len() == 1 {
+        atom_to_node(atoms.into_iter().next().unwrap())
+    } else {
+        Node::Phrase { atoms, gaps }
+    }
+}
+
+/// A quoted phrase: adjacency (all gaps = 1).
+fn phrase_node(atoms: Vec<Atom>) -> Node {
+    let gaps = vec![1; atoms.len().saturating_sub(1)];
+    phrase_node_with_gaps(atoms, gaps)
 }
 
 fn as_atom(node: &Node) -> Option<Atom> {
@@ -431,9 +454,30 @@ fn as_atom(node: &Node) -> Option<Atom> {
     }
 }
 
+/// The alternative contiguous atom-runs a node contributes as a phrase/distance
+/// (`<->`, `<N>`) operand, or `None` if it can't be one. A plain atom is a single run;
+/// a [`Node::Phrase`] is its own run; an `Or` is the concatenation of its branches'
+/// runs — which is how `<->`/`<N>` DISTRIBUTE over OR: `(a | b) <-> c` builds
+/// `[a,c]` and `[b,c]`, lowered to `(a <-> c) | (b <-> c)`, matching the within
+/// operators' OR semantics. Everything non-positional or non-contiguous (`&`, `!`,
+/// a regex, a nested proximity span) has no phrase form → `None`.
+fn phrase_alts(node: &Node) -> Option<Vec<(Vec<Atom>, Vec<i32>)>> {
+    match node {
+        Node::Phrase { atoms, gaps } => Some(vec![(atoms.clone(), gaps.clone())]),
+        Node::Or(children) => {
+            let mut alts = Vec::new();
+            for c in children {
+                alts.extend(phrase_alts(c)?);
+            }
+            Some(alts)
+        }
+        other => Some(vec![(vec![as_atom(other)?], Vec::new())]),
+    }
+}
+
 /// Fold a left-associative proximity chain. Phrase/distance operators extend a
-/// contiguous [`Node::Phrase`] (atom operands only); the rest wrap the running
-/// node so the next operand is tested against its position region.
+/// contiguous [`Node::Phrase`] (distributing over any OR operand, see [`extend_phrase`]);
+/// the rest wrap the running node so the next operand is tested against its position region.
 fn build_prox(first: Node, ops: Vec<(ProxOp, Node)>) -> Result<Node, String> {
     let mut current = first;
     for (op, rhs) in ops {
@@ -449,20 +493,28 @@ fn build_prox(first: Node, ops: Vec<(ProxOp, Node)>) -> Result<Node, String> {
     Ok(current)
 }
 
+/// Extend the running phrase with `rhs` at distance `gap`. Both sides are expanded to
+/// their phrase atom-runs ([`phrase_alts`]) and spliced as a cross product, so an OR on
+/// either side distributes into an `Or` of plain phrases (`(a | b) <-> c` →
+/// `(a <-> c) | (b <-> c)`). Each resulting phrase is a normal contiguous atom-run, so
+/// all downstream eval / lowering / skeleton handle it unchanged.
 fn extend_phrase(current: Node, rhs: Node, gap: i32) -> Result<Node, String> {
-    const ERR: &str = "phrase/distance operator (`<->`, `<N>`) needs term operands";
-    let rhs_atom = as_atom(&rhs).ok_or(ERR)?;
-    match current {
-        Node::Phrase { mut atoms, mut gaps } => {
-            atoms.push(rhs_atom);
+    const ERR: &str = "phrase/distance operator (`<->`, `<N>`) operands must be terms, \
+                       phrases, or an OR of them — not `&`, `!`, a regex, or a nested proximity";
+    let left = phrase_alts(&current).ok_or(ERR)?;
+    let right = phrase_alts(&rhs).ok_or(ERR)?;
+    let mut combos: Vec<Node> = Vec::with_capacity(left.len() * right.len());
+    for (la, lg) in &left {
+        for (ra, rg) in &right {
+            let mut atoms = la.clone();
+            atoms.extend_from_slice(ra);
+            let mut gaps = lg.clone();
             gaps.push(gap);
-            Ok(Node::Phrase { atoms, gaps })
-        }
-        other => {
-            let left = as_atom(&other).ok_or(ERR)?;
-            Ok(Node::Phrase { atoms: vec![left, rhs_atom], gaps: vec![gap] })
+            gaps.extend_from_slice(rg);
+            combos.push(phrase_node_with_gaps(atoms, gaps));
         }
     }
+    Ok(if combos.len() == 1 { combos.pop().unwrap() } else { Node::Or(combos) })
 }
 
 pub fn parse(input: &str) -> Result<Node, String> {

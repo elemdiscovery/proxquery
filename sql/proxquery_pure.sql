@@ -82,9 +82,11 @@ CREATE OR REPLACE FUNCTION _prox_is_word_char(c text) RETURNS boolean
     LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
 $fn$ SELECT $1 !~ '\s' AND position($1 in '()&|!<>,"''#') = 0 $fn$;
 
--- Parse a distance: non-empty digits, clamped to [0, 16383] (matches the Rust
--- `parse_distance` / MAX_DISTANCE clamp, including overflow → 16383). `0` is kept
--- (native tsquery `<0>` = same position), not raised to 1.
+-- Parse a distance: a non-empty run of digits in [0, 16384] (native tsquery's phrase
+-- range; matches the Rust `parse_distance` / MAX_DISTANCE). Out of range RAISES, like
+-- Postgres — no silent clamp. `0` is kept (native tsquery `<0>` = same position), not
+-- raised to 1. The `length > 5` check rejects anything past the range before the cast,
+-- so a huge value can't overflow int4 (16384 is 5 digits; ≥6 digits is always > MAX).
 CREATE OR REPLACE FUNCTION _prox_parse_distance(digits text) RETURNS int
     LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
 $fn$
@@ -92,10 +94,13 @@ BEGIN
     IF digits IS NULL OR digits = '' OR digits !~ '^[0-9]+$' THEN
         RAISE EXCEPTION 'expected a distance, got `%`', coalesce(digits, '');
     END IF;
-    IF length(digits) > 5 THEN
-        RETURN 16383;
+    IF length(digits) > 5 THEN  -- separate guard: don't cast a huge string (int4 overflow)
+        RAISE EXCEPTION 'distance must be between 0 and 16384, got `%`', digits;
     END IF;
-    RETURN least(greatest(digits::int, 0), 16383);
+    IF digits::int > 16384 THEN
+        RAISE EXCEPTION 'distance must be between 0 and 16384, got `%`', digits;
+    END IF;
+    RETURN digits::int;
 END
 $fn$;
 
@@ -453,28 +458,74 @@ CREATE OR REPLACE FUNCTION _prox_as_atom(node jsonb) RETURNS jsonb
     LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
 $fn$ SELECT CASE WHEN node ->> 't' IN ('term', 'prefix', 'glob') THEN node ELSE NULL END $fn$;
 
+-- Build a phrase node from atoms + explicit gaps, collapsing a single atom back to
+-- its bare leaf node (mirrors the Rust `phrase_node_with_gaps`).
+CREATE OR REPLACE FUNCTION _prox_phrase_node_with_gaps(atoms jsonb, gaps jsonb) RETURNS jsonb
+    LANGUAGE sql IMMUTABLE PARALLEL SAFE AS
+$fn$ SELECT CASE WHEN jsonb_array_length(atoms) = 1 THEN atoms -> 0
+                 ELSE jsonb_build_object('t', 'phrase', 'atoms', atoms, 'gaps', gaps) END $fn$;
+
+-- The alternative contiguous atom-runs a node contributes as a phrase/distance
+-- (`<->`, `<N>`) operand, as a JSONB array of `{atoms, gaps}` runs — or NULL if it
+-- can't be one. A plain atom is one run; a phrase is its own run; an OR is the
+-- concatenation of its branches' runs (so `<->`/`<N>` DISTRIBUTE over OR). Anything
+-- non-positional or non-contiguous (`&`, `!`, regex, nested proximity) → NULL.
+CREATE OR REPLACE FUNCTION _prox_phrase_alts(node jsonb) RETURNS jsonb
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+DECLARE
+    t     text := node ->> 't';
+    atom  jsonb;
+    child jsonb;
+    sub   jsonb;
+    alts  jsonb := '[]'::jsonb;
+BEGIN
+    IF t = 'phrase' THEN
+        RETURN jsonb_build_array(jsonb_build_object('atoms', node -> 'atoms', 'gaps', node -> 'gaps'));
+    ELSIF t = 'or' THEN
+        FOR child IN SELECT * FROM jsonb_array_elements(node -> 'c') LOOP
+            sub := _prox_phrase_alts(child);
+            IF sub IS NULL THEN RETURN NULL; END IF;
+            alts := alts || sub;
+        END LOOP;
+        RETURN alts;
+    ELSE
+        atom := _prox_as_atom(node);
+        IF atom IS NULL THEN RETURN NULL; END IF;
+        RETURN jsonb_build_array(jsonb_build_object('atoms', jsonb_build_array(atom), 'gaps', '[]'::jsonb));
+    END IF;
+END
+$fn$;
+
+-- Extend the running phrase with `rhs` at distance `gap`. Both sides expand to their
+-- phrase atom-runs and are spliced as a cross product, so an OR on either side
+-- distributes into an `Or` of plain phrases (`(a | b) <-> c` → `(a <-> c) | (b <-> c)`).
 CREATE OR REPLACE FUNCTION _prox_extend_phrase(cur jsonb, rhs jsonb, gap int) RETURNS jsonb
     LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
 $fn$
 DECLARE
-    rhs_atom jsonb := _prox_as_atom(rhs);
-    left_atom jsonb;
+    err constant text := 'phrase/distance operator (`<->`, `<N>`) operands must be terms, '
+        'phrases, or an OR of them — not `&`, `!`, a regex, or a nested proximity';
+    lefts  jsonb := _prox_phrase_alts(cur);
+    rights jsonb := _prox_phrase_alts(rhs);
+    l jsonb;
+    r jsonb;
+    combos jsonb := '[]'::jsonb;
 BEGIN
-    IF rhs_atom IS NULL THEN
-        RAISE EXCEPTION 'phrase/distance operator (`<->`, `<N>`) needs term operands';
+    IF lefts IS NULL OR rights IS NULL THEN
+        RAISE EXCEPTION '%', err;
     END IF;
-    IF cur ->> 't' = 'phrase' THEN
-        RETURN jsonb_build_object('t', 'phrase',
-            'atoms', (cur -> 'atoms') || jsonb_build_array(rhs_atom),
-            'gaps',  (cur -> 'gaps')  || jsonb_build_array(gap));
+    FOR l IN SELECT * FROM jsonb_array_elements(lefts) LOOP
+        FOR r IN SELECT * FROM jsonb_array_elements(rights) LOOP
+            combos := combos || jsonb_build_array(_prox_phrase_node_with_gaps(
+                (l -> 'atoms') || (r -> 'atoms'),
+                (l -> 'gaps') || jsonb_build_array(gap) || (r -> 'gaps')));
+        END LOOP;
+    END LOOP;
+    IF jsonb_array_length(combos) = 1 THEN
+        RETURN combos -> 0;
     END IF;
-    left_atom := _prox_as_atom(cur);
-    IF left_atom IS NULL THEN
-        RAISE EXCEPTION 'phrase/distance operator (`<->`, `<N>`) needs term operands';
-    END IF;
-    RETURN jsonb_build_object('t', 'phrase',
-        'atoms', jsonb_build_array(left_atom, rhs_atom),
-        'gaps',  jsonb_build_array(gap));
+    RETURN jsonb_build_object('t', 'or', 'c', combos);
 END
 $fn$;
 
