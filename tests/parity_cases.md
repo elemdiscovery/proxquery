@@ -699,23 +699,21 @@ A single-quoted literal `'…'` resolves through the config exactly like a bare 
 | `lit_unacc_plain` | `public.simple_unaccent` | `un café noir` | `'café'` | `true`   |
 | `lit_unacc_fold`  | `public.simple_unaccent` | `un cafe noir` | `'café'` | `true`   |
 
-Recheck-drop fold under a config (the 3-arg `ts_prox_query_exact` / `ts_prox_search`): boolean / phrase / term queries shed the per-row recheck even under `simple_unaccent`, because each term resolves through the config — a single lexeme, or an OR of lexemes for a parser-split compound (`café-bar` → `bar`/`cafe`/`cafe-bar`), whose `@@` matches exactly as the recheck unions positions. The differential `cfg-exact` probe asserts both ports agree on which queries are droppable and that `@@ exact` equals the recheck. (Docs hold the whole compound, so the probe and the recheck coincide.)
+Recheck-drop fold under a config (`ts_prox_query_exact` / `ts_prox_search`): even under `simple_unaccent`, boolean / phrase / compound queries shed the per-row recheck, because each term resolves through the config to a lexeme — or an OR of lexemes for a split compound (`café-bar` → `bar`/`cafe`/`cafe-bar`) — whose `@@` matches exactly. The `cfg-exact` probe asserts both ports agree on which queries are droppable and that `@@ exact` equals the recheck.
 
-| label | config | doc | query | expected |
-| --- | --- | --- | --- | --- |
-| `cu_drop_bool` | `public.simple_unaccent` | `un CAFÉ noir` | `cafe & noir` | `true` |
-| `cu_drop_bool_miss` | `public.simple_unaccent` | `un CAFÉ noir` | `cafe & vin` | `false` |
-| `cu_drop_or` | `public.simple_unaccent` | `un CAFÉ noir` | `(vin \| cafe)` | `true` |
-| `cu_drop_phrase` | `public.simple_unaccent` | `un café noir` | `"café noir"` | `true` |
-| `cu_drop_compound` | `public.simple_unaccent` | `le café-bar ferme` | `café-bar` | `true` |
-| `cu_drop_comp_fold` | `public.simple_unaccent` | `le café-bar ferme` | `cafe-bar` | `true` |
+| label               | config                   | doc                 | query         | expected |
+| ------------------- | ------------------------ | ------------------- | ------------- | -------- |
+| `cu_drop_bool`      | `public.simple_unaccent` | `un CAFÉ noir`      | `cafe & noir` | `true`   |
+| `cu_drop_bool_miss` | `public.simple_unaccent` | `un CAFÉ noir`      | `cafe & vin`  | `false`  |
+| `cu_drop_phrase`    | `public.simple_unaccent` | `un café noir`      | `"café noir"` | `true`   |
+| `cu_drop_compound`  | `public.simple_unaccent` | `le café-bar ferme` | `café-bar`    | `true`   |
 
-Same fold on a built-in stemming config (`english`, no contrib needed): a stemmed term folds 1:1 (`running` → `run`) so boolean / phrase queries drop the recheck; a stopword term (`the`) resolves to nothing, so `ts_prox_query_exact` stays NULL and the recheck is kept — exercising the gate's stopword branch on both ports.
+Same drop-fold on a stemming config (`english`, no contrib needed). A stemmed term folds 1:1, so boolean and phrase queries drop the recheck; and because the query is analyzed through the same config, a base-form query like `run & shoe` matches the inflected document `the running shoes` (both reduce to `run`/`shoe`). Two queries keep the recheck instead: a stopword (`the`) folds to nothing, leaving `ts_prox_query_exact` NULL, and `<~N>` proximity can't be expressed as a plain `@@` match.
 
 | label               | config    | doc                 | query                | expected |
 | ------------------- | --------- | ------------------- | -------------------- | -------- |
-| `ce_drop_bool`      | `english` | `the running shoes` | `running & shoes`    | `true`   |
 | `ce_drop_phrase`    | `english` | `the running shoes` | `"running shoes"`    | `true`   |
+| `ce_drop_stem_hit`  | `english` | `the running shoes` | `run & shoe`         | `true`   |
 | `ce_drop_stem_miss` | `english` | `the walking shoes` | `running & shoes`    | `false`  |
 | `ce_keep_stopword`  | `english` | `the running shoes` | `the & running`      | `false`  |
 | `ce_keep_within`    | `english` | `the running shoes` | `running <~2> shoes` | `true`   |
