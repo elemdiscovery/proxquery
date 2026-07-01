@@ -27,6 +27,15 @@ Single quote is the literal-term delimiter: a raw apostrophe (`it's`) opens a li
 | `litErr1` | `ts_prox_recheck(to_tsvector('simple','a b'), $$it's here$$)` | `ERR`    |
 | `litErr2` | `ts_prox_query($$''$$)`                                       | `ERR`    |
 
+`#` has exactly one meaning — the `##regex##` delimiter — and never falls through to literal text. A lone `#` (one not paired into `##`) raises rather than being read as a word character, and an opening `##` with no closing `##` raises as unterminated. So a "normal" phrase that merely happens to contain `#`/`##` (`alpha # beta`, `alpha ## beta`) is a query error on both ports, not a silently mis-parsed literal. To match a literal `#`, quote it (`'#tag'`). Empty delimiters `####` are a valid but empty pattern that matches no lexeme (see the `rEmpty` match case), not an error.
+
+| label      | expression                                                            | expected |
+| ---------- | --------------------------------------------------------------------- | -------- |
+| `hashErr1` | `ts_prox_recheck(to_tsvector('simple','alpha beta'),'alpha # beta')`  | `ERR`    |
+| `hashErr2` | `ts_prox_query('#foo')`                                               | `ERR`    |
+| `hashErr3` | `ts_prox_recheck(to_tsvector('simple','alpha beta'),'alpha ## beta')` | `ERR`    |
+| `hashErr4` | `ts_prox_query('##abc')`                                              | `ERR`    |
+
 A distance must be a non-empty run of digits. Anything else — embedded space, trailing junk, a sign, or empty — raises on both implementations (no silent coercion to a default distance). `<-N>` stays the legitimate ordered operator; only a malformed body errors.
 
 | label   | expression                   | expected |
@@ -343,6 +352,7 @@ Recheck pairs run as `ts_prox_recheck(to_tsvector('simple', doc), query)`.
 | `ra4` | `category dogma` | `##cat\|dog##` | `false` |
 | `ra5` | `the colour is nice` | `##^colou?r##` | `true` |
 | `ra6` | `the colour is nice` | `##colou?r$##` | `true` |
+| `rEmpty` | `alpha beta` | `####` | `false` |
 | `z0a` | `a b` | `a <~0> b` | `false` |
 | `z0d` | `a b` | `a <0> b` | `false` |
 | `span1` | `a 2 b 4 5 c` | `(a <~5> c) <~1> b` | `true` |

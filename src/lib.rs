@@ -713,6 +713,14 @@ mod tests {
         assert!(!proxmatch("category dogma", "##cat|dog##")); // neither is a whole lexeme
     }
 
+    #[pg_test]
+    fn regex_empty_matches_nothing() {
+        // `####` is a valid but empty pattern — it compiles as `^(?:)$`, which only
+        // matches the empty string. No lexeme is empty, so it matches nothing (rather
+        // than erroring or matching everything).
+        assert!(!proxmatch("alpha beta", "####"));
+    }
+
 
     // --- ts_prox_recheck recheck + full pipeline -----------------------------
     fn proxmatch(doc: &str, q: &str) -> bool {
@@ -1341,6 +1349,20 @@ mod tests {
         // Validation is up front, so a malformed regex fails the query even when a
         // sibling branch (`alpha`) would have matched and short-circuited eval.
         Spi::run("SELECT ts_prox_recheck(to_tsvector('simple','alpha beta'), 'alpha | ##[##')").unwrap();
+    }
+
+    #[pg_test(error = "ts_prox_recheck: a single `#` is not valid; use `##regex##` or quote it")]
+    fn err_single_hash() {
+        // `#` is not a word char and only means the `##regex##` delimiter — a lone `#`
+        // (e.g. a phrase that happens to contain one) is a query bug, not literal text.
+        Spi::run("SELECT ts_prox_recheck(to_tsvector('simple','alpha beta'), 'alpha # beta')").unwrap();
+    }
+
+    #[pg_test(error = "ts_prox_recheck: unterminated `##regex##`")]
+    fn err_unterminated_regex() {
+        // An opening `##` with no closing `##` raises rather than being read as a
+        // literal `##` — so `alpha ## beta` is an error, not a mis-parsed phrase.
+        Spi::run("SELECT ts_prox_recheck(to_tsvector('simple','alpha beta'), 'alpha ## beta')").unwrap();
     }
 
     // --- config-aware surface (3-arg overloads + @~@ proxquery operator) ----
@@ -2052,6 +2074,15 @@ mod tests {
         assert!(!m("rapport 😀 final", "prox_icu_no_emoji", "😀"));
         // with the emoji dropped (no position consumed), the flanking words are adjacent.
         assert!(m("rapport 😀 final", "prox_icu_no_emoji", "rapport <-> final"));
+        // Keycap emoji (`#️⃣`, `*️⃣`) reach is_emoji via the VS16 (U+FE0F) branch, not the
+        // Emoji_Presentation branch the emoji above hit — and their base is an ASCII char
+        // (`#`/`*`) that is otherwise always special/dropped, so it survives into a lexeme
+        // only here. Queried as a `'…'` literal (bare `#`/`*` are DSL operators). Dropped
+        // under prox_icu_no_emoji like any emoji.
+        assert!(m("a #️⃣ b", "prox_icu", "'#️⃣'"));
+        assert!(!m("a #️⃣ b", "prox_icu_no_emoji", "'#️⃣'"));
+        assert!(m("a *️⃣ b", "prox_icu", "'*️⃣'"));
+        assert!(!m("a *️⃣ b", "prox_icu_no_emoji", "'*️⃣'"));
     }
 
     #[pg_test]
