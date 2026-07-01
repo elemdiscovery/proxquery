@@ -45,6 +45,10 @@ permissions:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
+  # build-push-action (v6+) otherwise uploads a `.dockerbuild` build record as a
+  # workflow artifact per invocation; the publish job's download-artifact would
+  # sweep those into the Release. We don't need the records, so don't upload them.
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
 
 jobs:
   build:
@@ -212,6 +216,9 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
+          # Only the tarball artifacts (named proxquery-…) — never any stray
+          # workflow artifact, so the Release can't be polluted.
+          pattern: 'proxquery-*'
           merge-multiple: true
 
       - name: Attach to the GitHub Release
