@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "proxquery"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "caseless",
  "icu_segmenter",
