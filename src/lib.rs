@@ -1365,6 +1365,51 @@ mod tests {
         Spi::run("SELECT ts_prox_recheck(to_tsvector('simple','alpha beta'), 'alpha ## beta')").unwrap();
     }
 
+    // --- resource caps (MAX_DEPTH / MAX_PHRASE_EXPANSION boundaries) --------
+    // The over-cap shapes are corpus cases (capn*/capx*); the exact at-the-limit
+    // boundaries live here because the pure port's plpgsql parser burns real stack
+    // per nesting level and can't be asked to hold the extension's cap exactly.
+
+    #[pg_test]
+    fn depth_cap_at_limit_parses() {
+        // Exactly 1024 levels of each depth-spending shape still parse and evaluate:
+        // nested groups, a `!` chain (even count → positive), and a within chain
+        // (which deepens the tree with no lexical nesting).
+        let doc = "to_tsvector('simple','a')";
+        let parens = format!("{}a{}", "(".repeat(1024), ")".repeat(1024));
+        assert!(b(&format!("SELECT ts_prox_recheck({doc}, '{parens}')")));
+        let bangs = format!("{}a", "!".repeat(1024));
+        assert!(b(&format!("SELECT ts_prox_recheck({doc}, '{bangs}')")));
+        let chain = format!("a{}", " <~1> a".repeat(1024));
+        assert!(b(&format!("SELECT ts_prox_recheck({doc}, '{chain}')")));
+    }
+
+    #[pg_test(error = "ts_prox_recheck: query too deeply nested (max 1024 combined levels of `(`/`!` and chained proximity operators)")]
+    fn err_depth_cap_shared_budget() {
+        // Parens and chained proximity ops draw on ONE budget: 1000 nested groups
+        // around a 25-op within chain is 1025 combined levels — one over.
+        let q = format!("{}a{}{}", "(".repeat(1000), " <~1> a".repeat(25), ")".repeat(1000));
+        Spi::run(&format!("SELECT ts_prox_recheck(to_tsvector('simple','a'), '{q}')")).unwrap();
+    }
+
+    #[pg_test]
+    fn phrase_expansion_below_cap() {
+        // 9 chained `<->` over two-way ORs → 1024 alternatives of 10 atoms (10240
+        // atoms), under the cap; the all-`a` alternative matches a run of ten a's.
+        let q = format!("{}(a|b)", "(a|b) <-> ".repeat(9));
+        assert!(b(&format!(
+            "SELECT ts_prox_recheck(to_tsvector('simple', repeat('a ', 10)), '{q}')"
+        )));
+    }
+
+    #[pg_test(error = "ts_prox_recheck: phrase expansion too large (22528 atoms > max 16384): `<->`/`<N>` distribute an OR operand into every combination; use `<~N>`/`<-N>` for large OR groups, or split the query")]
+    fn err_phrase_expansion_cap() {
+        // One more op doubles the alternatives again: 2048 combos × 11 atoms would
+        // materialize 22528 atoms — refused BEFORE allocation, alternatives multiply.
+        let q = format!("{}(a|b)", "(a|b) <-> ".repeat(10));
+        Spi::run(&format!("SELECT ts_prox_recheck(to_tsvector('simple','a'), '{q}')")).unwrap();
+    }
+
     // --- config-aware surface (3-arg overloads + @~@ proxquery operator) ----
 
     #[pg_test]

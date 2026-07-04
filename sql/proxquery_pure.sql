@@ -511,9 +511,24 @@ DECLARE
     l jsonb;
     r jsonb;
     combos jsonb := '[]'::jsonb;
+    l_atoms bigint;
+    r_atoms bigint;
+    expanded bigint;
 BEGIN
     IF lefts IS NULL OR rights IS NULL THEN
         RAISE EXCEPTION '%', err;
+    END IF;
+    -- Size the cross product BEFORE materializing it (mirrors the Rust
+    -- MAX_PHRASE_EXPANSION = 16384): alternatives multiply along a `<->` chain,
+    -- and each combo carries one left run's atoms plus one right run's atoms.
+    SELECT coalesce(sum(jsonb_array_length(e -> 'atoms')), 0) INTO l_atoms
+    FROM jsonb_array_elements(lefts) e;
+    SELECT coalesce(sum(jsonb_array_length(e -> 'atoms')), 0) INTO r_atoms
+    FROM jsonb_array_elements(rights) e;
+    expanded := jsonb_array_length(lefts)::bigint * r_atoms
+              + jsonb_array_length(rights)::bigint * l_atoms;
+    IF expanded > 16384 THEN
+        RAISE EXCEPTION 'phrase expansion too large (% atoms > max 16384): `<->`/`<N>` distribute an OR operand into every combination; use `<~N>`/`<-N>` for large OR groups, or split the query', expanded;
     END IF;
     FOR l IN SELECT * FROM jsonb_array_elements(lefts) LOOP
         FOR r IN SELECT * FROM jsonb_array_elements(rights) LOOP
@@ -559,7 +574,22 @@ BEGIN
 END
 $fn$;
 
-CREATE OR REPLACE FUNCTION _prox_p_atom(toks jsonb, pos int) RETURNS jsonb
+-- The parser functions thread a `depth` counter: `(` and `!` (and, in _prox_p_prox,
+-- each tree-deepening proximity op) spend one level, capped at 1024 — mirroring the
+-- Rust `MAX_DEPTH` so both implementations reject the same queries. (Near the cap this
+-- port's plpgsql recursion raises Postgres's own stack-depth error before the check
+-- can — also a clean error, so over-cap inputs still agree across implementations.)
+CREATE OR REPLACE FUNCTION _prox_p_depth_check(depth int) RETURNS void
+    LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
+$fn$
+BEGIN
+    IF depth > 1024 THEN  -- keep in lockstep with the Rust MAX_DEPTH
+        RAISE EXCEPTION 'query too deeply nested (max 1024 combined levels of `(`/`!` and chained proximity operators)';
+    END IF;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION _prox_p_atom(toks jsonb, pos int, depth int) RETURNS jsonb
     LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
 $fn$
 DECLARE
@@ -571,7 +601,8 @@ BEGIN
     IF tk IS NULL THEN RAISE EXCEPTION 'unexpected end of query'; END IF;
     k := tk ->> 'k';
     IF k = 'lparen' THEN
-        r := _prox_p_or(toks, pos + 1);
+        PERFORM _prox_p_depth_check(depth + 1);
+        r := _prox_p_or(toks, pos + 1, depth + 1);
         p2 := (r ->> 'pos')::int;
         IF (toks -> p2) ->> 'k' IS DISTINCT FROM 'rparen' THEN
             RAISE EXCEPTION 'expected `)`';
@@ -585,22 +616,23 @@ BEGIN
 END
 $fn$;
 
-CREATE OR REPLACE FUNCTION _prox_p_unary(toks jsonb, pos int) RETURNS jsonb
+CREATE OR REPLACE FUNCTION _prox_p_unary(toks jsonb, pos int, depth int) RETURNS jsonb
     LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
 $fn$
 DECLARE
     r jsonb;
 BEGIN
     IF (toks -> pos) ->> 'k' = 'not' THEN
-        r := _prox_p_unary(toks, pos + 1);
+        PERFORM _prox_p_depth_check(depth + 1);
+        r := _prox_p_unary(toks, pos + 1, depth + 1);
         RETURN jsonb_build_object('node', jsonb_build_object('t', 'not', 'x', r -> 'node'),
                                   'pos', (r ->> 'pos')::int);
     END IF;
-    RETURN _prox_p_atom(toks, pos);
+    RETURN _prox_p_atom(toks, pos, depth);
 END
 $fn$;
 
-CREATE OR REPLACE FUNCTION _prox_p_prox(toks jsonb, pos int) RETURNS jsonb
+CREATE OR REPLACE FUNCTION _prox_p_prox(toks jsonb, pos int, depth int) RETURNS jsonb
     LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
 $fn$
 DECLARE
@@ -610,8 +642,9 @@ DECLARE
     op jsonb;
     k text;
     p int := pos;
+    chain int := 0;  -- within/pre/not-within left-nest the tree one level per op
 BEGIN
-    r := _prox_p_unary(toks, p);
+    r := _prox_p_unary(toks, p, depth);
     first := r -> 'node';
     p := (r ->> 'pos')::int;
     LOOP
@@ -628,8 +661,12 @@ BEGIN
         ELSE
             EXIT;
         END IF;
+        IF k <> 'op_phrase' THEN
+            chain := chain + 1;
+            PERFORM _prox_p_depth_check(depth + chain);
+        END IF;
         p := p + 1;
-        r := _prox_p_unary(toks, p);
+        r := _prox_p_unary(toks, p, depth + chain);
         op := op || jsonb_build_object('rhs', r -> 'node');
         p := (r ->> 'pos')::int;
         ops := ops || jsonb_build_array(op);
@@ -638,7 +675,7 @@ BEGIN
 END
 $fn$;
 
-CREATE OR REPLACE FUNCTION _prox_p_and(toks jsonb, pos int) RETURNS jsonb
+CREATE OR REPLACE FUNCTION _prox_p_and(toks jsonb, pos int, depth int) RETURNS jsonb
     LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
 $fn$
 DECLARE
@@ -646,12 +683,12 @@ DECLARE
     branches jsonb;
     p int := pos;
 BEGIN
-    r := _prox_p_prox(toks, p);
+    r := _prox_p_prox(toks, p, depth);
     branches := jsonb_build_array(r -> 'node');
     p := (r ->> 'pos')::int;
     WHILE (toks -> p) ->> 'k' = 'and' LOOP
         p := p + 1;
-        r := _prox_p_prox(toks, p);
+        r := _prox_p_prox(toks, p, depth);
         branches := branches || jsonb_build_array(r -> 'node');
         p := (r ->> 'pos')::int;
     END LOOP;
@@ -662,7 +699,7 @@ BEGIN
 END
 $fn$;
 
-CREATE OR REPLACE FUNCTION _prox_p_or(toks jsonb, pos int) RETURNS jsonb
+CREATE OR REPLACE FUNCTION _prox_p_or(toks jsonb, pos int, depth int) RETURNS jsonb
     LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS
 $fn$
 DECLARE
@@ -670,12 +707,12 @@ DECLARE
     branches jsonb;
     p int := pos;
 BEGIN
-    r := _prox_p_and(toks, p);
+    r := _prox_p_and(toks, p, depth);
     branches := jsonb_build_array(r -> 'node');
     p := (r ->> 'pos')::int;
     WHILE (toks -> p) ->> 'k' = 'or' LOOP
         p := p + 1;
-        r := _prox_p_and(toks, p);
+        r := _prox_p_and(toks, p, depth);
         branches := branches || jsonb_build_array(r -> 'node');
         p := (r ->> 'pos')::int;
     END LOOP;
@@ -694,7 +731,7 @@ DECLARE
     r jsonb;
 BEGIN
     IF jsonb_array_length(toks) = 0 THEN RAISE EXCEPTION 'empty query'; END IF;
-    r := _prox_p_or(toks, 0);
+    r := _prox_p_or(toks, 0, 0);
     IF (r ->> 'pos')::int <> jsonb_array_length(toks) THEN
         RAISE EXCEPTION 'unexpected token %', (toks -> (r ->> 'pos')::int)::text;
     END IF;

@@ -231,6 +231,18 @@ Distance range: a distance is an integer in `[0, 16384]` — the same range as n
 | `dsat4` | `ts_prox_query('a <99999999> b')`                               | `ERR`               |
 | `dsat5` | `ts_prox_recheck(to_tsvector('simple','a x b'),'a <~16385> b')` | `ERR`               |
 
+Resource caps: a hostile query must raise, not exhaust the backend (unguarded parser/walker recursion in the extension is a stack overflow — a backend crash, not an error). Structural depth — nested `(`/`!` plus chained within/pre/not-within operators, which deepen the tree with no lexical nesting — is capped at 1024 combined levels; a fully parenthesized left-nested chain of k proximity connectors costs ~k+1 levels, so this covers ~1000 chained connectors. Phrase expansion — `<->`/`<N>` distributing an OR operand into every combination (the `pho_*` behavior) — is capped at 16384 materialized atoms per step; alternatives multiply along a chain, so a couple hundred bytes of `(a|b) <-> (c|d) <-> …` would otherwise expand to gigabytes at parse time. The within operators union positions instead of expanding, so a large OR group near something is spelled `<~N>`/`<-N>`. Both implementations declare the same limits, but the exact at-the-limit cases (1024 levels, one-step-under-the-cap expansion) are pinned in the `depth_cap_*` / `phrase_expansion_*` Rust tests, off this spec: the pure port's plpgsql parser burns real C stack per `(`/`!` level and raises Postgres's stack-depth error well before the cap, so extreme depth is extension-only territory — on over-cap inputs both still raise (`capn3`/`capn4`), just not from the same check. Chained proximity ops are parsed iteratively on both ports, so that boundary (`capn5`) is exact parity.
+
+| label | expression | expected |
+| --- | --- | --- |
+| `capn1` | `ts_prox_recheck(to_tsvector('simple','a'), repeat('(', 32) \|\| 'a' \|\| repeat(')', 32))` | `true` |
+| `capn2` | `ts_prox_recheck(to_tsvector('simple','a'), 'a' \|\| repeat(' <~1> a', 32))` | `true` |
+| `capn3` | `ts_prox_query(repeat('(', 1025) \|\| 'a' \|\| repeat(')', 1025))` | `ERR` |
+| `capn4` | `ts_prox_recheck(to_tsvector('simple','a'), repeat('!', 1025) \|\| 'a')` | `ERR` |
+| `capn5` | `ts_prox_query('a' \|\| repeat(' <~1> a', 1025))` | `ERR` |
+| `capx1` | `ts_prox_recheck(to_tsvector('simple', repeat('a ', 12)), repeat('(a\|b) <-> ', 5) \|\| '(a\|b)')` | `true` |
+| `capx2` | `ts_prox_query('(' \|\| repeat('a\|', 99) \|\| 'a) <-> (' \|\| repeat('b\|', 99) \|\| 'b)')` | `ERR` |
+
 single-quoted literal terms (the `''` escape; no operator/glob meaning) matched verbatim against a literal tsvector — shared DSL behavior on both implementations. `'it''s'` resolves to the lexeme it's; an apostrophe-stripped/prefix tsvector misses.
 
 | label   | expression                                                   | expected |
