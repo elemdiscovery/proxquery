@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Run the pure-SQL-vs-extension benchmark and write a timestamped Markdown
 # report (timing + machine/version context) into bench/reports/ (gitignored).
+# Also builds a RUM index alongside GIN and compares them head to head (skipped
+# with a NOTICE if RUM is not installed — see bench/install_rum.sh).
 #
 # Connection uses standard libpq env vars (PGHOST, PGPORT, PGUSER, ...). The
 # script creates and drops a scratch database, so the role needs CREATEDB.
@@ -22,6 +24,7 @@ SMALL_MB="${SMALL_MB:-32}"; NQUERIES="${NQUERIES:-120}"; LB_ITERS="${LB_ITERS:-1
 SEED="${SEED:-0.42}"; QSEED="${QSEED:-0.137}"
 # Supplementary sections (tokenizer overhead, length scaling) keep their own corpora.
 NDOCS="${NDOCS:-20000}"; WLEN="${WLEN:-40}"; ITERS="${ITERS:-1}"; SDOCS="${SDOCS:-2000}"
+RUN_RUM="${RUN_RUM:-1}"   # also build a RUM index and compare it to GIN (skipped if RUM absent)
 MAINT_DB="${MAINT_DB:-postgres}"
 BENCH_DB="${BENCH_DB:-proxquery_bench_$$}"
 OUT_DIR="$ROOT/bench/reports"; mkdir -p "$OUT_DIR"
@@ -44,7 +47,7 @@ start=$(date +%s)
 # small. RUN_LARGE is irrelevant here; we invoke large_bench.sql directly.
 raw="$(psqlq -d "$BENCH_DB" -v seed="$SEED" -v qseed="$QSEED" \
         -v target_mb="$SMALL_MB" -v nqueries="$NQUERIES" -v iters="$LB_ITERS" \
-        -v with_pure=1 -v with_seqscan=1 -f bench/large/large_bench.sql)"
+        -v with_pure=1 -v with_rum="$RUN_RUM" -v with_seqscan=1 -f bench/large/large_bench.sql)"
 # Custom Unicode tokenizer vs stock `simple` on an overlap-heavy corpus — a smoke
 # regression check that superimposition doesn't blow up matching cost.
 raw_tok="$(psqlq -d "$BENCH_DB" -v ndocs="$NDOCS" -v wlen="$WLEN" -v iters="$ITERS" -f bench/tokenizer_vs_simple.sql)"
@@ -95,6 +98,11 @@ vocab_md="$(printf '%s\n' "$raw" | sed -n '/== vocabulary ==/,/([0-9]* row/p' | 
 corpus_block="$(printf '%s\n' "$raw" | sed -n '/== corpus shape ==/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
 plan_op_block="$(printf '%s\n' "$raw" | sed -n '/== plan: @~@ within/,/([0-9]* row/p' | sed '1d' || true)"
 plan_search_block="$(printf '%s\n' "$raw" | sed -n '/== plan: ts_prox_search on a boolean/,/([0-9]* row/p' | sed '1d' || true)"
+# GIN vs RUM index comparison (idxparity_md is non-empty only when the RUM pass ran).
+idxsize_md="$(printf '%s\n' "$raw" | sed -n '/== index size (by am) ==/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
+idxcmp_overall_md="$(printf '%s\n' "$raw" | sed -n '/== index comparison overall/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
+idxcmp_shape_md="$(printf '%s\n' "$raw" | sed -n '/== index comparison by shape/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
+idxparity_md="$(printf '%s\n' "$raw" | sed -n '/== index parity (rum vs gin)/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
 tok_corpus_md="$(printf '%s\n' "$raw_tok" | sed -n '/== corpus shape (lexeme/,/^$/p' | grep '|' | to_md_table || true)"
 tok_results_md="$(printf '%s\n' "$raw_tok" | sed -n '/== tokenizer vs simple/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
 scale_results_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: pure vs extension recheck by text length/,/([0-9]* row/p' | grep '|' | to_md_table || true)"
@@ -153,6 +161,32 @@ scale_growth_md="$(printf '%s\n' "$raw_scale" | sed -n '/== scaling: growth vs s
   echo
   printf '%s\n' "$parity_md"
   echo
+  echo "## GIN vs RUM index comparison"
+  echo
+  echo "Index size + build time per index am (\`size_vs_gin\` = RUM size / GIN size):"
+  echo
+  printf '%s\n' "$idxsize_md"
+  echo
+  if [ -n "$idxparity_md" ]; then
+    echo "\`@~@\` operator latency, GIN vs RUM (\`rum_vs_gin\` < 1 = RUM faster). RUM stores"
+    echo "lexeme positions in-index, so it prunes the native \`phrase\`/\`ordered\` shapes the"
+    echo "simplify path lowers to a real tsquery; on the lossy proximity shapes both AMs select"
+    echo "the same \`a & b\` skeleton candidates, so RUM only costs the extra storage above."
+    echo
+    printf '%s\n' "$idxcmp_overall_md"
+    echo
+    printf '%s\n' "$idxcmp_shape_md"
+    echo
+    echo "Index parity (RUM vs GIN \`@~@\` match counts — \`mismatches\` must be 0; gated, so a"
+    echo "nonzero count fails this job):"
+    echo
+    printf '%s\n' "$idxparity_md"
+    echo
+  else
+    echo "_RUM is not installed on this runner, so only the GIN index sizes are shown above_"
+    echo "_(install it with \`bench/install_rum.sh\` to enable the comparison)._"
+    echo
+  fi
   echo "## Tokenizer vs simple (overlap overhead)"
   echo
   echo "Custom Unicode tokenizer (\`proxquery_to_tsvector\`, which superimposes accent /"

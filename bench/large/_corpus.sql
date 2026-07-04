@@ -1,7 +1,9 @@
--- Shared include: generate the deterministic, topic-segmented corpus and build
--- its GIN index. Included by large_bench.sql and inspect.sql. Requires vocab +
--- topic_lut and the psql vars exported by _vocab.sql (bg_rate, n_topics,
--- seg_buckets). Run from the repo ROOT (the \copy path is repo-relative).
+-- Shared include: generate the deterministic, topic-segmented corpus (the TABLE
+-- only — no index). Callers build their own index, so large_bench.sql can create
+-- and compare each index AM (GIN vs RUM) on identical corpus bytes, and inspect.sql
+-- can pick whatever index it needs. Included by large_bench.sql and inspect.sql.
+-- Requires vocab + topic_lut and the psql vars exported by _vocab.sql (bg_rate,
+-- n_topics, seg_buckets). Run from the repo ROOT (the \copy path is repo-relative).
 --
 -- Each document is a sequence of fixed-length topic SEGMENTS (segment_len tokens).
 -- A segment's topic is a deterministic hash of (doc, segment index), so a run of
@@ -116,15 +118,16 @@ BEGIN
   RAISE NOTICE 'generated % docs in % batches, table=%', ndocs, batches, pg_size_pretty(sz);
 END $gen$;
 
-\echo '== building GIN index =='
-CREATE INDEX corpus_gin ON corpus USING gin(body_tsv);
+-- Column stats only (no index yet) — index-independent, so it need not be redone
+-- per AM when the caller builds GIN/RUM indexes afterwards.
 ANALYZE corpus;
 
 \echo ''
 \echo '== corpus shape =='
+-- Table size only; per-AM index sizes are reported separately by the caller
+-- (large_bench.sql's "index size (by am)" section), since the index no longer
+-- lives here.
 SELECT count(*) AS docs,
        round(avg(length(body_tsv))) AS avg_lexemes,
-       pg_size_pretty(pg_table_size('corpus'))          AS table_size,
-       pg_size_pretty(pg_indexes_size('corpus'))        AS index_size,
-       pg_size_pretty(pg_total_relation_size('corpus')) AS total_size
+       pg_size_pretty(pg_table_size('corpus'))          AS table_size
 FROM corpus;
