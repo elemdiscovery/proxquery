@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [0.5.2](https://github.com/elemdiscovery/proxquery/compare/v0.5.1...v0.5.2) - 2026-07-04
+
+### Fixed
+
+- Cap query nesting depth and phrase expansion to prevent backend crashes ([#37](https://github.com/elemdiscovery/proxquery/pull/37))
+
 ## [0.5.1](https://github.com/elemdiscovery/proxquery/compare/v0.5.0...v0.5.1) - 2026-07-01
 
 ### Fixed
