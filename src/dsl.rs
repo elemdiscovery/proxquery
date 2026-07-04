@@ -99,6 +99,25 @@ pub enum Node {
 /// suit on every proximity operator rather than silently clamping.
 const MAX_DISTANCE: i32 = 16384;
 
+/// Inclusive max structural depth of a query: nested `(`/`!` plus chained
+/// within/pre/not-within operators (which left-nest the tree with no lexical nesting).
+/// Unbounded depth is not an "ugly error" but a crash: parser and tree-walker recursion
+/// is plain Rust, which Postgres's `max_stack_depth` check never sees — overflow hits
+/// the guard page, SIGSEGVs the backend, and takes the whole cluster through crash
+/// recovery. Capping here, in the only place trees are built, bounds every recursive
+/// consumer (normalize, skeleton, lowering, eval, and `Box<Node>` drop glue) at once.
+/// A fully parenthesized left-nested chain of k proximity connectors (`(…(A <~5> B)
+/// <~50> C…)`, the shape a renderer emits) costs ~k+1 levels, so 1024 covers ~1000
+/// chained connectors while staying far under stack-overflow territory.
+const MAX_DEPTH: usize = 1024;
+
+/// Inclusive max atoms materialized when a phrase/distance operator distributes over
+/// OR ([`extend_phrase`]'s cross product). Alternatives MULTIPLY along a `<->` chain —
+/// unchecked, a couple hundred bytes of `(a|b) <-> (c|d) <-> …` expand into gigabytes
+/// at parse time, uncancellably. Past this cap the exact-phrase expansion is hopeless
+/// anyway; the within operators (`<~N>`/`<-N>`) take large OR groups without expanding.
+const MAX_PHRASE_EXPANSION: usize = 16384;
+
 fn parse_distance(digits: &str) -> Result<i32, String> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(format!("expected a distance, got `{digits}`"));
@@ -328,6 +347,7 @@ enum ProxOp {
 struct Parser {
     toks: Vec<Tok>,
     pos: usize,
+    depth: usize,
 }
 
 impl Parser {
@@ -341,6 +361,20 @@ impl Parser {
             self.pos += 1;
         }
         t
+    }
+
+    /// One more level of structural depth (`(`, `!`, or a tree-deepening proximity op).
+    /// The caller decrements on the way back out; on error the whole parse aborts, so
+    /// an early return leaving the counter high is fine.
+    fn descend(&mut self) -> Result<(), String> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(format!(
+                "query too deeply nested (max {MAX_DEPTH} combined levels of \
+                 `(`/`!` and chained proximity operators)"
+            ));
+        }
+        Ok(())
     }
 
     fn parse(&mut self) -> Result<Node, String> {
@@ -375,6 +409,10 @@ impl Parser {
     fn parse_prox(&mut self) -> Result<Node, String> {
         let first = self.parse_unary()?;
         let mut ops = Vec::new();
+        // Within/pre/not-within ops left-nest the tree one level per op with no lexical
+        // nesting, so each one spends depth budget. Phrase ops (`<->`/`<N>`) widen the
+        // running phrase instead of deepening it — their cost is `MAX_PHRASE_EXPANSION`'s.
+        let mut chain = 0;
         loop {
             let op = match self.peek() {
                 Some(&Tok::PhraseOp(n)) => ProxOp::Phrase(n),
@@ -383,16 +421,24 @@ impl Parser {
                 Some(&Tok::NotWithinOp(n, ord)) => ProxOp::NotWithin(n, ord),
                 _ => break,
             };
+            if !matches!(op, ProxOp::Phrase(_)) {
+                self.descend()?;
+                chain += 1;
+            }
             self.bump();
             ops.push((op, self.parse_unary()?));
         }
+        self.depth -= chain;
         build_prox(first, ops)
     }
 
     fn parse_unary(&mut self) -> Result<Node, String> {
         if matches!(self.peek(), Some(Tok::Not)) {
             self.bump();
-            Ok(Node::Not(Box::new(self.parse_unary()?)))
+            self.descend()?;
+            let inner = self.parse_unary()?;
+            self.depth -= 1;
+            Ok(Node::Not(Box::new(inner)))
         } else {
             self.parse_atom()
         }
@@ -401,7 +447,9 @@ impl Parser {
     fn parse_atom(&mut self) -> Result<Node, String> {
         match self.bump() {
             Some(Tok::LParen) => {
+                self.descend()?;
                 let inner = self.parse_or()?;
+                self.depth -= 1;
                 match self.bump() {
                     Some(Tok::RParen) => Ok(inner),
                     _ => Err("expected `)`".into()),
@@ -503,6 +551,20 @@ fn extend_phrase(current: Node, rhs: Node, gap: i32) -> Result<Node, String> {
                        phrases, or an OR of them — not `&`, `!`, a regex, or a nested proximity";
     let left = phrase_alts(&current).ok_or(ERR)?;
     let right = phrase_alts(&rhs).ok_or(ERR)?;
+    // Size the cross product BEFORE materializing it: each left alternative's atoms are
+    // cloned once per right alternative and vice versa, so the total atom count is
+    // exactly |left|·Σ|right atoms| + |right|·Σ|left atoms|. Since every step's output
+    // feeds the next step's `left`, capping here also bounds the whole chain.
+    let l_atoms: usize = left.iter().map(|(a, _)| a.len()).sum();
+    let r_atoms: usize = right.iter().map(|(a, _)| a.len()).sum();
+    let expanded = left.len() * r_atoms + right.len() * l_atoms;
+    if expanded > MAX_PHRASE_EXPANSION {
+        return Err(format!(
+            "phrase expansion too large ({expanded} atoms > max {MAX_PHRASE_EXPANSION}): \
+             `<->`/`<N>` distribute an OR operand into every combination; use `<~N>`/`<-N>` \
+             for large OR groups, or split the query"
+        ));
+    }
     let mut combos: Vec<Node> = Vec::with_capacity(left.len() * right.len());
     for (la, lg) in &left {
         for (ra, rg) in &right {
@@ -519,7 +581,7 @@ fn extend_phrase(current: Node, rhs: Node, gap: i32) -> Result<Node, String> {
 
 pub fn parse(input: &str) -> Result<Node, String> {
     let toks = lex(input)?;
-    Parser { toks, pos: 0 }.parse()
+    Parser { toks, pos: 0, depth: 0 }.parse()
 }
 
 // ===========================================================================
@@ -1649,4 +1711,59 @@ fn densify_union(mut intervals: Vec<(i32, i32)>) -> Vec<i32> {
     }
     out.extend(lo..=hi);
     out
+}
+
+#[cfg(test)]
+mod limit_sync_tests {
+    use super::*;
+
+    /// Every integer literal immediately following `marker` (spaces allowed between).
+    fn numbers_after(hay: &str, marker: &str) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut rest = hay;
+        while let Some(at) = rest.find(marker) {
+            rest = &rest[at + marker.len()..];
+            let s = rest.trim_start_matches(' ');
+            let len = s.bytes().take_while(u8::is_ascii_digit).count();
+            if len > 0 {
+                out.push(s[..len].parse().unwrap());
+            }
+        }
+        out
+    }
+
+    #[track_caller]
+    fn assert_sql_literal(sql: &str, marker: &str, expected: u64) {
+        let found = numbers_after(sql, marker);
+        assert!(
+            !found.is_empty(),
+            "marker `{marker}` not found in proxquery_pure.sql — if the pure port's \
+             spelling changed, update this test's marker to keep the limits pinned"
+        );
+        assert!(
+            found.iter().all(|&n| n == expected),
+            "proxquery_pure.sql has `{marker}` followed by {found:?}, but the Rust \
+             constant is {expected}; the pure port must stay in lockstep"
+        );
+    }
+
+    /// The pure-SQL port hard-codes the extension's limits as literals (plpgsql has no
+    /// cross-function constants), and the differential corpus can't pin every boundary
+    /// behaviorally — near the depth cap the port raises Postgres's own stack error
+    /// before its check fires, which the harness can't tell apart from the cap. So this
+    /// meta-test reads the port's source and asserts every limit literal (both the
+    /// comparisons and the numbers quoted in error messages) matches its Rust constant.
+    #[test]
+    fn pure_sql_port_limits_match_rust_constants() {
+        let sql = include_str!("../sql/proxquery_pure.sql");
+        // Comparison literals — the behavior.
+        assert_sql_literal(sql, "IF depth > ", MAX_DEPTH as u64);
+        assert_sql_literal(sql, "IF expanded > ", MAX_PHRASE_EXPANSION as u64);
+        assert_sql_literal(sql, "IF digits::int > ", MAX_DISTANCE as u64);
+        assert_sql_literal(sql, "IF n > ", NATIVE_MAX_DISTANCE as u64);
+        // The numbers quoted in error messages — user-facing copies of the same limits.
+        assert_sql_literal(sql, "deeply nested (max ", MAX_DEPTH as u64);
+        assert_sql_literal(sql, "atoms > max ", MAX_PHRASE_EXPANSION as u64);
+        assert_sql_literal(sql, "distance must be between 0 and ", MAX_DISTANCE as u64);
+    }
 }
