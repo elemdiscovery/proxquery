@@ -1,3 +1,7 @@
+-- Copyright (c) 2026 Elemental Discovery
+-- SPDX-License-Identifier: MIT
+-- Source: https://github.com/elemdiscovery/proxquery (sql/proxquery_pure.sql)
+--
 -- proxquery — pure-SQL implementation
 -- ====================================
 --
