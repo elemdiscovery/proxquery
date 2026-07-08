@@ -55,6 +55,11 @@ SELECT shape, count(*) FROM queries GROUP BY shape ORDER BY count(*) DESC, shape
 \if :inspect_corpus
 \i bench/large/_corpus.sql
 
+-- inspect only needs candidate/match COUNTS (index-independent), so a plain GIN
+-- index is enough here — the GIN-vs-RUM comparison lives in large_bench.sql.
+-- (_corpus.sql no longer builds an index; each caller picks its own.)
+CREATE INDEX corpus_gin ON corpus USING gin(body_tsv);
+
 -- Per-query results: candidate count (the GIN-index skeleton) and match count
 -- (the @~@ operator). This is the benchmark's measurement without the timing.
 DROP TABLE IF EXISTS qresults;
