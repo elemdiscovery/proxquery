@@ -281,6 +281,60 @@ The non-positional-operand rule (`bgErr*`/`notErr*`) fires through the 3-arg con
 | `cfgErrAnd` | `ts_prox_recheck(to_tsvector('english','a b c'),'(a & b) <~5> c','english')` | `ERR` |
 | `cfgErrNot` | `ts_prox_recheck(to_tsvector('english','a b c'),'(!a) <~5> c','english')` | `ERR` |
 
+## Operator precedence
+
+Precedence, loosest to tightest binding: `|` (OR) < `&` (AND) < proximity (`<~N>`, `<-N>`, `<!~N>`, `<N>`, `<->`) < `!` (NOT). Each case is a bare (unparenthesized) query on a doc where the intended grouping and the mis-grouping give opposite answers; run with the match-case recheck harness (`ts_prox_recheck(to_tsvector('simple', doc), query)`), the `precErr*` rows in the recheck expression form.
+
+| label    | doc           | query               | expected |
+| -------- | ------------- | ------------------- | -------- |
+| `prec1`  | `c alone`     | `a & b \| c`        | `true`   |
+| `prec2`  | `c alone`     | `a & (b \| c)`      | `false`  |
+| `prec3`  | `a alone`     | `a \| b & c`        | `true`   |
+| `prec4`  | `a alone`     | `(a \| b) & c`      | `false`  |
+| `prec5`  | `a b c`       | `a & b <~2> c`      | `true`   |
+| `prec6`  | `a b z z c`   | `a & b <~2> c`      | `false`  |
+| `prec7`  | `b c`         | `a & b <~2> c`      | `false`  |
+| `prec8`  | `a z z z z c` | `a \| b <~2> c`     | `true`   |
+| `prec9`  | `a z z z z c` | `(a \| b) <~2> c`   | `false`  |
+| `prec10` | `x b c`       | `a \| b <~2> c`     | `true`   |
+| `prec11` | `a b z z c`   | `a & b <!~2> c`     | `true`   |
+| `prec12` | `a b c`       | `a & b <!~2> c`     | `false`  |
+| `prec13` | `b z z c`     | `a & b <!~2> c`     | `false`  |
+| `prec14` | `a alone`     | `!a & b`            | `false`  |
+| `prec15` | `a alone`     | `!(a & b)`          | `true`   |
+| `prec16` | `b alone`     | `!a & b`            | `true`   |
+| `prec17` | `a alone`     | `a \| b & c <~2> d` | `true`   |
+| `prec18` | `b c d`       | `a \| b & c <~2> d` | `true`   |
+| `prec19` | `b c z z d`   | `a \| b & c <~2> d` | `false`  |
+| `prec20` | `b c`         | `!a & b <~2> c`     | `true`   |
+| `prec21` | `a b c`       | `!a & b <~2> c`     | `false`  |
+| `prec22` | `b z z c`     | `!a & b <~2> c`     | `false`  |
+
+`!` binds tighter than every proximity operator, so a bare negation as a proximity operand raises (this is the same rule as `notErr*`/`phErr_not`, pinned here on the bare, un-parenthesized `!`):
+
+| label      | expression                                                    | expected |
+| ---------- | ------------------------------------------------------------- | -------- |
+| `precErr1` | `ts_prox_recheck(to_tsvector('simple','a b c'),'!a <~2> c')`  | `ERR`    |
+| `precErr2` | `ts_prox_recheck(to_tsvector('simple','a b c'),'!a <!~2> c')` | `ERR`    |
+
+All proximity operators share one precedence level and fold left-associatively, so a bare mixed chain groups left-to-right: `a <~2> b <!~2> c` = `(a <~2> b) <!~2> c` (`precAssoc1`–`precAssoc4`; `precAssoc2` discriminates against the right grouping on `b a x c`). The phrase ops (`<->`, `<N>`) extend a phrase rather than wrap a span, so a phrase is a valid within operand (`precAssoc5`/`precAssoc6`) but a within-span is not a phrase operand — a phrase op after a within op raises (`precErr3`/`precErr4`).
+
+| label | expression | expected |
+| --- | --- | --- |
+| `precAssoc1` | `ts_prox_recheck(to_tsvector('simple','b a x c'),'a <~2> b <!~2> c') = ts_prox_recheck(to_tsvector('simple','b a x c'),'(a <~2> b) <!~2> c')` | `true` |
+| `precAssoc2` | `ts_prox_recheck(to_tsvector('simple','b a x c'),'a <~2> b <!~2> c') <> ts_prox_recheck(to_tsvector('simple','b a x c'),'a <~2> (b <!~2> c)')` | `true` |
+| `precAssoc3` | `ts_prox_recheck(to_tsvector('simple','a b c'),'a <-3> b <~3> c') = ts_prox_recheck(to_tsvector('simple','a b c'),'(a <-3> b) <~3> c')` | `true` |
+| `precAssoc4` | `ts_prox_recheck(to_tsvector('simple','a b c'),'a <~3> b <!-3> c') = ts_prox_recheck(to_tsvector('simple','a b c'),'(a <~3> b) <!-3> c')` | `true` |
+| `precAssoc5` | `ts_prox_recheck(to_tsvector('simple','a b c'),'a <-> b <~2> c') = ts_prox_recheck(to_tsvector('simple','a b c'),'(a <-> b) <~2> c')` | `true` |
+| `precAssoc6` | `ts_prox_recheck(to_tsvector('simple','a x b c'),'a <2> b <~3> c') = ts_prox_recheck(to_tsvector('simple','a x b c'),'(a <2> b) <~3> c')` | `true` |
+
+A phrase op (`<->`, `<N>`) after a within op has no phrase form for the left span, so the bare chain raises (same as the parenthesized `phErr_span`):
+
+| label      | expression                                                        | expected |
+| ---------- | ----------------------------------------------------------------- | -------- |
+| `precErr3` | `ts_prox_recheck(to_tsvector('simple','a b c'),'a <~2> b <-> c')` | `ERR`    |
+| `precErr4` | `ts_prox_recheck(to_tsvector('simple','a b c'),'a <~3> b <2> c')` | `ERR`    |
+
 ## Match cases
 
 Recheck pairs run as `ts_prox_recheck(to_tsvector('simple', doc), query)`.
