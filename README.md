@@ -100,6 +100,7 @@ The DSL is a superset of `tsquery`. Native `tsquery` syntax works unchanged; the
 
 A few comments:
 
+- Operator precedence is `!` > proximity `<...>` > `&` > `|`.
 - Proximity operators are read left to right, so `a <~5> b <~5> c` reads as `(a <~5> b) <~5> c`.
 - Adjacent words have a distance of one, so in `a b c` the `a` and `c` have a distance of two.
 - Proximity operators act on the span of the left side term, meaning for `a b c d e f`, the term `(a <~5> f) <~1> c` is a match--the `c` is in between the left side results.
