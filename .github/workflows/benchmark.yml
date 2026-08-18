@@ -2,9 +2,10 @@ name: large benchmark
 
 # Manually triggered, large, repeatable performance benchmark. Generates a
 # deterministic synthetic corpus (real COCA term distribution + synthetic tail),
-# indexes it with a plain GIN index, and times the native extension against the
-# pure-SQL port. The small tier is parity-gated (the job's real pass/fail); the
-# large tier shows how the extension scales where the pure port is too slow.
+# indexes it (GIN, and optionally RUM for a head-to-head index comparison), and
+# times the native extension against the pure-SQL port. The small tier is
+# parity-gated (the job's real pass/fail); the large tier shows how the extension
+# scales where the pure port is too slow.
 on:
   workflow_dispatch:
     inputs:
@@ -24,6 +25,14 @@ on:
         description: "Run the large extension-only tier"
         type: boolean
         default: true
+      run_rum:
+        description: "Compare a RUM index vs GIN on the small tier"
+        type: boolean
+        default: true
+      run_rum_large:
+        description: "Also compare RUM vs GIN on the large tier (SLOW build + RUM segfaults on short prefix queries at ~1GiB — see run.sh)"
+        type: boolean
+        default: false
       seed:
         description: "Corpus RNG seed (changes the corpus; keep fixed to compare runs)"
         default: "0.42"
@@ -81,6 +90,11 @@ jobs:
           cargo pgrx install --no-default-features --features pg17 \
             --pg-config "$(sed -n 's/^pg17 = "\(.*\)"/\1/p' ~/.pgrx/config.toml)"
 
+      # RUM (not in core PG) enables the GIN-vs-RUM index comparison. Built against
+      # the pgrx-managed pg17; if it fails the bench simply skips the RUM pass.
+      - name: Install RUM index extension (GIN-vs-RUM comparison)
+        run: bash bench/install_rum.sh "$(sed -n 's/^pg17 = "\(.*\)"/\1/p' ~/.pgrx/config.toml)"
+
       - name: Start the managed instance
         run: cargo pgrx start pg17
 
@@ -92,6 +106,8 @@ jobs:
           SMALL_QUERIES: ${{ inputs.small_queries }}
           LARGE_QUERIES: ${{ inputs.large_queries }}
           RUN_LARGE: ${{ inputs.run_large && '1' || '0' }}
+          RUN_RUM: ${{ inputs.run_rum && '1' || '0' }}
+          RUN_RUM_LARGE: ${{ inputs.run_rum_large && '1' || '0' }}
           SEED: ${{ inputs.seed }}
         run: |
           PGCONFIG="$(sed -n 's/^pg17 = "\(.*\)"/\1/p' ~/.pgrx/config.toml)"

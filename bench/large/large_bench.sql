@@ -2,9 +2,16 @@
 --
 -- Builds a deterministic synthetic corpus whose term distribution mirrors real
 -- English text (COCA top-5000 lemmas, weighted by their real frequency) plus a
--- synthetic long tail, indexes it with a plain GIN index, generates a realistic
--- e-discovery-style query list, and times the native extension against the
--- pure-SQL port.
+-- synthetic long tail, indexes it (a plain GIN index, and optionally a RUM index
+-- for a head-to-head index comparison), generates a realistic e-discovery-style
+-- query list, and times the native extension against the pure-SQL port.
+--
+-- The GIN-vs-RUM comparison builds each index AM in turn on the SAME corpus bytes
+-- and times the `@~@` operator per query shape, so the report shows where RUM's
+-- in-index positions pay off (native phrase / exact-`<N>`, which RUM prunes in the
+-- index) versus where it just matches GIN's candidates at larger size (the lossy
+-- proximity recheck). RUM (postgrespro/rum) is not in core PostgreSQL, so the RUM
+-- pass is skipped with a NOTICE when the extension is unavailable.
 --
 -- The vocabulary, query list, and corpus generation live in shared includes
 -- (_vocab.sql, _queries.sql, _corpus.sql) so this benchmark and the inspect
@@ -14,7 +21,7 @@
 -- query list is independent of corpus size, so it runs against every tier.
 --
 -- Run from the repo ROOT (the \copy and \i paths are repo-relative):
---   psql -d DB -v target_mb=1024 -v with_pure=0 -f bench/large/large_bench.sql
+--   psql -d DB -v target_mb=1024 -v with_pure=0 -v with_rum=1 -f bench/large/large_bench.sql
 -- Parameters (all overridable with -v); generation params are documented in the
 -- includes (_vocab.sql / _queries.sql / _corpus.sql):
 --   seed/qseed, target_mb, tail_words, zipf_s, batch_docs, max_doc_len,
@@ -22,6 +29,7 @@
 --   nqueries, termlo, termhi, dist_min, dist_max, query_topn  (query mix)
 --   iters        timed iterations per query (after a warmup)             (3)
 --   with_pure    1 = also time the pure-SQL port + parity gate           (1)
+--   with_rum     1 = also build a RUM index and compare it to GIN        (0)
 --   with_seqscan 1 = also time the index-disabled (seq scan) baseline    (0)
 --   pure         path to the pure-SQL port                  (sql/proxquery_pure.sql)
 
@@ -40,6 +48,10 @@ SET maintenance_work_mem = '512MB';
 \if :{?with_pure}
 \else
   \set with_pure 1
+\endif
+\if :{?with_rum}
+\else
+  \set with_rum 0
 \endif
 \if :{?with_seqscan}
 \else
@@ -62,12 +74,36 @@ CREATE EXTENSION proxquery;
 \i :pure
 SET search_path = public, proxquery, pg_catalog;
 
--- Vocabulary, query list, corpus (shared with inspect.sql).
+-- Vocabulary, query list, corpus (shared with inspect.sql). _corpus.sql builds
+-- the TABLE only; the indexes are built per-AM in the benchmark loop below.
 \i bench/large/_vocab.sql
 \i bench/large/_queries.sql
 INSERT INTO phase_t VALUES ('setup (extension + vocab + queries)', clock_timestamp());
 \i bench/large/_corpus.sql
-INSERT INTO phase_t VALUES ('corpus (generate + GIN)', clock_timestamp());
+INSERT INTO phase_t VALUES ('corpus (generate)', clock_timestamp());
+
+-- Which index AMs to benchmark: GIN always; RUM only when requested AND the
+-- extension is actually installed on this server (RUM is not in core PostgreSQL).
+-- do_rum is 't'/'f' so it drives psql's \if directly.
+SELECT (:with_rum = 1
+        AND EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'rum')) AS do_rum \gset
+\if :with_rum
+  \if :do_rum
+    CREATE EXTENSION IF NOT EXISTS rum;
+  \else
+    \echo 'NOTE: with_rum=1 but the rum extension is not available here — skipping the RUM comparison'
+  \endif
+\endif
+
+-- The AMs to iterate, and how to build each one's index on body_tsv. GIN is the
+-- reference AM: it carries the pure-port / seq-scan comparison and is the index
+-- left in place for the plan-shape guards at the end.
+DROP TABLE IF EXISTS bench_ams;
+CREATE TEMP TABLE bench_ams(ord int, am text, idxdef text);
+INSERT INTO bench_ams VALUES (1, 'gin', 'USING gin(body_tsv)');
+\if :do_rum
+INSERT INTO bench_ams VALUES (2, 'rum', 'USING rum(body_tsv rum_tsvector_ops)');
+\endif
 
 -- ================================================================= benchmark
 -- avg server-side ms over `iters` runs. NO warmup: the corpus is already cache-warm from the
@@ -90,9 +126,13 @@ BEGIN
 END $$;
 
 DROP TABLE IF EXISTS results;
-CREATE TABLE results(id int, shape text, q text, candidates bigint, matches bigint,
+CREATE TABLE results(am text, id int, shape text, q text, candidates bigint, matches bigint,
                      ext_op_ms numeric, ext_search_ms numeric, pure_search_ms numeric, disagree bigint,
                      ext_seq_ms numeric);
+
+-- Per-AM index build time + on-disk size (the storage half of the GIN-vs-RUM tradeoff).
+DROP TABLE IF EXISTS index_stats;
+CREATE TABLE index_stats(am text, build_ms numeric, size_bytes bigint, size_pretty text);
 
 SET lb.iters       = :iters;
 SET lb.with_pure   = :with_pure;
@@ -105,48 +145,101 @@ DECLARE
   it       int  := current_setting('lb.iters')::int;
   do_pure  bool := current_setting('lb.with_pure')::int = 1;
   do_seq   bool := current_setting('lb.with_seqscan')::int = 1;
+  am_rec   record;
+  is_gin   bool;
   r        record;
-  cand     bigint; matc bigint; pmatc bigint;
-  exop     numeric; exs numeric; pus numeric; dis bigint; seqms numeric;
+  line     text;
+  guard_q  text;
+  served   bool;
+  t0 timestamptz; t1 timestamptz;
+  cand bigint; matc bigint; pmatc bigint;
+  exop numeric; exs numeric; pus numeric; dis bigint; seqms numeric;
 BEGIN
-  FOR r IN SELECT id, shape, q FROM queries ORDER BY id LOOP
-    EXECUTE format('SELECT count(*) FROM corpus WHERE body_tsv @@ public.ts_prox_query(%L)', r.q) INTO cand;
-    EXECUTE format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q) INTO matc;
-    exop := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q), it);
-    seqms := NULL;
-    IF do_seq THEN
-      -- Same `@~@` query with the index DISABLED: the positional recheck runs over EVERY row
-      -- (a full seq scan) — the brute-force baseline the GIN index accelerates, and the timing
-      -- counterpart of the index-vs-seq-scan correctness test. Always ONE run (this column is
-      -- qualitative — an order-of-magnitude index speedup, not a precise per-query metric), and
-      -- not multiplied by `iters`. Off by default (and on the large tier), where a whole-corpus
-      -- recheck per query would dominate.
-      SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off;
-      seqms := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q), 1);
-      SET LOCAL enable_indexscan = on;  SET LOCAL enable_bitmapscan = on;
+  -- Non-GIN AMs first (each built, timed, then dropped so the next AM is measured
+  -- in isolation); GIN last and LEFT in place for the plan-shape guards below.
+  FOR am_rec IN SELECT ord, am, idxdef FROM bench_ams ORDER BY (am = 'gin'), ord LOOP
+    is_gin := (am_rec.am = 'gin');
+
+    -- Build this AM's index, timed. RUM builds are slower and larger than GIN;
+    -- both numbers land in the "index size (by am)" report section.
+    t0 := clock_timestamp();
+    EXECUTE format('CREATE INDEX corpus_idx ON corpus %s', am_rec.idxdef);
+    t1 := clock_timestamp();
+    INSERT INTO index_stats
+      SELECT am_rec.am,
+             round(extract(epoch FROM (t1 - t0)) * 1000.0, 1),
+             pg_relation_size('corpus_idx'),
+             pg_size_pretty(pg_relation_size('corpus_idx'));
+
+    -- Guard: this AM must actually SERVE `@~@` through the `@@` pushdown (the
+    -- support function targets any tsvector opfamily exposing `@@` at strategy 1 —
+    -- GIN tsvector_ops and RUM rum_tsvector_ops both do). Force the planner to
+    -- prefer an index scan on a selective boolean query and assert corpus_idx is
+    -- used, so a broken pushdown fails the run instead of silently seq-scanning
+    -- (which would make the AM's timings meaningless).
+    SELECT q INTO guard_q FROM queries WHERE shape IN ('and2','and3','or2','single') ORDER BY id LIMIT 1;
+    IF guard_q IS NOT NULL THEN
+      served := false;
+      SET LOCAL enable_seqscan = off;
+      FOR line IN EXECUTE format('EXPLAIN SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', guard_q) LOOP
+        IF line LIKE '%corpus_idx%' THEN served := true; END IF;
+      END LOOP;
+      SET LOCAL enable_seqscan = on;
+      IF NOT served THEN
+        RAISE EXCEPTION 'index guard: the % index did not serve `@~@` [%] — the @@ pushdown is broken for this AM', am_rec.am, guard_q;
+      END IF;
     END IF;
-    IF do_pure THEN
-      -- The consolidated `ts_prox_search` is the recommended portable form (it inlines to
-      -- the index-selection clause plus a recheck that folds away when the query's skeleton
-      -- is exact). ext_search is the apples-to-apples denominator for the pure slowdown
-      -- ratio — same form, different engine — so it is only timed alongside the pure port.
-      exs  := bench_ms(format('SELECT count(*) FROM corpus WHERE public.ts_prox_search(body_tsv, %L)', r.q), it);
-      -- Parity here is a per-query match-COUNT check (cheap): a differing count
-      -- proves a differing row set. The exhaustive row-set identity guarantee is
-      -- the matrix job's dedicated pure_sql_port_matches_extension test; this is
-      -- a perf + smoke run, so we keep the parity probe to one extra pure count.
-      EXECUTE format('SELECT count(*) FROM corpus WHERE proxquery.ts_prox_search(body_tsv, %L)', r.q) INTO pmatc;
-      pus := bench_ms(format('SELECT count(*) FROM corpus WHERE proxquery.ts_prox_search(body_tsv, %L)', r.q), it);
-      dis := abs(matc - pmatc);
-    ELSE
-      exs := NULL; pus := NULL; dis := NULL;
+
+    FOR r IN SELECT id, shape, q FROM queries ORDER BY id LOOP
+      EXECUTE format('SELECT count(*) FROM corpus WHERE body_tsv @@ public.ts_prox_query(%L)', r.q) INTO cand;
+      EXECUTE format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q) INTO matc;
+      exop := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q), it);
+      seqms := NULL; exs := NULL; pus := NULL; dis := NULL;
+      -- The pure-port / seq-scan comparison is index-AM-independent (the pure
+      -- port is pure SQL; the seq scan disables the index), so measure it ONCE,
+      -- under the GIN reference AM — not per AM.
+      IF is_gin THEN
+        IF do_seq THEN
+          -- Same `@~@` query with the index DISABLED: the positional recheck runs over EVERY row
+          -- (a full seq scan) — the brute-force baseline the index accelerates, and the timing
+          -- counterpart of the index-vs-seq-scan correctness test. Always ONE run (this column is
+          -- qualitative — an order-of-magnitude index speedup, not a precise per-query metric), and
+          -- not multiplied by `iters`. Off by default (and on the large tier), where a whole-corpus
+          -- recheck per query would dominate.
+          SET LOCAL enable_indexscan = off; SET LOCAL enable_bitmapscan = off;
+          seqms := bench_ms(format('SELECT count(*) FROM corpus WHERE body_tsv @~@ %L', r.q), 1);
+          SET LOCAL enable_indexscan = on;  SET LOCAL enable_bitmapscan = on;
+        END IF;
+        IF do_pure THEN
+          -- The consolidated `ts_prox_search` is the recommended portable form (it inlines to
+          -- the index-selection clause plus a recheck that folds away when the query's skeleton
+          -- is exact). ext_search is the apples-to-apples denominator for the pure slowdown
+          -- ratio — same form, different engine — so it is only timed alongside the pure port.
+          exs  := bench_ms(format('SELECT count(*) FROM corpus WHERE public.ts_prox_search(body_tsv, %L)', r.q), it);
+          -- Parity here is a per-query match-COUNT check (cheap): a differing count
+          -- proves a differing row set. The exhaustive row-set identity guarantee is
+          -- the matrix job's dedicated pure_sql_port_matches_extension test; this is
+          -- a perf + smoke run, so we keep the parity probe to one extra pure count.
+          EXECUTE format('SELECT count(*) FROM corpus WHERE proxquery.ts_prox_search(body_tsv, %L)', r.q) INTO pmatc;
+          pus := bench_ms(format('SELECT count(*) FROM corpus WHERE proxquery.ts_prox_search(body_tsv, %L)', r.q), it);
+          dis := abs(matc - pmatc);
+        END IF;
+      END IF;
+      INSERT INTO results VALUES (am_rec.am, r.id, r.shape, r.q, cand, matc, exop, exs, pus, dis, seqms);
+    END LOOP;
+
+    -- Drop every AM's index except GIN's, which the plan guards below reuse.
+    IF NOT is_gin THEN
+      EXECUTE 'DROP INDEX corpus_idx';
     END IF;
-    INSERT INTO results VALUES (r.id, r.shape, r.q, cand, matc, exop, exs, pus, dis, seqms);
   END LOOP;
 END $run$;
-INSERT INTO phase_t VALUES ('searches', clock_timestamp());
+INSERT INTO phase_t VALUES ('index builds + searches', clock_timestamp());
 
 -- ------------------------------------------------------------------- reports
+-- The overall / by-shape / per-query / parity sections below report the GIN
+-- reference AM (WHERE am='gin'), so they read exactly as they did before RUM was
+-- added; the GIN-vs-RUM comparison gets its own dedicated sections further down.
 \echo ''
 \echo '== phase timing (wall seconds) =='
 SELECT name AS phase,
@@ -166,7 +259,7 @@ SELECT count(*)                          AS queries,
        round(max(ext_op_ms), 2)          AS ext_op_max,
        round(avg(pure_search_ms), 2)     AS pure_avg,
        round(avg(pure_search_ms) / nullif(avg(ext_search_ms), 0), 1) AS slowdown
-FROM results;
+FROM results WHERE am = 'gin';
 
 \echo ''
 \echo '== results: by query shape =='
@@ -181,7 +274,7 @@ SELECT shape,
        round(avg(ext_search_ms), 2)  AS ext_search_ms,
        round(avg(pure_search_ms), 2) AS pure_search_ms,
        round(avg(pure_search_ms) / nullif(avg(ext_search_ms), 0), 1) AS slowdown
-FROM results
+FROM results WHERE am = 'gin'
 GROUP BY shape
 ORDER BY ext_op_ms DESC;
 \else
@@ -193,7 +286,7 @@ SELECT shape,
        round(avg(ext_search_ms), 2)  AS ext_search_ms,
        round(avg(pure_search_ms), 2) AS pure_search_ms,
        round(avg(pure_search_ms) / nullif(avg(ext_search_ms), 0), 1) AS slowdown
-FROM results
+FROM results WHERE am = 'gin'
 GROUP BY shape
 ORDER BY ext_op_ms DESC;
 \endif
@@ -209,22 +302,64 @@ SELECT id, shape,
        replace(replace(replace(replace(replace(q,'&','&amp;'),'<','&lt;'),'>','&gt;'),'|','&#124;'),'*','&#42;') AS query,
        candidates, matches, ext_op_ms, ext_search_ms, pure_search_ms,
        round(pure_search_ms / nullif(ext_search_ms, 0), 1) AS slowdown
-FROM results ORDER BY id;
+FROM results WHERE am = 'gin' ORDER BY id;
 \else
 SELECT id, shape,
        replace(replace(replace(replace(replace(q,'&','&amp;'),'<','&lt;'),'>','&gt;'),'|','&#124;'),'*','&#42;') AS query,
        candidates, matches, ext_op_ms
-FROM results ORDER BY id;
+FROM results WHERE am = 'gin' ORDER BY id;
 \endif
 \echo ''
 
+-- --------------------------------------------------------- GIN vs RUM comparison
+-- The index tradeoff: RUM stores lexeme positions in the index, so it prunes the
+-- native phrase / exact-`<N>` shapes (which the simplify path lowers to a real
+-- phrase tsquery) INSIDE the index scan, where GIN returns every doc containing
+-- the terms and rechecks positions in the heap. On the lossy proximity shapes
+-- (within/chain/…) both AMs select the same `a & b` skeleton candidates, so RUM
+-- only costs more storage. The size column is the other half of that tradeoff.
+\echo ''
+\echo '== index size (by am) =='
+SELECT s.am,
+       s.size_pretty                                       AS index_size,
+       s.build_ms                                          AS build_ms,
+       round(s.size_bytes::numeric
+             / nullif((SELECT size_bytes FROM index_stats WHERE am = 'gin'), 0), 2) AS size_vs_gin
+FROM index_stats s
+ORDER BY (s.am = 'gin') DESC, s.am;
+
+\echo ''
+\echo '== index comparison overall (avg @~@ ms/query by am) =='
+SELECT am,
+       count(*)                                                                    AS queries,
+       round(avg(ext_op_ms), 2)                                                    AS ext_op_avg,
+       round(percentile_cont(0.5)  WITHIN GROUP (ORDER BY ext_op_ms)::numeric, 2)  AS ext_op_p50,
+       round(percentile_cont(0.95) WITHIN GROUP (ORDER BY ext_op_ms)::numeric, 2)  AS ext_op_p95
+FROM results
+GROUP BY am
+ORDER BY (am = 'gin') DESC, am;
+
+\echo ''
+\echo '== index comparison by shape (gin vs rum @~@ ms; rum_vs_gin < 1 = rum faster) =='
+SELECT shape,
+       round(avg(candidates))                                    AS avg_cand,
+       round(avg(matches))                                       AS avg_match,
+       round(avg(ext_op_ms) FILTER (WHERE am = 'gin'), 2)        AS gin_op_ms,
+       round(avg(ext_op_ms) FILTER (WHERE am = 'rum'), 2)        AS rum_op_ms,
+       round(avg(ext_op_ms) FILTER (WHERE am = 'rum')
+             / nullif(avg(ext_op_ms) FILTER (WHERE am = 'gin'), 0), 2) AS rum_vs_gin
+FROM results
+GROUP BY shape
+ORDER BY shape;
+
 -- ------------------------------------------------------------- pushdown plans
 -- Plan-shape guards, surfaced in the PR comment, using real queries from the generated
--- mix. (1) A within/pre query via the `@~@` operator must stay GIN-index-served via the
+-- mix. (1) A within/pre query via the `@~@` operator must stay index-served via the
 -- selective `a & b` skeleton + a positional recheck — NOT rewritten to the native `<~>`
 -- OR-expansion, which is non-selective and the planner mis-estimates into a seq scan.
 -- (2) The recommended `ts_prox_search` must inline + use the index, and on a boolean query
 -- fold the recheck away entirely (Bitmap Index Scan, no Filter — no per-row re-detoast).
+-- These run under the GIN index left in place by the benchmark loop.
 SELECT coalesce((SELECT q FROM queries WHERE shape = 'within' ORDER BY id LIMIT 1),
                 'a <~5> b') AS within_q \gset
 SELECT coalesce((SELECT q FROM queries WHERE shape IN ('and2','or2','single') ORDER BY id LIMIT 1),
@@ -281,14 +416,37 @@ END $plan$;
 \echo '== parity (pure port vs extension; mismatches must be 0) =='
 SELECT count(*) AS queries_checked,
        count(*) FILTER (WHERE disagree <> 0) AS mismatches
-FROM results;
+FROM results WHERE am = 'gin';
 
 DO $$
 DECLARE n int;
 BEGIN
-  SELECT count(*) INTO n FROM results WHERE disagree IS DISTINCT FROM 0;
+  SELECT count(*) INTO n FROM results WHERE am = 'gin' AND disagree IS DISTINCT FROM 0;
   IF n > 0 THEN
     RAISE EXCEPTION 'parity mismatch: pure port and extension disagree on % quer(ies)', n;
+  END IF;
+END $$;
+\endif
+
+-- RUM parity: the RUM index must select exactly the rows the (already parity-checked)
+-- GIN index does — same `@~@` match count per query. A mismatch is a RUM correctness
+-- bug, so gate it. No-op when the RUM pass didn't run (the join is empty).
+\if :do_rum
+\echo ''
+\echo '== index parity (rum vs gin match counts; mismatches must be 0) =='
+SELECT count(*)                                            AS queries_checked,
+       count(*) FILTER (WHERE g.matches IS DISTINCT FROM r.matches) AS mismatches
+FROM results g JOIN results r ON g.id = r.id
+WHERE g.am = 'gin' AND r.am = 'rum';
+
+DO $$
+DECLARE n int;
+BEGIN
+  SELECT count(*) INTO n
+  FROM results g JOIN results r ON g.id = r.id
+  WHERE g.am = 'gin' AND r.am = 'rum' AND g.matches IS DISTINCT FROM r.matches;
+  IF n > 0 THEN
+    RAISE EXCEPTION 'rum parity mismatch: the rum and gin indexes disagree on % quer(ies)', n;
   END IF;
 END $$;
 \endif

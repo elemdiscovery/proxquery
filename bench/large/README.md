@@ -17,6 +17,20 @@ The pure-SQL port is ~30–60× slower, so running it on a multi-GiB corpus is n
 
 Each tier's report includes a **phase-timing** table (wall seconds for setup / corpus generation / searches) so you can see where the run's time actually went, and writes **raw per-query timings** to `bench/reports/results_{small,large}.csv` (both uploaded as the workflow artifact). `ext_search_ms` (the extension via the consolidated `ts_prox_search`, ≈ identical to `ext_op_ms`) is only timed on the small tier, where it is the denominator of the pure `slowdown` ratio.
 
+## GIN vs RUM index comparison
+
+Each tier can also build a **RUM** index ([`postgrespro/rum`](https://github.com/postgrespro/rum)) alongside the default GIN index and time the `@~@` operator on both, over identical corpus bytes. When it runs, the report adds:
+
+- an **index size (by am)** table — on-disk size + build time per AM, plus `size_vs_gin` (RUM is typically ~2–3× GIN, since it stores lexeme positions in the index);
+- a **by-shape comparison** — `gin_op_ms` vs `rum_op_ms` and the ratio `rum_vs_gin` (< 1 = RUM faster);
+- an **index parity** gate — the RUM index must return the same `@~@` match counts as the (already parity-checked) GIN index for every query, or the run fails.
+
+Where RUM helps: the native `phrase` / exact-`ordered` shapes lower (via the planner support function) to a real phrase `tsquery`, which RUM prunes using its in-index positions — GIN instead returns every doc containing the terms and rechecks positions in the heap. On the lossy proximity shapes (`within` / `chain` / …), proxquery moves proximity into a heap recheck, so both AMs select the same `a & b` skeleton candidates and RUM only costs the extra storage.
+
+RUM is not in core PostgreSQL, so the RUM pass is **skipped with a NOTICE** unless it is installed — see [`../install_rum.sh`](../install_rum.sh). It is on by default on the small tier (`RUN_RUM=1`) and **off on the large tier** (`RUN_RUM_LARGE=0`).
+
+> **Why the large tier defaults off.** Besides the slow multi-GiB RUM build, RUM (1.3.15) **segfaults on short, high-cardinality prefix (`:*`) queries at ~1 GiB scale**. proxquery lowers a wildcard proximity like `claim <~2> ha*` to the index skeleton `claim & ha:*`, and RUM's prefix scan crashes when `ha:*` expands to a huge posting list. It is a RUM bug (GIN and proxquery's own recheck handle the identical query, and it does **not** reproduce at ≤200 MiB). Since prefix/wildcard search is central to the ediscovery workload, this — on top of RUM's ~3.3–3.5× index size — is why GIN stays the default pairing. Enable `RUN_RUM_LARGE=1` only knowingly.
+
 ## Repeatability
 
 Everything is deterministic given the parameters:
@@ -34,7 +48,7 @@ Everything is deterministic given the parameters:
 - **Topics (positional locality).** Pure i.i.d. word placement has no local structure, so two specific terms are close only by chance and proximity search needs huge windows. Instead the vocabulary is partitioned into `n_topics` topics (the top `n_stop` words are a global stopword background, present everywhere; every other word is hard-assigned round-robin by frequency rank, so topics carry balanced mass). A small per-topic sampling table (`topic_lut`) gives each topic its own inverse-CDF over a `seg_buckets`-bucket draw + hash join. Because topics are a balanced partition chosen ~uniformly per segment, the **global term-frequency marginal is approximately preserved** (the Zipf head you worked for stays intact).
 - **Documents are topic segments.** Each document is generated as a run of fixed-length segments (`segment_len` tokens); a segment's topic is a deterministic integer hash of `(doc, segment-index)`. Each token is either a background draw (probability `bg_rate`, computed as the stopwords' mass share — ~0.55, a realistic stopword fraction) or a content draw from the segment's topic. `string_agg` is **ordered by position**, so tsvector positions follow the segment layout — that is what makes same-topic words land within a few positions and lets short-radius proximity match. This is a simplified segmented topic model (cf. LDA / a hidden-topic-Markov model); the segment length is the knob that maps to the proximity radius.
 - **Document lengths** are drawn from [`doc_sizes.csv`](doc_sizes.csv) (see below), clamped to 16383 tokens (tsvector's per-lexeme position cap) so positions are never silently dropped.
-- The corpus is filled in batches until it reaches the target size, then a plain `gin(tsvector)` index is built.
+- The corpus is filled in batches until it reaches the target size. The index is not built here: `_corpus.sql` produces the table only, and the benchmark builds each index AM on it in turn (a plain `gin(tsvector)` index, and a `rum(body_tsv rum_tsvector_ops)` index when the RUM comparison is enabled) so both are measured on identical bytes.
 
 ## The query workload
 
@@ -72,12 +86,14 @@ Needs a reachable PostgreSQL (libpq env vars) with the extension installed and a
 ```sh
 cargo pgrx install --no-default-features --features pg17 \
   --pg-config "$(sed -n 's/^pg17 = "\(.*\)"/\1/p' ~/.pgrx/config.toml)"
+# optional: enable the GIN-vs-RUM comparison (else it's skipped with a NOTICE)
+bench/install_rum.sh "$(sed -n 's/^pg17 = "\(.*\)"/\1/p' ~/.pgrx/config.toml)"
 cargo pgrx start pg17
 export PGHOST="$HOME/.pgrx" PGPORT=28817
 SMALL_MB=100 LARGE_MB=512 bench/large/run.sh
 ```
 
-Useful env knobs (see [`run.sh`](run.sh) for the full list): `SMALL_MB`, `LARGE_MB`, `SMALL_QUERIES`, `LARGE_QUERIES`, `SMALL_ITERS`, `LARGE_ITERS`, `RUN_LARGE=0` (skip the large tier), `SEED`, `TAIL_WORDS`, `ZIPF_S`.
+Useful env knobs (see [`run.sh`](run.sh) for the full list): `SMALL_MB`, `LARGE_MB`, `SMALL_QUERIES`, `LARGE_QUERIES`, `SMALL_ITERS`, `LARGE_ITERS`, `RUN_LARGE=0` (skip the large tier), `RUN_RUM=0` (skip the small-tier RUM comparison), `RUN_RUM_LARGE=1` (add RUM to the large tier), `SEED`, `TAIL_WORDS`, `ZIPF_S`.
 
 ## Inspect the queries locally
 

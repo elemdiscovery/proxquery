@@ -144,6 +144,12 @@ jobs:
           cargo pgrx install --no-default-features --features pg17 \
             --pg-config "$(sed -n 's/^pg17 = "\(.*\)"/\1/p' ~/.pgrx/config.toml)"
 
+      # RUM (not in core PG) enables the benchmark's GIN-vs-RUM index comparison.
+      # Built against the pgrx-managed pg17; ~/.pgrx cache may not carry it, so this
+      # always runs (a fast C build). If it ever breaks, the bench just skips RUM.
+      - name: Install RUM index extension (GIN-vs-RUM comparison)
+        run: bash bench/install_rum.sh "$(sed -n 's/^pg17 = "\(.*\)"/\1/p' ~/.pgrx/config.toml)"
+
       - name: Start the managed instance
         run: cargo pgrx start pg17
 

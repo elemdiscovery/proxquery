@@ -1,13 +1,15 @@
 //! Planner support for the `@~@` operator — makes it index-served on a *plain*
-//! `gin(tsvector)` index, with no custom operator class. Two requests:
+//! `gin(tsvector)` (or `rum(body_tsv rum_tsvector_ops)`) index, with no custom
+//! operator class. Two requests:
 //!
 //! * **simplify** ([`pg_sys::SupportRequestSimplify`], [`simplify`]) — when the query
 //!   is a constant that maps EXACTLY onto a native `tsquery` AND that native form is the
 //!   selective index probe (phrase, exact `<N>`, boolean — NOT `within`/`pre`, whose
 //!   OR-expansion would seq-scan; see [`crate::dsl::simplify_tsquery_string`]), rewrite
 //!   the whole clause to a plain `tsvector @@ ts_prox_query_native('q')`. Postgres's own
-//!   (C) phrase engine then evaluates it in the GIN `@@` heap recheck, so the custom
-//!   positional recheck is dropped entirely (one detoast, not two).
+//!   (C) phrase engine then evaluates it via the index `@@` (a heap recheck on GIN;
+//!   in-index on RUM, which stores lexeme positions), so the custom positional
+//!   recheck is dropped entirely (one detoast, not two).
 //! * **index condition** ([`pg_sys::SupportRequestIndexCondition`], [`index_condition`])
 //!   — for everything else, hand back `tsvector @@ ts_prox_query('q')` (the lexeme-
 //!   presence skeleton) marked **lossy**, so the original `@~@` stays as the positional
@@ -65,7 +67,9 @@ pub unsafe fn index_condition(node: *mut pg_sys::Node) -> Option<Internal> {
         }
     }
 
-    // The index must expose `tsvector @@ tsquery` (GIN tsvector_ops, strategy 1).
+    // The index must expose `tsvector @@ tsquery` at strategy 1 — both GIN
+    // `tsvector_ops` and RUM `rum_tsvector_ops` register `@@` there, so this one
+    // lookup serves either index AM.
     let at_at =
         pg_sys::get_opfamily_member((*req).opfamily, pg_sys::TSVECTOROID, pg_sys::TSQUERYOID, 1);
     if at_at == pg_sys::InvalidOid {
@@ -116,7 +120,7 @@ pub unsafe fn index_condition(node: *mut pg_sys::Node) -> Option<Internal> {
 /// `text`) query maps EXACTLY onto a native `tsquery` whose `@@` is ALSO the selective
 /// index probe (phrase / exact `<N>` / boolean — see
 /// [`crate::dsl::simplify_tsquery_string`]), rewrite the whole clause to a plain
-/// `tsvector @@ ts_prox_query_native(query)`. That `@@` is GIN-indexable and carries
+/// `tsvector @@ ts_prox_query_native(query)`. That `@@` is GIN/RUM-indexable and carries
 /// its own (AM-level) exact recheck, so the custom positional recheck is gone
 /// entirely — and the rewrite is equivalent everywhere, seq scan included. Returns
 /// `None` (no rewrite) otherwise: runtime parameters, the `proxquery` (cfg/analyzer)
